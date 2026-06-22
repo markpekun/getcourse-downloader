@@ -1,2 +1,7 @@
 __pycache__/
 session_data/
+.idea
+.claude
+.venv
+app/session_data
+app/data

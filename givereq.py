@@ -1,52 +1,53 @@
-"""Скачивание уроков из предварительно собранного списка курсов."""
-
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
 import re
+import sys
 from typing import Any
 
 from playwright.async_api import Frame, async_playwright
 
-from gcpd import try_download_with_quality as gcpd_main
 from login import ensure_login_active
-from utils_config import get_env_config
+from utils_console import configure_console_output
 
 USER_DATA_DIR = "session_data"
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_COURSES_PATH = _PROJECT_ROOT / "app" / "data" / "courses.json"
 PREF = {"cloudflare": 3, "integrosproxy": 2}
+
+configure_console_output()
 
 
 def _extract_video_id(url: str) -> str:
-    """Извлекает ID видео из URL."""
-
     match = re.search(r"/api/playlist/media/([^/?#]+)/", url)
     return match.group(1) if match else url
 
 
 def _extract_provider(url: str) -> str:
-    """Извлекает CDN-провайдера (cloudflare, integrosproxy и т.д.)."""
-
     match = re.search(r"[?&]user-cdn=([^&]+)", url)
     return match.group(1) if match else ""
 
 
 def _provider_score(provider: str) -> int:
-    """Рейтинг провайдера — для выбора лучшего URL."""
-
     return PREF.get(provider, 1)
 
 
-def replace_quality(url: str, target_quality: str) -> str:
-    """Заменяет качество в URL."""
+def _extract_quality(url: str) -> int:
+    path = url.split("?", 1)[0]
+    numeric_parts = [part for part in path.split("/") if part.isdigit()]
+    if not numeric_parts:
+        return 0
+    return int(numeric_parts[-1])
 
-    return re.sub(r"/(360|480|720|1080)\?", f"/{target_quality}?", url)
+
+def _is_media_playlist_request(url: str) -> bool:
+    return "/api/playlist/media/" in url and "user-cdn=" in url
 
 
 def sanitize_filename(name: str) -> str:
-    """Удаляет запрещённые символы и пометки 'Просмотрено'."""
-
     clean = re.sub(
         r"\b(Просмотрено|Пройдено|Завершено)\b",
         "",
@@ -58,12 +59,10 @@ def sanitize_filename(name: str) -> str:
 
 
 async def _click_modal_if_present(frame: Frame) -> None:
-    """Закрывает модалку, если она появилась."""
-
     modal = frame.locator(".mst-root .cnf-root, .cnf-root")
     try:
         await modal.wait_for(state="attached", timeout=2500)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return
 
     for selector in [".cnf-button--decline", ".cnf-button--confirm"]:
@@ -77,21 +76,17 @@ async def _click_modal_if_present(frame: Frame) -> None:
 
     try:
         await modal.wait_for(state="detached", timeout=4000)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 
 async def _click_play(frame: Frame) -> None:
-    """Нажимает кнопку Play."""
-
     button = frame.locator(".fsn-main-btn.fsn-main-btn--play, .fsn-main-btn")
     await button.first.wait_for(state="attached", timeout=8000)
     await frame.evaluate("(el)=>el.click()", await button.first.element_handle())
 
 
 async def _handle_player_frame(frame: Frame) -> bool:
-    """Обрабатывает iframe с плеером."""
-
     if not await frame.query_selector(".vpl-root"):
         return False
     if not await frame.query_selector(".mst-root"):
@@ -118,12 +113,27 @@ async def _handle_player_frame(frame: Frame) -> bool:
             })();
             """
         )
-    except Exception as exc:  # noqa: BLE001
-        print(f"⚠️ Не удалось заглушить звук: {exc}")
+    except Exception as exc:
+        print(f"[WARN] Не удалось заглушить звук: {exc}")
 
     await _click_modal_if_present(frame)
     await _click_play(frame)
     return True
+
+
+async def _run_gcpd(url: str, output_path: str) -> None:
+    script_path = os.path.join(os.path.dirname(__file__), "gcpd.py")
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        script_path,
+        "--url",
+        url,
+        "--output",
+        output_path,
+    )
+    exit_code = await process.wait()
+    if exit_code != 0:
+        print(f"[WARN] gcpd завершился с ошибкой (код {exit_code}): {output_path}")
 
 
 async def process_lesson(
@@ -131,10 +141,8 @@ async def process_lesson(
     course_title: str,
     lesson: dict[str, Any],
     save_root: str,
-    quality: str,
+    quality_filter: str = "auto",
 ) -> None:
-    """Находит запросы m3u8 и скачивает видео."""
-
     page = await browser.new_page()
     await page.goto(lesson["url"])
 
@@ -143,45 +151,73 @@ async def process_lesson(
     login_restored = await ensure_login_active(page)
 
     if not login_restored:
-        await browser.close()
+        await page.close()
         return
 
     if was_login_page:
-        print("🔁 Повторная загрузка урока после авторизации...")
+        print("[INFO] Повторная загрузка урока после авторизации...")
         await page.goto(lesson["url"])
         await asyncio.sleep(2)
 
-    best: dict[str, tuple[int, str]] = {}
+    best: dict[str, tuple[int, int, str]] = {}
+    intercepted_urls: list[str] = []
+    seen_interesting_urls: set[str] = set()
+    pending_tasks: set[asyncio.Task] = set()
 
-    async def on_request(request):  # noqa: ANN001 - тип объекта playwright
+    async def on_request(request):
         url = request.url
-        if "/api/playlist/media/" in url and "user-cdn=" in url:
+
+        if _is_media_playlist_request(url) and url not in seen_interesting_urls:
+            print(f"[REQ] {request.method} {url}")
+            seen_interesting_urls.add(url)
+            if len(intercepted_urls) < 200:
+                intercepted_urls.append(url)
+
+        if _is_media_playlist_request(url):
             video_id = _extract_video_id(url)
             provider = _extract_provider(url)
             score = _provider_score(provider)
+            quality_val = _extract_quality(url)
+            current = best.get(video_id)
+            if current is None or (score, quality_val) > (current[0], current[1]):
+                best[video_id] = (score, quality_val, url)
 
-            if quality.lower() == "auto":
-                for resolution in ["1080", "720", "480", "360"]:
-                    if f"/{resolution}?" in url:
-                        best[video_id] = (score, url)
-                        break
-            else:
-                best[video_id] = (score, replace_quality(url, quality))
+    def on_request_handler(req):
+        task = asyncio.create_task(on_request(req))
+        pending_tasks.add(task)
+        task.add_done_callback(pending_tasks.discard)
 
-    page.on("request", lambda req: asyncio.create_task(on_request(req)))
+    page.on("request", on_request_handler)
 
     for frame in [fr for fr in page.frames if "vhcdn.com" in (fr.url or "")]:
         try:
             await _handle_player_frame(frame)
-        except Exception as exc:  # noqa: BLE001
-            print(f"⚠️ Ошибка фрейма: {exc}")
+        except Exception as exc:
+            print(f"[WARN] Ошибка фрейма: {exc}")
 
     await asyncio.sleep(5)
     await page.close()
 
-    videos = [url for _, url in sorted(best.values(), key=lambda item: -item[0])]
+    if pending_tasks:
+        await asyncio.wait(pending_tasks, timeout=2)
+
+    if quality_filter and quality_filter != "auto":
+        max_quality = int(quality_filter)
+        before = len(best)
+        best = {k: v for k, v in best.items() if v[1] <= max_quality}
+        filtered = before - len(best)
+        if filtered:
+            print(f"[QUALITY] Отфильтровано {filtered} потоков выше {quality_filter}p")
+
+    videos = [item[2] for item in sorted(best.values(), key=lambda item: (-item[0], -item[1]))]
     if not videos:
-        print(f"⚠️ Видео не найдено: {lesson['title']}")
+        print(f"[WARN] Видео не найдено: {lesson['title']}")
+        if intercepted_urls:
+            print("[DEBUG] Последние перехваченные URL (до 20):")
+            for captured_url in intercepted_urls[-20:]:
+                print(f"[DEBUG] {captured_url}")
+        else:
+            print("[DEBUG] Перехват запросов /api/playlist/media/ не сработал.")
         return
 
     course_path = os.path.join(save_root, course_title)
@@ -189,53 +225,50 @@ async def process_lesson(
     safe_title = sanitize_filename(lesson["title"])
 
     if len(videos) == 1:
-        await gcpd_main(videos[0], os.path.join(course_path, safe_title))
+        await _run_gcpd(videos[0], os.path.join(course_path, safe_title))
         return
 
     lesson_path = os.path.join(course_path, safe_title)
     os.makedirs(lesson_path, exist_ok=True)
     for index, video_url in enumerate(videos, start=1):
-        await gcpd_main(video_url, os.path.join(lesson_path, f"video_{index}"))
+        await _run_gcpd(video_url, os.path.join(lesson_path, f"video_{index}"))
 
 
 async def main() -> None:
-    """Читает courses.json и скачивает все уроки."""
+    parser = argparse.ArgumentParser(description="Скачивание уроков из courses.json")
+    parser.add_argument("--quality", default="auto", choices=["auto", "1080", "720", "480", "360"])
+    parser.add_argument("--save-path", default="downloads", dest="save_path")
+    args = parser.parse_args()
 
-    cfg = get_env_config()
-    save_root = cfg["courses_save_path"]
-    quality = cfg["quality"]
+    save_root = args.save_path
+    quality_setting = args.quality
 
-    if not os.path.exists("courses.json") or os.path.getsize("courses.json") == 0:
-        print("⚠️ Файл courses.json пустой или отсутствует.")
-        print(
-            "💡 Укажите ссылку на плейлист в .env и запустите givelinks.py "
-            "для создания списка курсов."
-        )
+    if not _COURSES_PATH.exists() or _COURSES_PATH.stat().st_size == 0:
+        print("[WARN] Файл courses.json пустой или отсутствует.")
+        print("[TIP] Запустите parse_courses.py с URL плейлиста для создания списка курсов.")
         return
 
-    with open("courses.json", "r", encoding="utf-8") as courses_file:
+    with open(_COURSES_PATH, "r", encoding="utf-8") as courses_file:
         courses = json.load(courses_file)
 
     async with async_playwright() as playwright:
         browser = await playwright.firefox.launch_persistent_context(
             USER_DATA_DIR,
-            headless=cfg["headless"],
+            headless=False,
         )
 
         for course in courses:
-            print(f"\n📚 Курс: {course['course_title']}")
+            print(f"\n[COURSE] Курс: {course['course_title']}")
             for lesson in course["lessons"]:
                 await process_lesson(
                     browser,
                     course["course_title"],
                     lesson,
                     save_root,
-                    quality,
+                    quality_setting,
                 )
 
         await browser.close()
-
-
 
 
 if __name__ == "__main__":
