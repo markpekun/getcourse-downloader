@@ -183,9 +183,7 @@ async def _download_video(playlist_url: str, output_path: str) -> None:
             os.remove(ts_file)
             return
         os.remove(ts_file)
-        if process.returncode == 0:
-            print(f"  ✓ Сохранено: {output_mp4}")
-        else:
+        if process.returncode != 0:
             err = stderr.decode("utf-8", errors="replace")[-300:]
             print(f"  ✗ Ошибка конвертации")
 
@@ -323,6 +321,8 @@ async def process_lesson(
             await _download_video(selected_url, os.path.join(video_dir, f"video_{idx}"))
         else:
             await _download_video(selected_url, os.path.join(course_path, safe_title))
+
+        print()
 
 
 async def main() -> None:
