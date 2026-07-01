@@ -85,37 +85,134 @@ class CoursesScreen:
         self.side_content = ft.Column(spacing=16)
         self._build_side_panel()
 
-        self.view = ft.Container(
+        self.overlay = ft.Container(
             expand=True,
-            gradient=Gradient.BG_PRIMARY,
-            content=ft.Column(
-                spacing=0,
-                controls=[
-                    self._build_header(),
-                    divider(),
-                    ft.Container(
-                        expand=True,
-                        padding=ft.Padding.only(left=32, right=32, top=20, bottom=20),
-                        content=ft.Row(
-                            spacing=24,
+            bgcolor="rgba(0,0,0,0.7)",
+            visible=False,
+            alignment=ft.Alignment(0, 0),
+            content=ft.Container(
+                width=360,
+                padding=ft.Padding.all(32),
+                border_radius=20,
+                bgcolor=Color.BG_CARD,
+                border=ft.Border.all(1, Color.BORDER),
+                shadow=Shadow.CARD,
+                gradient=Gradient.CARD,
+                content=ft.Column(
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=16,
+                    controls=[
+                        ft.ProgressRing(width=56, height=56, color=Color.ACCENT, stroke_width=4),
+                        ft.Text(
+                            "Идёт загрузка...",
+                            size=20,
+                            weight=ft.FontWeight.W_600,
+                            color=Color.TEXT,
+                        ),
+                        ft.Text(
+                            "Пожалуйста, подождите",
+                            size=14,
+                            color=Color.TEXT_MUTED,
+                        ),
+                    ],
+                ),
+            ),
+        )
+
+        self.error_overlay = ft.Container(
+            expand=True,
+            bgcolor="rgba(0,0,0,0.7)",
+            visible=False,
+            alignment=ft.Alignment(0, 0),
+            content=ft.Container(
+                width=420,
+                padding=ft.Padding.all(24),
+                border_radius=20,
+                bgcolor=Color.BG_CARD,
+                border=ft.Border.all(1, Color.BORDER),
+                shadow=Shadow.CARD,
+                gradient=Gradient.CARD,
+                content=ft.Column(
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=20,
+                    controls=[
+                        ft.Row(
+                            alignment=ft.MainAxisAlignment.END,
                             controls=[
                                 ft.Container(
-                                    width=320,
-                                    content=self.side_content,
-                                ),
-                                ft.Container(
-                                    expand=True,
-                                    content=ft.Column(
-                                        spacing=16,
-                                        controls=[
-                                            self._build_toolbar(),
-                                            self.course_list,
-                                        ],
-                                    ),
+                                    content=ft.Icon(ft.Icons.CLOSE, size=20, color=Color.TEXT_SECONDARY),
+                                    padding=ft.Padding.all(4),
+                                    border_radius=6,
+                                    ink=True,
+                                    on_click=self._dismiss_error,
                                 ),
                             ],
                         ),
+                        ft.Icon(ft.Icons.ERROR_OUTLINE, size=56, color=Color.RED),
+                        ft.Text(
+                            "Папка сохранения не найдена!",
+                            size=20,
+                            weight=ft.FontWeight.W_600,
+                            color=Color.TEXT,
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                        ft.Text(
+                            f"Путь: {self._save_path}",
+                            size=13,
+                            color=Color.TEXT_MUTED,
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                        ft.Container(
+                            content=ft.Text("Выбрать другую папку", size=15, weight=ft.FontWeight.W_600, color=Color.TEXT),
+                            padding=ft.Padding.symmetric(horizontal=24, vertical=12),
+                            border_radius=10,
+                            gradient=Gradient.ACCENT,
+                            ink=True,
+                            on_click=self._dismiss_error_and_pick,
+                        ),
+                    ],
+                ),
+            ),
+        )
+
+        self.view = ft.Container(
+            expand=True,
+            gradient=Gradient.BG_PRIMARY,
+            content=ft.Stack(
+                expand=True,
+                controls=[
+                    ft.Column(
+                        spacing=0,
+                        controls=[
+                            self._build_header(),
+                            divider(),
+                            ft.Container(
+                                expand=True,
+                                padding=ft.Padding.only(left=32, right=32, top=20, bottom=20),
+                                content=ft.Row(
+                                    spacing=24,
+                                    controls=[
+                                        ft.Container(
+                                            width=320,
+                                            content=self.side_content,
+                                        ),
+                                        ft.Container(
+                                            expand=True,
+                                            content=ft.Column(
+                                                spacing=16,
+                                                controls=[
+                                                    self._build_toolbar(),
+                                                    self.course_list,
+                                                ],
+                                            ),
+                                        ),
+                                    ],
+                                ),
+                            ),
+                        ],
                     ),
+                    self.overlay,
+                    self.error_overlay,
                 ],
             ),
         )
@@ -164,6 +261,19 @@ class CoursesScreen:
                         content=ft.Row(
                             spacing=8,
                             controls=[
+                                ft.Container(
+                                    content=ft.Icon(
+                                        ft.Icons.DELETE_ROUNDED,
+                                        size=20,
+                                        color=Color.RED,
+                                    ),
+                                    padding=ft.Padding.symmetric(horizontal=8, vertical=4),
+                                    border_radius=6,
+                                    bgcolor="rgba(239,68,68,0.12)",
+                                    ink=True,
+                                    on_click=self._delete_courses,
+                                    tooltip="Удалить курсы и начать заново",
+                                ),
                                 ft.Container(
                                     content=ft.Row(
                                         [
@@ -596,7 +706,11 @@ class CoursesScreen:
         kwargs = {"dialog_title": "Выберите папку для сохранения видео"}
         if Path(self._save_path).is_absolute():
             kwargs["initial_directory"] = self._save_path
-        path = await self.file_picker.get_directory_path(**kwargs)
+        try:
+            path = await self.file_picker.get_directory_path(**kwargs)
+        except Exception:
+            kwargs.pop("initial_directory", None)
+            path = await self.file_picker.get_directory_path(**kwargs)
         if path:
             self._save_path = path
             self._save_save_path(path)
@@ -617,6 +731,18 @@ class CoursesScreen:
         _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
             json.dump({"save_path": path}, f)
+
+    async def _delete_courses(self, e):
+        if _COURSES_PATH.exists():
+            _COURSES_PATH.unlink()
+        self.page.clean()
+        self.page.window.width = 680
+        self.page.window.height = 460
+        from app.screens.start_screen import StartScreen
+        screen = StartScreen(self.page)
+        self.page.add(screen.view)
+        await self.page.window.center()
+        self.page.update()
 
     def _update_selected_count(self, e=None):
         selected = sum(1 for cb in self._register if cb.value)
@@ -656,6 +782,15 @@ class CoursesScreen:
             cb.value = False
         self._update_selected_count()
 
+    def _dismiss_error(self, e):
+        self.error_overlay.visible = False
+        self.page.update()
+
+    async def _dismiss_error_and_pick(self, e):
+        self.error_overlay.visible = False
+        await self._pick_directory(None)
+        self.page.update()
+
     def _start_download(self, e):
         selected = [cb for cb in self._register if cb.value]
         if not selected:
@@ -663,7 +798,20 @@ class CoursesScreen:
             return
         if self._downloading:
             return
+
+        if not Path(self._save_path).is_dir():
+            self.error_overlay.visible = True
+            self.page.update()
+            return
+
         self._downloading = True
+        self.overlay.visible = True
+        self.page.update()
+
+        print(f"\n🚀 Старт скачивания: {len(selected)} уроков")
+        print(f"   Качество: {self._quality}")
+        print(f"   Папка: {self._save_path}")
+        print()
 
         lessons_to_download = []
         for idx, course in enumerate(self.data):
@@ -674,8 +822,6 @@ class CoursesScreen:
                         "course_title": course["course_title"],
                         "lesson": course["lessons"][i],
                     })
-
-        self._show_snack(f"Загрузка {len(lessons_to_download)} уроков...")
 
         threading.Thread(
             target=self._run_download,
@@ -698,6 +844,7 @@ class CoursesScreen:
         json.dump(lessons, tmp, ensure_ascii=False)
         tmp.close()
         try:
+            print(f"▶ Запуск: {sys.executable} {givereq_path}")
             subprocess.run(
                 [
                     sys.executable, givereq_path,
@@ -707,16 +854,22 @@ class CoursesScreen:
                 ],
                 check=True,
             )
-            page.run_thread(lambda: self._show_snack("Загрузка завершена"))
+            print("✅ Загрузка завершена")
+            page.run_thread(lambda: self._finish_download("Загрузка завершена"))
         except Exception as ex:
             err = str(ex)
-            page.run_thread(lambda: self._show_snack(f"Ошибка: {err}", is_error=True))
+            print(f"❌ Ошибка загрузки: {err}")
+            page.run_thread(lambda: self._finish_download(f"Ошибка: {err}", is_error=True))
         finally:
             try:
                 os.unlink(tmp.name)
             except Exception:
                 pass
-            self._downloading = False
+
+    def _finish_download(self, message: str, is_error: bool = False):
+        self.overlay.visible = False
+        self._downloading = False
+        self._show_snack(message, is_error)
 
     def _show_snack(self, message: str, is_error: bool = False):
         bg = "#1A0A0A" if is_error else "#0A1A15"
