@@ -310,7 +310,6 @@ async def process_lesson(
             continue
 
         q = _extract_quality(selected_url)
-        print(f"  ▶ Качество: {q}p")
 
         course_path = os.path.join(save_root, course_title)
         os.makedirs(course_path, exist_ok=True)

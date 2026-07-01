@@ -1,3 +1,4 @@
+import asyncio
 import json
 import threading
 from pathlib import Path
@@ -106,6 +107,40 @@ class CoursesScreen:
             content=ft.Text("Продолжить", size=14, weight=ft.FontWeight.W_600, color=Color.TEXT),
         )
 
+        self._overlay_card = ft.Container(
+            width=500,
+            padding=ft.Padding.all(24),
+            border_radius=20,
+            bgcolor=Color.BG_CARD,
+            border=ft.Border.all(1, Color.ACCENT_GLOW),
+            shadow=ft.BoxShadow(
+                blur_radius=40,
+                color=Color.ACCENT_GLOW,
+                offset=ft.Offset(0, 8),
+            ),
+            gradient=Gradient.CARD,
+            opacity=0,
+            offset=ft.Offset(0, 0.15),
+            animate_opacity=ft.Animation(350, ft.AnimationCurve.EASE_OUT),
+            animate_offset=ft.Animation(350, ft.AnimationCurve.EASE_OUT),
+            animate=ft.Animation(300, ft.AnimationCurve.EASE_OUT),
+            content=ft.Column(
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=12,
+                controls=[
+                    ft.ProgressRing(width=40, height=40, color=Color.ACCENT, stroke_width=4),
+                    ft.Text(
+                        "Загрузка видео",
+                        size=18,
+                        weight=ft.FontWeight.W_600,
+                        color=Color.TEXT,
+                    ),
+                    self._log_container,
+                    self._continue_btn,
+                ],
+            ),
+        )
+
         self.overlay = ft.Container(
             expand=True,
             bgcolor="rgba(0,0,0,0.7)",
@@ -117,32 +152,7 @@ class CoursesScreen:
                 controls=[
                     ft.Column(
                         alignment=ft.MainAxisAlignment.CENTER,
-                        controls=[
-                            ft.Container(
-                                width=500,
-                                padding=ft.Padding.all(24),
-                                border_radius=20,
-                                bgcolor=Color.BG_CARD,
-                                border=ft.Border.all(1, Color.BORDER),
-                                shadow=Shadow.CARD,
-                                gradient=Gradient.CARD,
-                                content=ft.Column(
-                                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                                    spacing=12,
-                                    controls=[
-                                        ft.ProgressRing(width=40, height=40, color=Color.ACCENT, stroke_width=4),
-                                        ft.Text(
-                                            "Загрузка видео",
-                                            size=18,
-                                            weight=ft.FontWeight.W_600,
-                                            color=Color.TEXT,
-                                        ),
-                                        self._log_container,
-                                        self._continue_btn,
-                                    ],
-                                ),
-                            ),
-                        ],
+                        controls=[self._overlay_card],
                     ),
                 ],
             ),
@@ -841,6 +851,19 @@ class CoursesScreen:
             return Color.RED
         return Color.TEXT_SECONDARY
 
+    def _scroll_smooth(self):
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                self._log_column.scroll_to(
+                    delta=1000000,
+                    duration=250,
+                    curve=ft.AnimationCurve.EASE_OUT,
+                )
+            )
+        except Exception:
+            pass
+
     def _add_log(self, line: str):
         self.log_lines.append(line)
         color = self._log_color(line)
@@ -849,6 +872,7 @@ class CoursesScreen:
         )
         try:
             self.page.update()
+            self._scroll_smooth()
         except (IndexError, RuntimeError):
             pass
 
@@ -862,6 +886,7 @@ class CoursesScreen:
                     self.log_lines[-1] = line
                 try:
                     self.page.update()
+                    self._scroll_smooth()
                 except (IndexError, RuntimeError):
                     pass
                 return
@@ -899,7 +924,13 @@ class CoursesScreen:
         self._log_column.controls.clear()
         self._continue_btn.visible = False
         self._proc_stdin = None
+
+        self._overlay_card.opacity = 0
+        self._overlay_card.offset = ft.Offset(0, 0.15)
         self.overlay.visible = True
+        self.page.update()
+        self._overlay_card.opacity = 1
+        self._overlay_card.offset = ft.Offset(0, 0)
         self.page.update()
 
         self._add_log(f"Старт скачивания: {len(selected)} уроков")
