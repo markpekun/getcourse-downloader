@@ -833,12 +833,12 @@ class CoursesScreen:
 
     @staticmethod
     def _log_color(line: str) -> str:
+        if "Сегменты" in line or "сегмент" in line.lower():
+            return "#F59E0B"
         if line.startswith("✅") or line.startswith("✓"):
             return Color.GREEN
         if line.startswith("❌") or "Ошибка" in line:
             return Color.RED
-        if "Сегменты" in line:
-            return "#F59E0B"
         return Color.TEXT_SECONDARY
 
     def _add_log(self, line: str):
@@ -963,7 +963,7 @@ class CoursesScreen:
 
                 check = line.lower()
 
-                if "требуется авторизация" in check or "авторизация выполнена" in check:
+                if "авторизац" in check:
                     continue
 
                 if "\r" in line:
