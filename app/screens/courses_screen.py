@@ -8,6 +8,7 @@ from app.theme import Color, Gradient, Shadow, accent_button, body_text, divider
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _COURSES_PATH = _PROJECT_ROOT / "app" / "data" / "courses.json"
+_SETTINGS_PATH = _PROJECT_ROOT / "app" / "data" / "settings.json"
 
 _COURSE_COLORS = [
     "#7C3AED",
@@ -46,7 +47,7 @@ class CoursesScreen:
         self._register: list[ft.Checkbox] = []
 
         self._quality = "auto"
-        self._save_path = "downloads"
+        self._save_path = self._load_save_path()
 
         self.file_picker = ft.FilePicker()
 
@@ -592,14 +593,30 @@ class CoursesScreen:
         self._quality = e.control.value
 
     async def _pick_directory(self, e):
-        path = await self.file_picker.get_directory_path(
-            dialog_title="Выберите папку для сохранения видео",
-            initial_directory=self._save_path,
-        )
+        kwargs = {"dialog_title": "Выберите папку для сохранения видео"}
+        if Path(self._save_path).is_absolute():
+            kwargs["initial_directory"] = self._save_path
+        path = await self.file_picker.get_directory_path(**kwargs)
         if path:
             self._save_path = path
+            self._save_save_path(path)
             self._build_side_panel()
             self.page.update()
+
+    @staticmethod
+    def _load_save_path() -> str:
+        try:
+            with open(_SETTINGS_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("save_path", "downloads")
+        except (FileNotFoundError, json.JSONDecodeError):
+            return "downloads"
+
+    @staticmethod
+    def _save_save_path(path: str) -> None:
+        _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"save_path": path}, f)
 
     def _update_selected_count(self, e=None):
         selected = sum(1 for cb in self._register if cb.value)
@@ -667,22 +684,38 @@ class CoursesScreen:
         ).start()
 
     def _run_download(self, lessons: list):
+        import json
+        import os
         import subprocess
         import sys
+        import tempfile
         page = self.page
+        givereq_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            os.pardir, "services", "givereq.py",
+        )
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+        json.dump(lessons, tmp, ensure_ascii=False)
+        tmp.close()
         try:
             subprocess.run(
                 [
-                    sys.executable, "givereq.py",
+                    sys.executable, givereq_path,
                     "--quality", self._quality,
                     "--save-path", self._save_path,
+                    "--lessons-file", tmp.name,
                 ],
                 check=True,
             )
             page.run_thread(lambda: self._show_snack("Загрузка завершена"))
         except Exception as ex:
-            page.run_thread(lambda: self._show_snack(f"Ошибка: {ex}", is_error=True))
+            err = str(ex)
+            page.run_thread(lambda: self._show_snack(f"Ошибка: {err}", is_error=True))
         finally:
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
             self._downloading = False
 
     def _show_snack(self, message: str, is_error: bool = False):
