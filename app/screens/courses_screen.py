@@ -85,37 +85,66 @@ class CoursesScreen:
         self.side_content = ft.Column(spacing=16)
         self._build_side_panel()
 
+        self.log_lines: list[str] = []
+        self._log_column = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=2)
+        self._log_container = ft.Container(
+            width=440,
+            height=180,
+            border_radius=10,
+            bgcolor="rgba(0,0,0,0.3)",
+            border=ft.Border.all(1, "rgba(255,255,255,0.06)"),
+            padding=ft.Padding.all(12),
+            content=self._log_column,
+        )
+        self._continue_btn = ft.Container(
+            visible=False,
+            padding=ft.Padding.symmetric(horizontal=20, vertical=8),
+            border_radius=8,
+            gradient=Gradient.ACCENT,
+            ink=True,
+            on_click=self._send_continue,
+            content=ft.Text("Продолжить", size=14, weight=ft.FontWeight.W_600, color=Color.TEXT),
+        )
+
         self.overlay = ft.Container(
             expand=True,
             bgcolor="rgba(0,0,0,0.7)",
             visible=False,
-            alignment=ft.Alignment(0, 0),
-            content=ft.Container(
-                width=360,
-                padding=ft.Padding.all(32),
-                border_radius=20,
-                bgcolor=Color.BG_CARD,
-                border=ft.Border.all(1, Color.BORDER),
-                shadow=Shadow.CARD,
-                gradient=Gradient.CARD,
-                content=ft.Column(
-                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    spacing=16,
-                    controls=[
-                        ft.ProgressRing(width=56, height=56, color=Color.ACCENT, stroke_width=4),
-                        ft.Text(
-                            "Идёт загрузка...",
-                            size=20,
-                            weight=ft.FontWeight.W_600,
-                            color=Color.TEXT,
-                        ),
-                        ft.Text(
-                            "Пожалуйста, подождите",
-                            size=14,
-                            color=Color.TEXT_MUTED,
-                        ),
-                    ],
-                ),
+            content=ft.Row(
+                expand=True,
+                alignment=ft.MainAxisAlignment.CENTER,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.Column(
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        controls=[
+                            ft.Container(
+                                width=500,
+                                padding=ft.Padding.all(24),
+                                border_radius=20,
+                                bgcolor=Color.BG_CARD,
+                                border=ft.Border.all(1, Color.BORDER),
+                                shadow=Shadow.CARD,
+                                gradient=Gradient.CARD,
+                                content=ft.Column(
+                                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                                    spacing=12,
+                                    controls=[
+                                        ft.ProgressRing(width=40, height=40, color=Color.ACCENT, stroke_width=4),
+                                        ft.Text(
+                                            "Загрузка видео",
+                                            size=18,
+                                            weight=ft.FontWeight.W_600,
+                                            color=Color.TEXT,
+                                        ),
+                                        self._log_container,
+                                        self._continue_btn,
+                                    ],
+                                ),
+                            ),
+                        ],
+                    ),
+                ],
             ),
         )
 
@@ -123,55 +152,66 @@ class CoursesScreen:
             expand=True,
             bgcolor="rgba(0,0,0,0.7)",
             visible=False,
-            alignment=ft.Alignment(0, 0),
-            content=ft.Container(
-                width=420,
-                padding=ft.Padding.all(24),
-                border_radius=20,
-                bgcolor=Color.BG_CARD,
-                border=ft.Border.all(1, Color.BORDER),
-                shadow=Shadow.CARD,
-                gradient=Gradient.CARD,
-                content=ft.Column(
-                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    spacing=20,
-                    controls=[
-                        ft.Row(
-                            alignment=ft.MainAxisAlignment.END,
-                            controls=[
-                                ft.Container(
-                                    content=ft.Icon(ft.Icons.CLOSE, size=20, color=Color.TEXT_SECONDARY),
-                                    padding=ft.Padding.all(4),
-                                    border_radius=6,
-                                    ink=True,
-                                    on_click=self._dismiss_error,
+            content=ft.Row(
+                expand=True,
+                alignment=ft.MainAxisAlignment.CENTER,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.Column(
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        controls=[
+                            ft.Container(
+                                width=420,
+                                padding=ft.Padding.all(24),
+                                border_radius=20,
+                                bgcolor=Color.BG_CARD,
+                                border=ft.Border.all(1, Color.BORDER),
+                                shadow=Shadow.CARD,
+                                gradient=Gradient.CARD,
+                                content=ft.Column(
+                                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                                    spacing=20,
+                                    controls=[
+                                        ft.Row(
+                                            alignment=ft.MainAxisAlignment.END,
+                                            controls=[
+                                                ft.Container(
+                                                    content=ft.Icon(ft.Icons.CLOSE, size=20, color=Color.TEXT_SECONDARY),
+                                                    padding=ft.Padding.all(4),
+                                                    border_radius=6,
+                                                    ink=True,
+                                                    on_click=self._dismiss_error,
+                                                ),
+                                            ],
+                                        ),
+                                        ft.Icon(ft.Icons.ERROR_OUTLINE, size=56, color=Color.RED),
+                                        ft.Text(
+                                            "Папка сохранения не найдена!",
+                                            size=20,
+                                            weight=ft.FontWeight.W_600,
+                                            color=Color.TEXT,
+                                            text_align=ft.TextAlign.CENTER,
+                                        ),
+                                        ft.Text(
+                                            f"Путь: {self._save_path}",
+                                            size=13,
+                                            color=Color.TEXT_MUTED,
+                                            text_align=ft.TextAlign.CENTER,
+                                        ),
+                                        ft.Container(
+                                            content=ft.Text("Выбрать другую папку", size=15, weight=ft.FontWeight.W_600, color=Color.TEXT),
+                                            padding=ft.Padding.symmetric(horizontal=24, vertical=12),
+                                            border_radius=10,
+                                            gradient=Gradient.ACCENT,
+                                            ink=True,
+                                            on_click=self._dismiss_error_and_pick,
+                                        ),
+                                    ],
                                 ),
-                            ],
-                        ),
-                        ft.Icon(ft.Icons.ERROR_OUTLINE, size=56, color=Color.RED),
-                        ft.Text(
-                            "Папка сохранения не найдена!",
-                            size=20,
-                            weight=ft.FontWeight.W_600,
-                            color=Color.TEXT,
-                            text_align=ft.TextAlign.CENTER,
-                        ),
-                        ft.Text(
-                            f"Путь: {self._save_path}",
-                            size=13,
-                            color=Color.TEXT_MUTED,
-                            text_align=ft.TextAlign.CENTER,
-                        ),
-                        ft.Container(
-                            content=ft.Text("Выбрать другую папку", size=15, weight=ft.FontWeight.W_600, color=Color.TEXT),
-                            padding=ft.Padding.symmetric(horizontal=24, vertical=12),
-                            border_radius=10,
-                            gradient=Gradient.ACCENT,
-                            ink=True,
-                            on_click=self._dismiss_error_and_pick,
-                        ),
-                    ],
-                ),
+                            ),
+                        ],
+                    ),
+                ],
             ),
         )
 
@@ -791,6 +831,27 @@ class CoursesScreen:
         await self._pick_directory(None)
         self.page.update()
 
+    def _add_log(self, line: str):
+        self.log_lines.append(line)
+        self._log_column.controls.append(
+            ft.Text(line, size=13, color=Color.TEXT_SECONDARY, selectable=False)
+        )
+        self.page.update()
+
+    def _show_continue_btn(self):
+        self._continue_btn.visible = True
+        self.page.update()
+
+    def _send_continue(self, e):
+        self._continue_btn.visible = False
+        self.page.update()
+        if hasattr(self, '_proc_stdin') and self._proc_stdin:
+            try:
+                self._proc_stdin.write("\n")
+                self._proc_stdin.flush()
+            except Exception:
+                pass
+
     def _start_download(self, e):
         selected = [cb for cb in self._register if cb.value]
         if not selected:
@@ -805,10 +866,20 @@ class CoursesScreen:
             return
 
         self._downloading = True
+        self.log_lines.clear()
+        self._log_column.controls.clear()
+        self._continue_btn.visible = False
+        self._proc_stdin = None
         self.overlay.visible = True
         self.page.update()
 
-        print(f"\n🚀 Старт скачивания: {len(selected)} уроков")
+        msg = f"🚀 Старт скачивания: {len(selected)} уроков"
+        self._add_log(msg)
+        self._add_log(f"   Качество: {self._quality}")
+        self._add_log(f"   Папка: {self._save_path}")
+        self._add_log("")
+
+        print(f"\n{msg}")
         print(f"   Качество: {self._quality}")
         print(f"   Папка: {self._save_path}")
         print()
@@ -835,6 +906,7 @@ class CoursesScreen:
         import subprocess
         import sys
         import tempfile
+
         page = self.page
         givereq_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -845,22 +917,45 @@ class CoursesScreen:
         tmp.close()
         try:
             print(f"▶ Запуск: {sys.executable} {givereq_path}")
-            subprocess.run(
+            proc = subprocess.Popen(
                 [
                     sys.executable, givereq_path,
                     "--quality", self._quality,
                     "--save-path", self._save_path,
                     "--lessons-file", tmp.name,
                 ],
-                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
             )
-            print("✅ Загрузка завершена")
-            page.run_thread(lambda: self._finish_download("Загрузка завершена"))
+            self._proc_stdin = proc.stdin
+
+            for raw_line in proc.stdout or []:
+                line = raw_line.rstrip("\n\r")
+                if not line:
+                    continue
+                print(line)
+                page.run_thread(lambda l=line: self._add_log(l))
+                if "нажмите Enter" in line.lower() or "enter" in line.lower():
+                    page.run_thread(lambda: self._show_continue_btn())
+
+            proc.wait()
+
+            if proc.returncode == 0:
+                print("✅ Загрузка завершена")
+                page.run_thread(lambda: self._finish_download("Загрузка завершена"))
+            else:
+                err = f"Код ошибки: {proc.returncode}"
+                print(f"❌ {err}")
+                page.run_thread(lambda: self._finish_download(f"Ошибка: {err}", is_error=True))
         except Exception as ex:
             err = str(ex)
             print(f"❌ Ошибка загрузки: {err}")
             page.run_thread(lambda: self._finish_download(f"Ошибка: {err}", is_error=True))
         finally:
+            self._proc_stdin = None
             try:
                 os.unlink(tmp.name)
             except Exception:
