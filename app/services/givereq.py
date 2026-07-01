@@ -85,6 +85,14 @@ def _select_quality_url(qualities: dict[int, str], quality_filter: str) -> str |
     return qualities[available[0]]
 
 
+async def _countdown(seconds: int, message: str = "Ожидание") -> None:
+    """Асинхронный обратный отсчёт с красивым выводом."""
+    for i in range(seconds, 0, -1):
+        print(f"\r  ⏳ {message}: {i} сек.", end="", flush=True)
+        await asyncio.sleep(1)
+    print(f"\r  ⏳ {message}: 0 сек.", flush=True)
+
+
 async def _download_video(playlist_url: str, output_path: str) -> None:
     import aiohttp
     import shutil
@@ -107,7 +115,7 @@ async def _download_video(playlist_url: str, output_path: str) -> None:
         ]
         total = len(segment_urls)
         if not total:
-            print("  Нет сегментов")
+            print("  ⚠ Нет сегментов")
             return
 
         tmpdir = tempfile.mkdtemp()
@@ -142,7 +150,7 @@ async def _download_video(playlist_url: str, output_path: str) -> None:
         segments = sorted(r for r in results if r)
 
         if not segments:
-            print("  Не скачано ни одного сегмента")
+            print("  ⚠ Не скачано ни одного сегмента")
             return
 
         ts_file = output_mp4.replace(".mp4", ".ts")
@@ -169,15 +177,46 @@ async def _download_video(playlist_url: str, output_path: str) -> None:
             _, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
         except asyncio.TimeoutError:
             process.kill()
-            print(f"  Ошибка: ffmpeg завис (таймаут 5 мин)")
+            print("  ✗ Ошибка: ffmpeg завис (таймаут 5 мин)")
             os.remove(ts_file)
             return
         os.remove(ts_file)
         if process.returncode == 0:
-            print(f"  Сохранено: {output_mp4}")
+            print(f"  ✓ Сохранено: {output_mp4}")
         else:
             err = stderr.decode("utf-8", errors="replace")[-300:]
-            print(f"  Ошибка конвертации")
+            print(f"  ✗ Ошибка конвертации")
+
+
+async def ensure_authenticated(playwright: Any, url: str) -> bool:
+    """Проверить авторизацию headless, если нужно — открыть браузер для входа."""
+    browser = await playwright.firefox.launch_persistent_context(
+        USER_DATA_DIR,
+        headless=True,
+    )
+    page = browser.pages[0] if browser.pages else await browser.new_page()
+    await page.goto(url, wait_until="domcontentloaded")
+    needs_auth = "login" in page.url.lower() or "required=true" in page.url
+    await browser.close()
+
+    if not needs_auth:
+        print("  ✓ Авторизация активна")
+        return True
+
+    print("\n  🔐 Требуется авторизация. Открываю браузер для входа...\n")
+    browser = await playwright.firefox.launch_persistent_context(
+        USER_DATA_DIR,
+        headless=False,
+    )
+    login_page = browser.pages[0] if browser.pages else await browser.new_page()
+    await login_page.goto(url)
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, input, "  После успешного входа нажмите Enter...")
+
+    await browser.close()
+    print("  ✓ Авторизация выполнена. Продолжаем.\n")
+    return True
 
 
 async def process_lesson(
@@ -186,10 +225,11 @@ async def process_lesson(
     lesson: dict[str, Any],
     save_root: str,
     quality_filter: str = "auto",
+    playwright: Any | None = None,
 ) -> None:
     lesson_title = lesson["title"]
     lesson_url = lesson["url"]
-    print(f"\n  >>> {lesson_title}")
+    print(f"\n  ▶ {lesson_title}")
 
     page = await browser.new_page()
 
@@ -217,12 +257,34 @@ async def process_lesson(
     for attempt in range(3):
         if "login" not in page.url.lower() and "required=true" not in page.url:
             break
-        print("\n  Требуется авторизация. Войдите в аккаунт в браузере.")
-        print("  Через 30 секунд страница перезагрузится...")
+        print("\n  ⚠ Страница запросила авторизацию")
         master_urls_seen.clear()
         master_playlists.clear()
         last_arrival = 0.0
-        await asyncio.sleep(30)
+        await _countdown(10, "Повторная попытка")
+        await page.goto(lesson_url)
+    else:
+        # Все 3 попытки исчерпаны — нужна ручная авторизация
+        print("  ⚠ Автоматические попытки не удались")
+        if playwright:
+            print("  🔐 Открываю браузер для ручного входа...")
+            auth_browser = await playwright.firefox.launch_persistent_context(
+                USER_DATA_DIR,
+                headless=False,
+            )
+            auth_page = auth_browser.pages[0] if auth_browser.pages else await auth_browser.new_page()
+            await auth_page.goto(lesson_url)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, input, "  После успешного входа нажмите Enter...")
+            await auth_browser.close()
+            print("  ✓ Авторизация выполнена. Продолжаем.")
+        else:
+            print("  ⚠ Передайте playwright для повторной авторизации")
+            return
+        # После авторизации повторяем навигацию
+        master_urls_seen.clear()
+        master_playlists.clear()
+        last_arrival = 0.0
         await page.goto(lesson_url)
 
     start_time = time.monotonic()
@@ -236,7 +298,7 @@ async def process_lesson(
     await page.close()
 
     if not master_playlists:
-        print("  Master playlist не получен")
+        print("  ⚠ Master playlist не получен")
         return
 
     for idx, (master_url, master_text) in enumerate(master_playlists, start=1):
@@ -244,11 +306,11 @@ async def process_lesson(
         selected_url = _select_quality_url(qualities, quality_filter)
 
         if not selected_url:
-            print("  Не удалось подобрать качество")
+            print("  ⚠ Не удалось подобрать качество")
             continue
 
         q = _extract_quality(selected_url)
-        print(f"  Качество: {q}p")
+        print(f"  ▶ Качество: {q}p")
 
         course_path = os.path.join(save_root, course_title)
         os.makedirs(course_path, exist_ok=True)
@@ -277,7 +339,7 @@ async def main() -> None:
             entries = json.load(f)
     else:
         if not _COURSES_PATH.exists() or _COURSES_PATH.stat().st_size == 0:
-            print("Файл courses.json пустой или отсутствует.")
+            print("  ⚠ Файл courses.json пустой или отсутствует.")
             return
 
         with open(_COURSES_PATH, "r", encoding="utf-8") as courses_file:
@@ -292,9 +354,14 @@ async def main() -> None:
                 })
 
     async with async_playwright() as playwright:
+        # Предварительная проверка авторизации
+        if entries:
+            first_url = entries[0]["lesson"]["url"]
+            await ensure_authenticated(playwright, first_url)
+
         browser = await playwright.firefox.launch_persistent_context(
             USER_DATA_DIR,
-            headless=False,
+            headless=True,
         )
 
         for entry in entries:
@@ -306,6 +373,7 @@ async def main() -> None:
                 lesson,
                 save_root,
                 quality_setting,
+                playwright=playwright,
             )
 
         await browser.close()
