@@ -86,7 +86,7 @@ class CoursesScreen:
         self._build_side_panel()
 
         self.log_lines: list[str] = []
-        self._log_column = ft.Column(scroll=ft.ScrollMode.AUTO, spacing=2)
+        self._log_column = ft.Column(scroll=ft.ScrollMode.AUTO, auto_scroll=True, spacing=1)
         self._log_container = ft.Container(
             width=440,
             height=180,
@@ -831,12 +831,41 @@ class CoursesScreen:
         await self._pick_directory(None)
         self.page.update()
 
+    @staticmethod
+    def _log_color(line: str) -> str:
+        if line.startswith("✅") or line.startswith("✓"):
+            return Color.GREEN
+        if line.startswith("❌") or "Ошибка" in line:
+            return Color.RED
+        if "Сегменты" in line:
+            return "#F59E0B"
+        return Color.TEXT_SECONDARY
+
     def _add_log(self, line: str):
         self.log_lines.append(line)
+        color = self._log_color(line)
         self._log_column.controls.append(
-            ft.Text(line, size=13, color=Color.TEXT_SECONDARY, selectable=False)
+            ft.Text(line, size=13, color=color, selectable=False)
         )
-        self.page.update()
+        try:
+            self.page.update()
+        except (IndexError, RuntimeError):
+            pass
+
+    def _update_last_log(self, line: str):
+        if self._log_column.controls:
+            last = self._log_column.controls[-1]
+            if isinstance(last, ft.Text):
+                last.value = line
+                last.color = self._log_color(line)
+                if self.log_lines:
+                    self.log_lines[-1] = line
+                try:
+                    self.page.update()
+                except (IndexError, RuntimeError):
+                    pass
+                return
+        self._add_log(line)
 
     def _show_continue_btn(self):
         self._continue_btn.visible = True
@@ -873,16 +902,10 @@ class CoursesScreen:
         self.overlay.visible = True
         self.page.update()
 
-        msg = f"🚀 Старт скачивания: {len(selected)} уроков"
-        self._add_log(msg)
-        self._add_log(f"   Качество: {self._quality}")
-        self._add_log(f"   Папка: {self._save_path}")
-        self._add_log("")
-
-        print(f"\n{msg}")
+        self._add_log(f"Старт скачивания: {len(selected)} уроков")
+        print(f"\n🚀 Старт скачивания: {len(selected)} уроков")
         print(f"   Качество: {self._quality}")
         print(f"   Папка: {self._save_path}")
-        print()
 
         lessons_to_download = []
         for idx, course in enumerate(self.data):
@@ -937,8 +960,21 @@ class CoursesScreen:
                 if not line:
                     continue
                 print(line)
-                page.run_thread(lambda l=line: self._add_log(l))
-                if "нажмите Enter" in line.lower() or "enter" in line.lower():
+
+                check = line.lower()
+
+                if "требуется авторизация" in check or "авторизация выполнена" in check:
+                    continue
+
+                if "\r" in line:
+                    parts = line.split("\r")
+                    clean = parts[-1].strip()
+                    if clean:
+                        page.run_thread(lambda l=clean: self._update_last_log(l))
+                else:
+                    page.run_thread(lambda l=line: self._add_log(l))
+
+                if "нажмите enter" in check:
                     page.run_thread(lambda: self._show_continue_btn())
 
             proc.wait()
