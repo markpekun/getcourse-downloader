@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import os
+import time
 import re
 import time
 from typing import Any
@@ -122,10 +123,10 @@ async def _download_video(playlist_url: str, output_path: str) -> None:
         sem = asyncio.Semaphore(10)
 
         downloaded_count = 0
-        last_report = 0
+        last_report_time = 0.0
 
         async def download_seg(idx: int, seg_url: str) -> str | None:
-            nonlocal downloaded_count, last_report
+            nonlocal downloaded_count, last_report_time
             async with sem:
                 for attempt in range(3):
                     try:
@@ -135,9 +136,10 @@ async def _download_video(playlist_url: str, output_path: str) -> None:
                         with open(path, "wb") as f:
                             f.write(data)
                         downloaded_count += 1
-                        pct = downloaded_count * 100 // total
-                        if pct >= last_report + 5 or downloaded_count - last_report >= 10:
-                            last_report = downloaded_count
+                        now = time.monotonic()
+                        if now - last_report_time >= 2.0:
+                            last_report_time = now
+                            pct = downloaded_count * 100 // total
                             print(f"\r  Сегменты: {downloaded_count}/{total} ({pct}%)", end="", flush=True)
                         return path
                     except Exception:
