@@ -1150,9 +1150,78 @@ class CoursesScreen:
                 pass
 
     def _finish_download(self, message: str, is_error: bool = False):
-        self.overlay.visible = False
         self._downloading = False
-        self._show_snack(message, is_error)
+        self._show_completion_overlay(message, is_error)
+
+    def _show_completion_overlay(self, message: str, is_error: bool = False):
+        """Показывает в оверлее результат загрузки: зелёную галочку или ошибку."""
+        icon_name = ft.Icons.CHECK_CIRCLE_ROUNDED if not is_error else ft.Icons.ERROR_ROUNDED
+        icon_color = Color.GREEN if not is_error else Color.RED
+        title = "Загружено" if not is_error else "Ошибка"
+
+        self._overlay_card.content = ft.Column(
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=16,
+            controls=[
+                # Close button (X) top-right
+                ft.Row(
+                    alignment=ft.MainAxisAlignment.END,
+                    controls=[
+                        ft.Container(
+                            content=ft.Icon(ft.Icons.CLOSE, size=20, color=Color.TEXT_SECONDARY),
+                            padding=ft.Padding.all(4),
+                            border_radius=6,
+                            ink=True,
+                            on_click=self._close_completion_overlay,
+                        ),
+                    ],
+                ),
+                # Icon
+                ft.Container(
+                    width=64, height=64,
+                    border_radius=32,
+                    bgcolor=ft.Colors.with_opacity(0.15, icon_color),
+                    content=ft.Icon(icon_name, size=36, color=icon_color),
+                ),
+                # Title
+                ft.Text(
+                    title,
+                    size=22,
+                    weight=ft.FontWeight.W_700,
+                    color=Color.TEXT,
+                    text_align=ft.TextAlign.CENTER,
+                ),
+                # Message body
+                ft.Text(
+                    message,
+                    size=14,
+                    color=Color.TEXT_SECONDARY,
+                    text_align=ft.TextAlign.CENTER,
+                ),
+                # Close button
+                ft.Container(
+                    content=ft.Text(
+                        "Закрыть",
+                        size=15,
+                        weight=ft.FontWeight.W_600,
+                        color=Color.TEXT,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                    width=200,
+                    padding=ft.Padding.symmetric(horizontal=24, vertical=12),
+                    border_radius=10,
+                    gradient=Gradient.ACCENT if not is_error else Gradient.SUNSET,
+                    ink=True,
+                    on_click=self._close_completion_overlay,
+                ),
+            ],
+        )
+        self.overlay.visible = True
+        self.page.update()
+
+    def _close_completion_overlay(self, e=None):
+        self.overlay.visible = False
+        self.page.update()
 
     def _show_snack(self, message: str, is_error: bool = False):
         bg = "#1A0A0A" if is_error else "#0A1A15"
