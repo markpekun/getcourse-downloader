@@ -8,7 +8,7 @@ from app.theme import Color, build_theme
 
 
 _START_WIN_W, _START_WIN_H = 680, 460
-_COURSES_WIN_W, _COURSES_WIN_H = 1200, 750
+_COURSES_WIN_W, _COURSES_WIN_H = 1400, 850
 
 
 class App:

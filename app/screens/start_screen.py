@@ -617,8 +617,8 @@ class StartScreen:
 
             self.loader.visible = False
             self.page.clean()
-            self.page.window.width = 1200
-            self.page.window.height = 750
+            self.page.window.width = 1400
+            self.page.window.height = 850
             screen = CoursesScreen(self.page)
             self.page.add(screen.view)
             await self.page.window.center()

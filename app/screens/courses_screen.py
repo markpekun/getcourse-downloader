@@ -747,7 +747,7 @@ class CoursesScreen:
                                         content=ft.Row(
                                             [
                                                 ft.Icon(ft.Icons.SELECT_ALL_ROUNDED, size=18, color=Color.TEXT_SECONDARY),
-                                                ft.Text("Все", size=14, weight=ft.FontWeight.W_500, color=Color.TEXT),
+                                                ft.Text("Выбрать все", size=14, weight=ft.FontWeight.W_500, color=Color.TEXT),
                                             ],
                                             spacing=6,
                                             alignment=ft.MainAxisAlignment.CENTER,
@@ -764,7 +764,7 @@ class CoursesScreen:
                                         content=ft.Row(
                                             [
                                                 ft.Icon(ft.Icons.DESELECT_ROUNDED, size=18, color=Color.TEXT_SECONDARY),
-                                                ft.Text("Нет", size=14, weight=ft.FontWeight.W_500, color=Color.TEXT),
+                                                ft.Text("Убрать все", size=14, weight=ft.FontWeight.W_500, color=Color.TEXT),
                                             ],
                                             spacing=6,
                                             alignment=ft.MainAxisAlignment.CENTER,
