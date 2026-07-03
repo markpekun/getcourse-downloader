@@ -204,6 +204,7 @@ async def ensure_authenticated(playwright: Any, url: str) -> bool:
         return True
 
     print("\n  🔐 Требуется авторизация. Открываю браузер для входа...\n")
+    await asyncio.sleep(5)
     browser = await playwright.firefox.launch_persistent_context(
         USER_DATA_DIR,
         headless=False,

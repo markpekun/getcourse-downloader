@@ -107,6 +107,54 @@ class CoursesScreen:
             content=ft.Text("Продолжить", size=14, weight=ft.FontWeight.W_600, color=Color.TEXT),
         )
 
+        # ── Auth overlay widgets (same as StartScreen) ──
+        self._auth_icon = ft.Container(
+            width=38, height=38, border_radius=11,
+            gradient=Gradient.ACCENT,
+            shadow=Shadow.GLOW_PRIMARY,
+            content=ft.Icon(ft.Icons.LOCK_ROUNDED, size=19, color=Color.TEXT),
+        )
+        self._auth_title = ft.Text(
+            "Требуется вход",
+            size=17, weight=ft.FontWeight.W_700, color=Color.TEXT,
+        )
+        self._auth_desc = ft.Text(
+            "Для доступа к материалам необходимо\nвыполнить вход в аккаунт.",
+            size=12, color=Color.TEXT_SECONDARY,
+            text_align=ft.TextAlign.CENTER,
+        )
+        _auth_steps = [
+            "Дождитесь открытия браузера.",
+            "Выполните вход в аккаунт.",
+            "Вернитесь в приложение.",
+            "Нажмите «Продолжить».",
+        ]
+        self._auth_instructions = ft.Container(
+            padding=ft.Padding.symmetric(vertical=2),
+            content=ft.Column(
+                spacing=2,
+                controls=[
+                    ft.Row(
+                        spacing=6,
+                        controls=[
+                            ft.Text(f"{i+1}.", size=12, color=Color.ACCENT_LIGHT, weight=ft.FontWeight.W_600),
+                            ft.Text(step, size=12, color=Color.TEXT_SECONDARY),
+                        ],
+                    )
+                    for i, step in enumerate(_auth_steps)
+                ],
+            ),
+        )
+        self._auth_status = ft.Text(
+            "Ожидаем вход в браузере...",
+            size=13, color=Color.ACCENT_LIGHT,
+            weight=ft.FontWeight.W_500,
+            text_align=ft.TextAlign.CENTER,
+            height=20,
+        )
+
+        self._auth_overlay_task: asyncio.Task | None = None
+
         self._overlay_card = ft.Container(
             width=500,
             padding=ft.Padding.all(24),
@@ -896,8 +944,79 @@ class CoursesScreen:
         self._continue_btn.visible = True
         self.page.update()
 
+    def _switch_overlay_to_download(self):
+        """Переключает содержимое оверлея на панель загрузки (логи + прогресс)."""
+        # Отменяем таймер авторизации, если он ещё идёт
+        if self._auth_overlay_task is not None:
+            self._auth_overlay_task.cancel()
+            self._auth_overlay_task = None
+
+        self._overlay_card.content = ft.Column(
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=12,
+            controls=[
+                ft.ProgressRing(width=40, height=40, color=Color.ACCENT, stroke_width=4),
+                ft.Text("Загрузка видео", size=18, weight=ft.FontWeight.W_600, color=Color.TEXT),
+                self._log_container,
+                self._continue_btn,
+            ],
+        )
+        self.page.update()
+
+    def _switch_overlay_to_auth(self):
+        """Переключает оверлей на карточку авторизации с обратным отсчётом."""
+        # Отменяем предыдущий таймер, если есть
+        if self._auth_overlay_task is not None:
+            self._auth_overlay_task.cancel()
+            self._auth_overlay_task = None
+
+        self._continue_btn.visible = False
+        self._auth_status.value = "Требуется авторизация"
+        self._overlay_card.content = ft.Column(
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=8,
+            controls=[
+                self._auth_icon,
+                self._auth_title,
+                self._auth_desc,
+                self._auth_instructions,
+                self._auth_status,
+                self._continue_btn,
+            ],
+        )
+        self.page.update()
+
+        # Запускаем обратный отсчёт перед появлением кнопки
+        try:
+            loop = asyncio.get_running_loop()
+            self._auth_overlay_task = loop.create_task(self._auth_overlay_countdown())
+        except RuntimeError:
+            self._continue_btn.visible = True
+            self.page.update()
+
+    async def _auth_overlay_countdown(self):
+        """Отсчёт 5 секунд перед тем, как станет активной кнопка «Продолжить»."""
+        try:
+            for i in range(5, 0, -1):
+                self._auth_status.value = f"Браузер откроется через {i} сек."
+                try:
+                    self.page.update()
+                except Exception:
+                    return
+                await asyncio.sleep(1)
+
+            self._auth_status.value = "Войдите в аккаунт в браузере"
+            self._continue_btn.visible = True
+            try:
+                self.page.update()
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            pass
+
     def _send_continue(self, e):
         self._continue_btn.visible = False
+        self._switch_overlay_to_download()
         self.page.update()
         if hasattr(self, '_proc_stdin') and self._proc_stdin:
             try:
@@ -925,6 +1044,7 @@ class CoursesScreen:
         self._continue_btn.visible = False
         self._proc_stdin = None
 
+        self._switch_overlay_to_download()
         self._overlay_card.opacity = 0
         self._overlay_card.offset = ft.Offset(0, 0.15)
         self.overlay.visible = True
@@ -994,7 +1114,8 @@ class CoursesScreen:
 
                 check = line.lower()
 
-                if "авторизац" in check:
+                if "открываю браузер" in check and "входа" in check:
+                    page.run_thread(lambda: self._switch_overlay_to_auth())
                     continue
 
                 if "\r" in line:
@@ -1005,7 +1126,7 @@ class CoursesScreen:
                 else:
                     page.run_thread(lambda l=line: self._add_log(l))
 
-                if "нажмите enter" in check:
+                if "нажмите enter" in check and "выполнен" not in check:
                     page.run_thread(lambda: self._show_continue_btn())
 
             proc.wait()
