@@ -104,7 +104,7 @@ winget install --id Gyan.FFmpeg -e
 ### Запуск приложения
 
 ```bash
-python app/main.py
+python -m app.main
 ```
 
 ### Пошаговый сценарий
