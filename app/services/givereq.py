@@ -4,21 +4,23 @@ import argparse
 import asyncio
 import json
 import os
-import time
 import re
+import sys
 import time
 from typing import Any
 
 from pathlib import Path
 from urllib.parse import urljoin
 
-from playwright.async_api import async_playwright
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from utils_console import configure_console_output
+from playwright.async_api import async_playwright
 
 USER_DATA_DIR = "session_data"
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-_COURSES_PATH = _PROJECT_ROOT / "app" / "data" / "courses.json"
+_COURSES_PATH = Path(_PROJECT_ROOT) / "app" / "data" / "courses.json"
 
 configure_console_output()
 
@@ -251,7 +253,6 @@ async def process_lesson(
 
     page.on("response", lambda resp: asyncio.create_task(_on_response(resp)))
 
-    await page.goto(lesson_url)
 
     for attempt in range(3):
         if "login" not in page.url.lower() and "required=true" not in page.url:
@@ -261,7 +262,6 @@ async def process_lesson(
         master_playlists.clear()
         last_arrival = 0.0
         await _countdown(10, "Повторная попытка")
-        await page.goto(lesson_url)
     else:
         print("  ⚠ Автоматические попытки не удались")
         if playwright:
@@ -282,7 +282,6 @@ async def process_lesson(
         master_urls_seen.clear()
         master_playlists.clear()
         last_arrival = 0.0
-        await page.goto(lesson_url)
 
     start_time = time.monotonic()
     while True:
