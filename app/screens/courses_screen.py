@@ -107,7 +107,6 @@ class CoursesScreen:
             content=ft.Text("Продолжить", size=14, weight=ft.FontWeight.W_600, color=Color.TEXT),
         )
 
-        # ── Auth overlay widgets (same as StartScreen) ──
         self._auth_icon = ft.Container(
             width=38, height=38, border_radius=11,
             gradient=Gradient.ACCENT,
@@ -945,8 +944,6 @@ class CoursesScreen:
         self.page.update()
 
     def _switch_overlay_to_download(self):
-        """Переключает содержимое оверлея на панель загрузки (логи + прогресс)."""
-        # Отменяем таймер авторизации, если он ещё идёт
         if self._auth_overlay_task is not None:
             self._auth_overlay_task.cancel()
             self._auth_overlay_task = None
@@ -964,8 +961,6 @@ class CoursesScreen:
         self.page.update()
 
     def _switch_overlay_to_auth(self):
-        """Переключает оверлей на карточку авторизации с обратным отсчётом."""
-        # Отменяем предыдущий таймер, если есть
         if self._auth_overlay_task is not None:
             self._auth_overlay_task.cancel()
             self._auth_overlay_task = None
@@ -986,7 +981,6 @@ class CoursesScreen:
         )
         self.page.update()
 
-        # Запускаем обратный отсчёт перед появлением кнопки
         try:
             loop = asyncio.get_running_loop()
             self._auth_overlay_task = loop.create_task(self._auth_overlay_countdown())
@@ -995,7 +989,6 @@ class CoursesScreen:
             self.page.update()
 
     async def _auth_overlay_countdown(self):
-        """Отсчёт 5 секунд перед тем, как станет активной кнопка «Продолжить»."""
         try:
             for i in range(5, 0, -1):
                 self._auth_status.value = f"Браузер откроется через {i} сек."
@@ -1154,7 +1147,6 @@ class CoursesScreen:
         self._show_completion_overlay(message, is_error)
 
     def _show_completion_overlay(self, message: str, is_error: bool = False):
-        """Показывает в оверлее результат загрузки: зелёную галочку или ошибку."""
         icon_name = ft.Icons.CHECK_CIRCLE_ROUNDED if not is_error else ft.Icons.ERROR_ROUNDED
         icon_color = Color.GREEN if not is_error else Color.RED
         title = "Загружено" if not is_error else "Ошибка"
@@ -1163,7 +1155,6 @@ class CoursesScreen:
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             spacing=16,
             controls=[
-                # Close button (X) top-right
                 ft.Row(
                     alignment=ft.MainAxisAlignment.END,
                     controls=[
@@ -1176,14 +1167,12 @@ class CoursesScreen:
                         ),
                     ],
                 ),
-                # Icon
                 ft.Container(
                     width=64, height=64,
                     border_radius=32,
                     bgcolor=ft.Colors.with_opacity(0.15, icon_color),
                     content=ft.Icon(icon_name, size=36, color=icon_color),
                 ),
-                # Title
                 ft.Text(
                     title,
                     size=22,
@@ -1191,14 +1180,12 @@ class CoursesScreen:
                     color=Color.TEXT,
                     text_align=ft.TextAlign.CENTER,
                 ),
-                # Message body
                 ft.Text(
                     message,
                     size=14,
                     color=Color.TEXT_SECONDARY,
                     text_align=ft.TextAlign.CENTER,
                 ),
-                # Close button
                 ft.Container(
                     content=ft.Text(
                         "Закрыть",

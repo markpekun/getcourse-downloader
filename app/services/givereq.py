@@ -87,7 +87,6 @@ def _select_quality_url(qualities: dict[int, str], quality_filter: str) -> str |
 
 
 async def _countdown(seconds: int, message: str = "Ожидание") -> None:
-    """Асинхронный обратный отсчёт с красивым выводом."""
     for i in range(seconds, 0, -1):
         print(f"\r  ⏳ {message}: {i} сек.", end="", flush=True)
         await asyncio.sleep(1)
@@ -189,7 +188,6 @@ async def _download_video(playlist_url: str, output_path: str) -> None:
 
 
 async def ensure_authenticated(playwright: Any, url: str) -> bool:
-    """Проверить авторизацию headless, если нужно — открыть браузер для входа."""
     browser = await playwright.firefox.launch_persistent_context(
         USER_DATA_DIR,
         headless=True,
@@ -265,7 +263,6 @@ async def process_lesson(
         await _countdown(10, "Повторная попытка")
         await page.goto(lesson_url)
     else:
-        # Все 3 попытки исчерпаны — нужна ручная авторизация
         print("  ⚠ Автоматические попытки не удались")
         if playwright:
             print("  🔐 Открываю браузер для ручного входа...")
@@ -282,7 +279,6 @@ async def process_lesson(
         else:
             print("  ⚠ Передайте playwright для повторной авторизации")
             return
-        # После авторизации повторяем навигацию
         master_urls_seen.clear()
         master_playlists.clear()
         last_arrival = 0.0
@@ -356,7 +352,6 @@ async def main() -> None:
                 })
 
     async with async_playwright() as playwright:
-        # Предварительная проверка авторизации
         if entries:
             first_url = entries[0]["lesson"]["url"]
             await ensure_authenticated(playwright, first_url)

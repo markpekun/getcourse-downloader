@@ -91,33 +91,71 @@ async def parse_courses(
     await page.goto(playlist_url)
 
     print("[INFO] Загружаю список курсов...")
-    await page.wait_for_selector("tr.training-row")
-    rows = await page.query_selector_all("tr.training-row")
+    print("   → Ищу список курсов на странице...")
+    try:
+        await page.wait_for_selector("tr.training-row", timeout=5_000)
+        rows = await page.query_selector_all("tr.training-row")
+    except Exception:
+        rows = []
 
-    courses: list[dict[str, str]] = []
-    for row in rows:
-        title_el = await row.query_selector("span.stream-title")
-        course_title: str = await title_el.inner_text() if title_el else "Без названия"
+    if rows:
+        courses: list[dict[str, str]] = []
+        for row in rows:
+            title_el = await row.query_selector("span.stream-title")
+            course_title: str = await title_el.inner_text() if title_el else "Без названия"
 
-        link_el = await row.query_selector("a")
-        href: str = await link_el.get_attribute("href") if link_el else "#"
-        href = urljoin(playlist_url, href)
+            link_el = await row.query_selector("a")
+            href: str = await link_el.get_attribute("href") if link_el else "#"
+            href = urljoin(playlist_url, href)
 
-        courses.append({"title": clean_title(course_title), "href": href})
+            courses.append({"title": clean_title(course_title), "href": href})
 
-    all_courses: list[dict] = []
-    for course in courses:
-        print(f"\n[COURSE] {course['title']}")
-        await page.goto(course["href"])
+        all_courses = []
+        for course in courses:
+            print(f"\n[COURSE] {course['title']}")
+            await page.goto(course["href"])
 
-        try:
-            await page.wait_for_selector("ul.lesson-list li", timeout=LESSON_LIST_TIMEOUT)
-            lesson_elements = await page.query_selector_all("ul.lesson-list li")
-        except Exception:
-            lesson_elements = []
+            try:
+                await page.wait_for_selector("ul.lesson-list li", timeout=LESSON_LIST_TIMEOUT)
+                lesson_elements = await page.query_selector_all("ul.lesson-list li")
+            except Exception:
+                lesson_elements = []
 
-        lessons_data: list[dict[str, str]] = []
-        for lesson in lesson_elements:
+            lessons_data = []
+            for lesson in lesson_elements:
+                title_el = await lesson.query_selector("div.link.title")
+                lesson_title: str = await title_el.inner_text() if title_el else "Без названия"
+                lesson_title = clean_title(lesson_title)
+
+                link_el = await lesson.query_selector("a")
+                lesson_href: str = await link_el.get_attribute("href") if link_el else "#"
+                lesson_href = urljoin(playlist_url, lesson_href)
+
+                print(f"   [LESSON] {lesson_title}")
+                lessons_data.append({"title": lesson_title, "url": lesson_href})
+
+            all_courses.append({"course_title": course["title"], "lessons": lessons_data})
+
+            if on_course_parsed:
+                await on_course_parsed(course["title"], len(lessons_data))
+
+        await browser.close()
+        return all_courses
+
+    lessons = await page.query_selector_all("ul.lesson-list li")
+
+    if lessons:
+        print("   → Найдены уроки на текущей странице (один курс)")
+        course_title_el = await page.query_selector("h1")
+        course_title: str = await course_title_el.inner_text() if course_title_el else "Курс"
+        course_title = clean_title(course_title)
+
+        all_courses: list[dict] = [{
+            "course_title": course_title,
+            "lessons": [],
+        }]
+
+        for lesson in lessons:
             title_el = await lesson.query_selector("div.link.title")
             lesson_title: str = await title_el.inner_text() if title_el else "Без названия"
             lesson_title = clean_title(lesson_title)
@@ -127,15 +165,17 @@ async def parse_courses(
             lesson_href = urljoin(playlist_url, lesson_href)
 
             print(f"   [LESSON] {lesson_title}")
-            lessons_data.append({"title": lesson_title, "url": lesson_href})
-
-        all_courses.append({"course_title": course["title"], "lessons": lessons_data})
+            all_courses[0]["lessons"].append({"title": lesson_title, "url": lesson_href})
 
         if on_course_parsed:
-            await on_course_parsed(course["title"], len(lessons_data))
+            await on_course_parsed(course_title, len(all_courses[0]["lessons"]))
 
+        await browser.close()
+        return all_courses
+
+    print("   ⚠ Не удалось найти курсы или уроки на странице.")
     await browser.close()
-    return all_courses
+    return []
 
 
 async def main() -> None:
