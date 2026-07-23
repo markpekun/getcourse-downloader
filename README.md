@@ -16,7 +16,9 @@
   <img src="https://img.shields.io/badge/build-passing-brightgreen"/>
 </p>
 
-<img width="1386" height="843" alt="21ч46м28с" src="https://github.com/user-attachments/assets/22250e33-d7f8-4738-ad6a-f4578eb185cd" />
+<p align="center">
+  <img src="./picture/info-gif.gif" width="100%">
+</p>
 
 ## ✨ Возможности
 
