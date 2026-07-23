@@ -62,7 +62,7 @@
 ### 1. Клонируй репозиторий
 
 ```bash
-git clone https://github.com/markpekun/GetCourseVideoDownloader.git
+https://github.com/markpekun/getcourse-downloader.git
 cd GetCourseVideoDownloader
 ```
 
