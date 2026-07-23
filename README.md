@@ -7,7 +7,7 @@
   <img src="https://img.shields.io/badge/license-MIT-purple"/>
 </p>
 
-<h1 align="center">GetCourseVideoDownloader</h1>
+<h1 align="center">getcourse-saver</h1>
 
 <p align="center">
   <b>Автоматическая загрузка видео с GetCourse с сохранением структуры курса, поддержкой авторизации, HLS (m3u8), выбором качества и возможностью продолжения загрузк</b>
