@@ -10,7 +10,7 @@
 <h1 align="center">GetCourseVideoDownloader</h1>
 
 <p align="center">
-  <b>Десктопное приложение для скачивания видеоуроков с платформы GetCourse</b>
+  <b>Автоматическая загрузка видео с GetCourse с сохранением структуры курса, поддержкой авторизации, HLS (m3u8), выбором качества и возможностью продолжения загрузк</b>
   <br>
   <img src="https://img.shields.io/badge/Windows-10%2F11-0078D6?logo=windows&logoColor=white"/>
   <img src="https://img.shields.io/badge/build-passing-brightgreen"/>
