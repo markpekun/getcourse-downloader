@@ -62,11 +62,10 @@ class CoursesScreen:
         self._open_task: asyncio.Task | None = None
         self._diagnostic_reports: dict[str, Path] = {}
         self._diagnostic_reports_by_title: dict[str, Path] = {}
-        self._last_run_report: Path | None = None
-        self._current_run_report: Path | None = None
         self._diagnostic_open = False
         self._diagnostic_previous_content: ft.Control | None = None
         self._diagnostic_previous_visible = False
+        self._active_download_id = 0
         self._download_title = ft.Text(
             "Подготовка",
             size=18,
@@ -115,19 +114,19 @@ class CoursesScreen:
             color=Color.TEXT_SECONDARY,
             weight=ft.FontWeight.W_500,
         )
-        self._diagnostics_button = ft.Container(
+        self._logs_button = ft.Container(
             visible=False,
             content=ft.Icon(
-                ft.Icons.BUG_REPORT_OUTLINED,
+                ft.Icons.SUBJECT_OUTLINED,
                 size=19,
-                color=Color.YELLOW,
+                color=Color.ACCENT_LIGHT,
             ),
             padding=ft.Padding.all(7),
             border_radius=8,
-            bgcolor="rgba(245,158,11,0.10)",
+            bgcolor="rgba(124,58,237,0.10)",
             ink=True,
-            tooltip="Открыть последний отчёт диагностики",
-            on_click=self._show_run_diagnostics,
+            tooltip="Открыть логи загрузки",
+            on_click=self._show_logs,
         )
 
         self.course_list = ft.Column(spacing=12, scroll=ft.ScrollMode.AUTO, expand=True)
@@ -180,6 +179,15 @@ class CoursesScreen:
                 color=Color.RED,
                 side=ft.BorderSide(1, "rgba(239,68,68,0.55)"),
                 padding=ft.Padding.symmetric(horizontal=20, vertical=9),
+            ),
+        )
+        self._overlay_logs_button = ft.OutlinedButton(
+            "Логи",
+            icon=ft.Icons.SUBJECT_OUTLINED,
+            on_click=self._show_logs,
+            style=ft.ButtonStyle(
+                color=Color.ACCENT_LIGHT,
+                side=ft.BorderSide(1, "rgba(124,58,237,0.55)"),
             ),
         )
 
@@ -271,6 +279,7 @@ class CoursesScreen:
                     ),
                     self._download_rows_container,
                     self._continue_btn,
+                    self._overlay_logs_button,
                     self._cancel_btn,
                 ],
             ),
@@ -289,6 +298,63 @@ class CoursesScreen:
                         alignment=ft.MainAxisAlignment.CENTER,
                         controls=[self._overlay_card],
                     ),
+                ],
+            ),
+        )
+
+        self._logs_overlay = ft.Container(
+            expand=True,
+            bgcolor="rgba(0,0,0,0.58)",
+            visible=False,
+            content=ft.Row(
+                expand=True,
+                alignment=ft.MainAxisAlignment.CENTER,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.Container(
+                        width=620,
+                        padding=ft.Padding.all(24),
+                        border_radius=20,
+                        bgcolor=Color.BG_CARD,
+                        border=ft.Border.all(1, Color.BORDER),
+                        shadow=Shadow.CARD,
+                        gradient=Gradient.CARD,
+                        content=ft.Column(
+                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                            spacing=14,
+                            controls=[
+                                ft.Row(
+                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                                    controls=[
+                                        ft.Row(
+                                            spacing=8,
+                                            controls=[
+                                                ft.Icon(
+                                                    ft.Icons.SUBJECT_OUTLINED,
+                                                    size=24,
+                                                    color=Color.ACCENT_LIGHT,
+                                                ),
+                                                ft.Text(
+                                                    "Логи загрузки",
+                                                    size=19,
+                                                    weight=ft.FontWeight.W_700,
+                                                    color=Color.TEXT,
+                                                ),
+                                            ],
+                                        ),
+                                        ft.IconButton(
+                                            icon=ft.Icons.CLOSE,
+                                            icon_color=Color.TEXT_SECONDARY,
+                                            tooltip="Закрыть логи",
+                                            on_click=self._close_logs,
+                                        ),
+                                    ],
+                                ),
+                                self._log_container,
+                                ft.OutlinedButton("Закрыть", on_click=self._close_logs),
+                            ],
+                        ),
+                    )
                 ],
             ),
         )
@@ -408,6 +474,7 @@ class CoursesScreen:
                         ],
                     ),
                     self.overlay,
+                    self._logs_overlay,
                     self.error_overlay,
                 ],
             ),
@@ -477,7 +544,7 @@ class CoursesScreen:
                                         "(обновляется раз в 3 секунды)"
                                     ),
                                 ),
-                                self._diagnostics_button,
+                                self._logs_button,
                                 ft.Container(
                                     content=ft.Icon(
                                         ft.Icons.DELETE_ROUNDED,
@@ -1083,6 +1150,7 @@ class CoursesScreen:
                 self._download_title,
                 self._download_rows_container,
                 self._continue_btn,
+                self._overlay_logs_button,
                 self._cancel_btn,
             ],
         )
@@ -1160,6 +1228,8 @@ class CoursesScreen:
 
         self.state.downloading = True
         self.state.cancelling = False
+        self._active_download_id += 1
+        run_id = self._active_download_id
         self._reset_download_follow()
         self._cancel_btn.disabled = False
         self._cancel_btn.content = "Отмена"
@@ -1168,7 +1238,7 @@ class CoursesScreen:
         self._log_column.controls.clear()
         self._diagnostic_reports.clear()
         self._diagnostic_reports_by_title.clear()
-        self._current_run_report = None
+        self._logs_button.visible = True
         self._download_rows.clear()
         self._download_rows_column.controls.clear()
         for item in lessons_to_download:
@@ -1198,17 +1268,19 @@ class CoursesScreen:
         self._controller.start_download(
             request,
             on_event=lambda event: self.page.run_thread(
-                partial(self._handle_download_event, event)
+                partial(self._handle_download_event, event, run_id=run_id)
             ),
             on_finished=lambda summary: self.page.run_thread(
-                partial(self._finish_summary, summary)
+                partial(self._finish_summary, summary, run_id=run_id)
             ),
             on_failed=lambda error: self.page.run_thread(
-                partial(self._finish_download, f"Ошибка: {error}", True)
+                partial(self._finish_download, f"Ошибка: {error}", True, run_id=run_id)
             ),
         )
 
-    def _handle_download_event(self, event: DownloadEvent) -> None:
+    def _handle_download_event(self, event: DownloadEvent, *, run_id: int | None = None) -> None:
+        if run_id is not None and run_id != self._active_download_id:
+            return
         self._remember_diagnostic(event)
         if event.type is DownloadEventType.AUTH_REQUIRED:
             self._switch_overlay_to_auth()
@@ -1252,9 +1324,6 @@ class CoursesScreen:
             return
         report = Path(event.diagnostic_report)
         if event.type is DownloadEventType.SUMMARY:
-            self._last_run_report = report
-            self._current_run_report = report
-            self._diagnostics_button.visible = True
             return
         if event.lesson_url:
             self._diagnostic_reports[event.lesson_url] = report
@@ -1268,11 +1337,13 @@ class CoursesScreen:
             return
         self._show_diagnostic_report(report, "Отчёт по уроку")
 
-    def _show_run_diagnostics(self, _event=None) -> None:
-        if self._last_run_report is None:
-            self._show_snack("Общий отчёт пока не создан", is_error=True)
-            return
-        self._show_diagnostic_report(self._last_run_report, "Общий отчёт загрузки")
+    def _show_logs(self, _event=None) -> None:
+        self._logs_overlay.visible = True
+        self.page.update()
+
+    def _close_logs(self, _event=None) -> None:
+        self._logs_overlay.visible = False
+        self.page.update()
 
     def _show_diagnostic_report(self, path: Path, title: str) -> None:
         try:
@@ -1427,7 +1498,9 @@ class CoursesScreen:
             row.progress_text.visible = False
         self.page.update()
 
-    def _finish_summary(self, summary: DownloadSummary) -> None:
+    def _finish_summary(self, summary: DownloadSummary, *, run_id: int | None = None) -> None:
+        if run_id is not None and run_id != self._active_download_id:
+            return
         if summary.cancelled:
             self._mark_unfinished_rows(
                 "Остановлено",
@@ -1458,7 +1531,11 @@ class CoursesScreen:
         is_error: bool = False,
         is_warning: bool = False,
         failed: list[str] | None = None,
+        *,
+        run_id: int | None = None,
     ):
+        if run_id is not None and run_id != self._active_download_id:
+            return
         self.state.downloading = False
         self.state.cancelling = False
         self._reset_download_follow()
@@ -1605,17 +1682,6 @@ class CoursesScreen:
                     color=Color.TEXT_SECONDARY,
                     text_align=ft.TextAlign.CENTER,
                 ),
-            )
-
-        if self._current_run_report is not None:
-            controls.append(ft.Container(height=14))
-            controls.append(
-                ft.OutlinedButton(
-                    "Открыть общий отчёт",
-                    icon=ft.Icons.BUG_REPORT_OUTLINED,
-                    on_click=self._show_run_diagnostics,
-                    style=ft.ButtonStyle(color=Color.ACCENT_LIGHT),
-                )
             )
 
         if not is_error:

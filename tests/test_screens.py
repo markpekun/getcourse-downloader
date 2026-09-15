@@ -202,6 +202,23 @@ def test_no_video_summary_is_presented_as_warning():
     assert "Без видео: 1" in str(captured["message"])
 
 
+def test_stale_download_completion_does_not_replace_active_overlay():
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen._active_download_id = 2
+    screen.state = SimpleNamespace(downloading=True)
+    completion_called = False
+
+    def finish(*_args, **_kwargs):
+        nonlocal completion_called
+        completion_called = True
+
+    screen._finish_download = finish
+    screen._finish_summary(DownloadSummary(total=1, downloaded=1), run_id=1)
+
+    assert completion_called is False
+    assert screen.state.downloading is True
+
+
 def _nested_course() -> Course:
     lessons = tuple(
         Lesson(f"Урок {index}", f"https://school.example/lesson/{index}") for index in range(1, 15)
@@ -410,12 +427,11 @@ def test_failed_download_row_exposes_the_individual_diagnostic_report():
     assert opened == ["opened"]
 
 
-def test_screen_tracks_individual_and_last_run_diagnostic_reports():
+def test_screen_tracks_individual_diagnostic_reports_without_exposing_run_report():
     screen = CoursesScreen.__new__(CoursesScreen)
     screen._diagnostic_reports = {}
     screen._diagnostic_reports_by_title = {}
     screen._last_run_report = None
-    screen._diagnostics_button = SimpleNamespace(visible=False)
 
     screen._remember_diagnostic(
         DownloadEvent(
@@ -436,8 +452,7 @@ def test_screen_tracks_individual_and_last_run_diagnostic_reports():
         "C:/reports/lesson.json"
     )
     assert screen._diagnostic_reports_by_title["Урок"] == Path("C:/reports/lesson.json")
-    assert screen._last_run_report == Path("C:/reports/last-run.json")
-    assert screen._diagnostics_button.visible is True
+    assert screen._last_run_report is None
 
 
 def test_no_video_row_exposes_its_diagnostic_report_without_relayout():
@@ -485,7 +500,7 @@ def test_diagnostic_report_viewport_fits_inside_overlay_card(tmp_path):
     assert screen.overlay.visible is True
 
 
-def test_failed_run_does_not_offer_previous_runs_report_as_current():
+def test_completion_overlay_never_offers_a_general_diagnostic_report():
     screen = CoursesScreen.__new__(CoursesScreen)
     screen.page = SimpleNamespace(update=lambda: None)
     screen.overlay = SimpleNamespace(visible=False)
@@ -509,7 +524,7 @@ def test_failed_run_does_not_offer_previous_runs_report_as_current():
         for control in screen._overlay_card.content.controls
         if isinstance(control, ft.OutlinedButton)
     ]
-    assert any(button.content == "Открыть общий отчёт" for button in buttons)
+    assert not any(button.content == "Открыть общий отчёт" for button in buttons)
 
 
 def test_closing_diagnostics_restores_active_download_controls(tmp_path):
