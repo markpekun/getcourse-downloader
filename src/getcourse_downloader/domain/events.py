@@ -44,6 +44,9 @@ class DownloadEvent:
     quality: str = ""
     speed_bps: float | None = None
     level: str = "info"
+    error_code: str = ""
+    source_host: str = ""
+    diagnostic_report: str = ""
 
     def to_json(self) -> str:
         payload = {"protocol_version": 2, **asdict(self)}
@@ -93,6 +96,9 @@ class DownloadEvent:
                 else None
             ),
             level=str(data.get("level", "info")),
+            error_code=str(data.get("error_code", "")),
+            source_host=str(data.get("source_host", "")),
+            diagnostic_report=str(data.get("diagnostic_report", "")),
         )
 
     @classmethod
