@@ -3,6 +3,7 @@ import concurrent.futures
 from types import SimpleNamespace
 
 from getcourse_downloader.application.ports.discovery import CourseDiscoveryUpdate
+from getcourse_downloader.domain.errors import ExternalServiceError
 from getcourse_downloader.presentation.flet.screens.start.state import StartViewState
 from getcourse_downloader.presentation.flet.screens.start.view import StartScreen
 
@@ -48,6 +49,97 @@ def test_successful_discovery_does_not_cancel_its_own_navigation_task():
     assert transition_completed is True
     assert task_cancelled is False
     assert parse_task is None
+
+
+def test_discovery_failure_stays_visible_with_code_and_sanitized_details():
+    error = ExternalServiceError(
+        "Сайт не ответил за отведённое время.",
+        code="SITE_TIMEOUT",
+        technical_details=(
+            "Timeout at C:\\Users\\Alice\\browser-profile "
+            "https://school.example/course?token=private-value"
+        ),
+    )
+
+    class Controller:
+        async def discover(self, *_args, **_kwargs):
+            raise error
+
+    class Page:
+        def __init__(self) -> None:
+            self.updates = 0
+
+        def update(self) -> None:
+            self.updates += 1
+
+    async def scenario():
+        screen = StartScreen.__new__(StartScreen)
+        screen._controller = Controller()
+        screen._loading_task = None
+        screen._dot_task = None
+        screen._discovery_scroll_task = None
+        screen._pending_discovery_scroll_url = None
+        screen._auth_event = asyncio.Event()
+        screen.page = Page()
+        screen.state = SimpleNamespace(parse_running=True, discovery_visible=True)
+        screen.loader = SimpleNamespace(visible=True, content=None)
+        screen.url_input = SimpleNamespace(value="https://school.example/course")
+        screen._parse_task = concurrent.futures.Future()
+        screen._stop_all_animations = lambda: None
+        screen._on_courses_ready = lambda: None
+
+        await screen._parse_async(screen.url_input.value)
+        return screen
+
+    screen = asyncio.run(scenario())
+
+    assert screen.loader.visible is True
+    assert screen.url_input.value == "https://school.example/course"
+    assert screen._error_code.value == "Код ошибки: SITE_TIMEOUT"
+    assert screen._error_message.value == "Сайт не ответил за отведённое время."
+    assert "Alice" not in screen._error_details.value
+    assert "private-value" not in screen._error_details.value
+    assert screen._error_details_box.visible is False
+    assert callable(screen._error_details_button.on_click)
+    assert callable(screen._error_retry_button.on_click)
+    assert screen._parse_task is None
+
+
+def test_error_details_toggle_and_retry_reuse_the_entered_url():
+    screen = StartScreen.__new__(StartScreen)
+    screen.page = SimpleNamespace(update=lambda: None)
+    screen.loader = SimpleNamespace(visible=True)
+    screen._error_details_box = SimpleNamespace(visible=False)
+    screen._error_details_button = SimpleNamespace(text="Показать подробности")
+    retries = []
+    screen._start_parse = lambda: retries.append("retry")
+
+    screen._toggle_error_details(None)
+    assert screen._error_details_box.visible is True
+    assert screen._error_details_button.text == "Скрыть подробности"
+
+    screen._retry_after_error(None)
+    assert retries == ["retry"]
+
+
+def test_unexpected_failure_does_not_expose_raw_details_in_the_summary():
+    class Page:
+        def update(self) -> None:
+            return None
+
+    screen = StartScreen.__new__(StartScreen)
+    screen.page = Page()
+    screen.loader = SimpleNamespace(visible=False, content=None)
+    error = RuntimeError(
+        "failed at C:\\Users\\Alice\\profile https://school.example/course?token=private-value"
+    )
+
+    screen._show_error(error)
+
+    assert screen._error_code.value == "Код ошибки: INTERNAL_ERROR"
+    assert screen._error_message.value == "Произошла непредвиденная ошибка."
+    assert "Alice" not in screen._error_details.value
+    assert "private-value" not in screen._error_details.value
 
 
 def test_discovery_scroll_targets_processed_row_and_ignores_detached_control():

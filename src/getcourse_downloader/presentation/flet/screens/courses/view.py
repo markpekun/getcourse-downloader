@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import contextlib
+import json
 from collections.abc import Awaitable, Callable
 from functools import partial
 from pathlib import Path
@@ -59,6 +60,13 @@ class CoursesScreen:
         self._download_follow_paused = False
         self._active_lesson_url: str | None = None
         self._open_task: asyncio.Task | None = None
+        self._diagnostic_reports: dict[str, Path] = {}
+        self._diagnostic_reports_by_title: dict[str, Path] = {}
+        self._last_run_report: Path | None = None
+        self._current_run_report: Path | None = None
+        self._diagnostic_open = False
+        self._diagnostic_previous_content: ft.Control | None = None
+        self._diagnostic_previous_visible = False
         self._download_title = ft.Text(
             "Подготовка",
             size=18,
@@ -106,6 +114,20 @@ class CoursesScreen:
             size=12,
             color=Color.TEXT_SECONDARY,
             weight=ft.FontWeight.W_500,
+        )
+        self._diagnostics_button = ft.Container(
+            visible=False,
+            content=ft.Icon(
+                ft.Icons.BUG_REPORT_OUTLINED,
+                size=19,
+                color=Color.YELLOW,
+            ),
+            padding=ft.Padding.all(7),
+            border_radius=8,
+            bgcolor="rgba(245,158,11,0.10)",
+            ink=True,
+            tooltip="Открыть последний отчёт диагностики",
+            on_click=self._show_run_diagnostics,
         )
 
         self.course_list = ft.Column(spacing=12, scroll=ft.ScrollMode.AUTO, expand=True)
@@ -455,6 +477,7 @@ class CoursesScreen:
                                         "(обновляется раз в 3 секунды)"
                                     ),
                                 ),
+                                self._diagnostics_button,
                                 ft.Container(
                                     content=ft.Icon(
                                         ft.Icons.DELETE_ROUNDED,
@@ -1045,6 +1068,8 @@ class CoursesScreen:
         self.page.update()
 
     def _switch_overlay_to_download(self):
+        self._diagnostic_open = False
+        self._diagnostic_previous_content = None
         if self._auth_overlay_task is not None:
             self._auth_overlay_task.cancel()
             self._auth_overlay_task = None
@@ -1064,6 +1089,8 @@ class CoursesScreen:
         self.page.update()
 
     def _switch_overlay_to_auth(self):
+        self._diagnostic_open = False
+        self._diagnostic_previous_content = None
         if self._auth_overlay_task is not None:
             self._auth_overlay_task.cancel()
             self._auth_overlay_task = None
@@ -1139,10 +1166,16 @@ class CoursesScreen:
         self._speed_text.value = "Средняя: —"
         self.log_lines.clear()
         self._log_column.controls.clear()
+        self._diagnostic_reports.clear()
+        self._diagnostic_reports_by_title.clear()
+        self._current_run_report = None
         self._download_rows.clear()
         self._download_rows_column.controls.clear()
         for item in lessons_to_download:
-            row = build_download_lesson_row(item)
+            row = build_download_lesson_row(
+                item,
+                on_details=partial(self._show_lesson_diagnostics, item.lesson.url),
+            )
             self._download_rows[item.lesson.url] = row
             self._download_rows_column.controls.append(row.control)
         self._continue_btn.visible = False
@@ -1176,6 +1209,7 @@ class CoursesScreen:
         )
 
     def _handle_download_event(self, event: DownloadEvent) -> None:
+        self._remember_diagnostic(event)
         if event.type is DownloadEventType.AUTH_REQUIRED:
             self._switch_overlay_to_auth()
             return
@@ -1212,6 +1246,92 @@ class CoursesScreen:
         elif event.message:
             prefix = "✓ " if event.type is DownloadEventType.LESSON_COMPLETED else ""
             self._add_log(f"{prefix}{event.message}")
+
+    def _remember_diagnostic(self, event: DownloadEvent) -> None:
+        if not event.diagnostic_report:
+            return
+        report = Path(event.diagnostic_report)
+        if event.type is DownloadEventType.SUMMARY:
+            self._last_run_report = report
+            self._current_run_report = report
+            self._diagnostics_button.visible = True
+            return
+        if event.lesson_url:
+            self._diagnostic_reports[event.lesson_url] = report
+        if event.lesson:
+            self._diagnostic_reports_by_title[event.lesson] = report
+
+    def _show_lesson_diagnostics(self, lesson_url: str) -> None:
+        report = self._diagnostic_reports.get(lesson_url)
+        if report is None:
+            self._show_snack("Для этого урока нет отчёта", is_error=True)
+            return
+        self._show_diagnostic_report(report, "Отчёт по уроку")
+
+    def _show_run_diagnostics(self, _event=None) -> None:
+        if self._last_run_report is None:
+            self._show_snack("Общий отчёт пока не создан", is_error=True)
+            return
+        self._show_diagnostic_report(self._last_run_report, "Общий отчёт загрузки")
+
+    def _show_diagnostic_report(self, path: Path, title: str) -> None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            formatted = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        except (OSError, json.JSONDecodeError):
+            self._show_snack("Не удалось открыть отчёт диагностики", is_error=True)
+            return
+        if not getattr(self, "_diagnostic_open", False):
+            self._diagnostic_previous_content = self._overlay_card.content
+            self._diagnostic_previous_visible = self.overlay.visible
+            self._diagnostic_open = True
+        self._overlay_card.content = ft.Column(
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=12,
+            controls=[
+                ft.Icon(ft.Icons.BUG_REPORT_OUTLINED, size=38, color=Color.YELLOW),
+                ft.Text(title, size=19, weight=ft.FontWeight.W_700, color=Color.TEXT),
+                ft.Text(
+                    str(path),
+                    size=11,
+                    color=Color.TEXT_MUTED,
+                    selectable=True,
+                    text_align=ft.TextAlign.CENTER,
+                ),
+                ft.Container(
+                    width=520,
+                    height=360,
+                    padding=ft.Padding.all(12),
+                    border_radius=10,
+                    bgcolor="rgba(0,0,0,0.3)",
+                    border=ft.Border.all(1, "rgba(255,255,255,0.08)"),
+                    content=ft.Column(
+                        scroll=ft.ScrollMode.AUTO,
+                        controls=[
+                            ft.Text(
+                                formatted,
+                                size=11,
+                                color=Color.TEXT_SECONDARY,
+                                selectable=True,
+                                font_family="Consolas",
+                            )
+                        ],
+                    ),
+                ),
+                ft.OutlinedButton("Назад", on_click=self._close_diagnostic_report),
+            ],
+        )
+        self.overlay.visible = True
+        self.page.update()
+
+    def _close_diagnostic_report(self, _event=None) -> None:
+        if not self._diagnostic_open:
+            return
+        self._overlay_card.content = self._diagnostic_previous_content
+        self.overlay.visible = self._diagnostic_previous_visible
+        self._diagnostic_open = False
+        self._diagnostic_previous_content = None
+        self.page.update()
 
     @staticmethod
     def _format_speed(speed_bps: float) -> str:
@@ -1289,6 +1409,8 @@ class CoursesScreen:
             )
             row.status_text.value = "Видео не найдено"
             row.status_text.color = Color.RED
+            if event.diagnostic_report:
+                row.details_button.visible = True
             row.progress.visible = False
             row.progress_text.visible = False
         elif event.type in {DownloadEventType.LESSON_FAILED, DownloadEventType.ERROR}:
@@ -1299,6 +1421,8 @@ class CoursesScreen:
             )
             row.status_text.value = "Ошибка"
             row.status_text.color = Color.YELLOW
+            if event.diagnostic_report:
+                row.details_button.visible = True
             row.progress.visible = False
             row.progress_text.visible = False
         self.page.update()
@@ -1381,6 +1505,8 @@ class CoursesScreen:
         is_warning: bool = False,
         failed: list[str] | None = None,
     ):
+        self._diagnostic_open = False
+        self._diagnostic_previous_content = None
         if is_error:
             icon_name, icon_color, title = ft.Icons.ERROR_ROUNDED, Color.RED, "Ошибка"
         elif is_warning:
@@ -1481,6 +1607,17 @@ class CoursesScreen:
                 ),
             )
 
+        if self._current_run_report is not None:
+            controls.append(ft.Container(height=14))
+            controls.append(
+                ft.OutlinedButton(
+                    "Открыть общий отчёт",
+                    icon=ft.Icons.BUG_REPORT_OUTLINED,
+                    on_click=self._show_run_diagnostics,
+                    style=ft.ButtonStyle(color=Color.ACCENT_LIGHT),
+                )
+            )
+
         if not is_error:
             controls.append(ft.Container(height=18))
             controls.append(
@@ -1505,15 +1642,34 @@ class CoursesScreen:
 
     def _build_failed_lessons(self, failed: list[str]) -> ft.Container:
         rows: list[ft.Control] = []
+        reports_by_title = getattr(self, "_diagnostic_reports_by_title", {})
         for line in failed:
             title = line[1:].strip() if line.startswith("✗") else line
+            report = reports_by_title.get(title)
             rows.append(
-                ft.Row(
-                    spacing=8,
-                    controls=[
-                        ft.Icon(ft.Icons.CLOSE_ROUNDED, size=14, color=Color.RED),
-                        ft.Text(title, size=13, color=Color.TEXT_SECONDARY, selectable=False),
-                    ],
+                ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=4, vertical=3),
+                    border_radius=6,
+                    ink=report is not None,
+                    on_click=(
+                        lambda _event, current=report, name=title: (
+                            self._show_diagnostic_report(current, f"Отчёт: {name}")
+                            if current is not None
+                            else None
+                        )
+                    ),
+                    content=ft.Row(
+                        spacing=8,
+                        controls=[
+                            ft.Icon(ft.Icons.CLOSE_ROUNDED, size=14, color=Color.RED),
+                            ft.Text(title, size=13, color=Color.TEXT_SECONDARY, selectable=False),
+                            ft.Text(
+                                "Подробнее" if report is not None else "",
+                                size=11,
+                                color=Color.ACCENT_LIGHT,
+                            ),
+                        ],
+                    ),
                 )
             )
         return ft.Container(

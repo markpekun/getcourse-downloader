@@ -1,12 +1,14 @@
 import asyncio
 import concurrent.futures
 import contextlib
+import re
 from collections.abc import Awaitable, Callable
 from typing import ClassVar, TypedDict
 
 import flet as ft
 
 from getcourse_downloader.application.ports.discovery import CourseDiscoveryUpdate
+from getcourse_downloader.domain.errors import DownloaderError
 from getcourse_downloader.presentation.flet.screens.start.controller import StartController
 from getcourse_downloader.presentation.flet.screens.start.state import StartViewState
 from getcourse_downloader.presentation.flet.theme import (
@@ -644,28 +646,160 @@ class StartScreen:
             self._stop_all_animations()
             self.state.parse_running = False
             self.state.discovery_visible = False
-            self.loader.visible = False
-            self.page.update()
-            self._show_error(str(ex))
+            self._parse_task = None
+            self._show_error(ex)
 
-    def _show_error(self, message: str):
-        self.page.snack_bar = ft.SnackBar(
-            content=ft.Row(
-                [
-                    ft.Icon(ft.Icons.ERROR_OUTLINE, color=Color.RED, size=20),
-                    ft.Text(message, color=Color.TEXT, size=14, expand=True),
-                ],
-                spacing=8,
-            ),
-            bgcolor="#2A1A1A",
-            shape=ft.RoundedRectangleBorder(radius=12),
-            duration=5000,
-            margin=ft.Margin.only(bottom=20, left=20, right=20),
-            behavior=ft.SnackBarBehavior.FLOATING,
-            elevation=10,
+    @staticmethod
+    def _sanitize_error_details(details: str) -> str:
+        text = re.sub(
+            r"(?i)\b[A-Z]:\\Users\\[^\\\s]+",
+            "<папка пользователя>",
+            details,
         )
-        self.page.snack_bar.open = True
+        text = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?<скрыто>", text)
+        text = " ".join(text.split())
+        return text[:800] or "Дополнительные сведения отсутствуют"
+
+    @staticmethod
+    def _error_title(code: str) -> str:
+        if code in {"BROWSER_RESOURCES_MISSING", "BROWSER_START_FAILED"}:
+            return "Встроенный Firefox не запустился"
+        if code == "BROWSER_PROFILE_BUSY":
+            return "Firefox уже используется"
+        if code in {"SITE_TIMEOUT", "SITE_CONNECTION_FAILED"}:
+            return "Сайт недоступен"
+        if code in {"HTTP_401", "HTTP_403", "AUTH_REQUIRED"}:
+            return "Нет доступа к курсу"
+        if code == "HTTP_404":
+            return "Страница не найдена"
+        if code == "HTTP_5XX":
+            return "Ошибка сервера"
+        if code == "INVALID_CONFIGURATION":
+            return "Проверьте ссылку"
+        return "Не удалось загрузить курсы"
+
+    def _show_error(self, error: Exception) -> None:
+        code = str(getattr(error, "code", "INTERNAL_ERROR"))
+        message = (
+            str(error).strip()
+            if isinstance(error, DownloaderError)
+            else "Произошла непредвиденная ошибка."
+        )
+        message = message or "Произошла непредвиденная ошибка."
+        raw_details = str(getattr(error, "technical_details", "")).strip()
+        if not raw_details:
+            raw_details = f"{type(error).__name__}: {error}"
+
+        self._error_message = ft.Text(
+            message,
+            size=13,
+            color=Color.TEXT_SECONDARY,
+            text_align=ft.TextAlign.CENTER,
+        )
+        self._error_code = ft.Text(
+            f"Код ошибки: {code}",
+            size=11,
+            color=Color.RED,
+            weight=ft.FontWeight.W_600,
+        )
+        self._error_details = ft.Text(
+            self._sanitize_error_details(raw_details),
+            size=11,
+            color=Color.TEXT_MUTED,
+            selectable=True,
+        )
+        self._error_details_box = ft.Container(
+            visible=False,
+            width=380,
+            padding=ft.Padding.symmetric(horizontal=12, vertical=10),
+            border_radius=8,
+            bgcolor="rgba(0,0,0,0.22)",
+            content=self._error_details,
+        )
+        self._error_details_button = ft.TextButton(
+            "Показать подробности",
+            on_click=self._toggle_error_details,
+        )
+        self._error_retry_button = ft.Button(
+            "Повторить",
+            icon=ft.Icons.REFRESH_ROUNDED,
+            on_click=self._retry_after_error,
+            style=ft.ButtonStyle(
+                color=ft.Colors.WHITE,
+                bgcolor=Color.ACCENT,
+                shape=ft.RoundedRectangleBorder(radius=9),
+            ),
+        )
+        close_button = ft.OutlinedButton(
+            "Закрыть",
+            on_click=self._dismiss_error,
+            style=ft.ButtonStyle(
+                color=Color.TEXT_SECONDARY,
+                side=ft.BorderSide(1, Color.BORDER),
+                shape=ft.RoundedRectangleBorder(radius=9),
+            ),
+        )
+
+        self.loader.content = ft.Container(
+            expand=True,
+            alignment=ft.Alignment(0, 0),
+            content=ft.Container(
+                width=460,
+                padding=ft.Padding.symmetric(horizontal=28, vertical=24),
+                border_radius=18,
+                bgcolor=Color.BG_CARD,
+                border=ft.Border.all(1, "rgba(239,68,68,0.35)"),
+                gradient=Gradient.CARD,
+                shadow=Shadow.CARD_ELEVATED,
+                content=ft.Column(
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=10,
+                    controls=[
+                        ft.Container(
+                            width=40,
+                            height=40,
+                            border_radius=12,
+                            bgcolor="rgba(239,68,68,0.14)",
+                            content=ft.Icon(ft.Icons.ERROR_OUTLINE, color=Color.RED, size=22),
+                        ),
+                        ft.Text(
+                            self._error_title(code),
+                            size=17,
+                            weight=ft.FontWeight.W_700,
+                            color=Color.TEXT,
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                        self._error_message,
+                        self._error_code,
+                        self._error_details_button,
+                        self._error_details_box,
+                        ft.Row(
+                            [close_button, self._error_retry_button],
+                            alignment=ft.MainAxisAlignment.CENTER,
+                            spacing=10,
+                        ),
+                    ],
+                ),
+            ),
+        )
+        self.loader.visible = True
         self.page.update()
+
+    def _toggle_error_details(self, _event) -> None:
+        self._error_details_box.visible = not self._error_details_box.visible
+        self._error_details_button.text = (
+            "Скрыть подробности" if self._error_details_box.visible else "Показать подробности"
+        )
+        self.page.update()
+
+    def _dismiss_error(self, _event) -> None:
+        self.loader.visible = False
+        self.page.update()
+
+    def _retry_after_error(self, _event) -> None:
+        self.loader.visible = False
+        self.page.update()
+        self._start_parse()
 
     def dispose(self) -> None:
         self._stop_all_animations()

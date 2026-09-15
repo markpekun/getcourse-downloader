@@ -1,5 +1,7 @@
 import asyncio
 import concurrent.futures
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import flet as ft
@@ -255,7 +257,7 @@ def test_selected_lessons_deduplicate_same_url_and_keep_first_tree_path():
     assert selected[0].course_path == ("Первый курс",)
 
 
-def test_folder_badge_and_tristate_selection():
+def test_partially_selected_folder_stays_visually_unchecked():
     course = _nested_course()
     selected = {f"https://school.example/lesson/{index}" for index in range(1, 4)}
     tree = _build_tree(
@@ -266,8 +268,10 @@ def test_folder_badge_and_tristate_selection():
 
     root_url = "https://school.example/course/root"
     child_url = "https://school.example/course/child"
-    assert tree.folder_checkboxes[root_url].value is None
-    assert tree.folder_checkboxes[child_url].value is None
+    assert tree.folder_checkboxes[root_url].value is False
+    assert tree.folder_checkboxes[root_url].tristate is False
+    assert tree.folder_checkboxes[child_url].value is False
+    assert tree.folder_checkboxes[child_url].tristate is False
     assert tree.folder_badges[root_url].value == "3 из 14"
     assert folder_badge_text(0, 14) == "14 уроков"
     assert folder_badge_text(14, 14) == "14 из 14"
@@ -380,6 +384,165 @@ def test_download_speed_is_formatted_for_header():
     assert CoursesScreen._format_speed(512) == "512 Б/с"
     assert CoursesScreen._format_speed(128 * 1024) == "128 КБ/с"
     assert CoursesScreen._format_speed(1.5 * 1024 * 1024) == "1.5 МБ/с"
+
+
+def test_failed_download_row_exposes_the_individual_diagnostic_report():
+    item = SelectedLesson(("Курс",), Lesson("Урок", "https://school.example/lesson/1"))
+    opened: list[str] = []
+    lesson_row = build_download_lesson_row(item, on_details=lambda: opened.append("opened"))
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen.page = SimpleNamespace(update=lambda: None)
+    screen._download_rows = {item.lesson.url: lesson_row}
+
+    screen._update_download_row(
+        DownloadEvent(
+            DownloadEventType.ERROR,
+            lesson="Урок",
+            lesson_url=item.lesson.url,
+            error_code="HTTP_403",
+            diagnostic_report="C:/reports/lesson.json",
+        )
+    )
+
+    assert lesson_row.status_text.value == "Ошибка"
+    assert lesson_row.details_button.visible is True
+    lesson_row.details_button.on_click(None)
+    assert opened == ["opened"]
+
+
+def test_screen_tracks_individual_and_last_run_diagnostic_reports():
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen._diagnostic_reports = {}
+    screen._diagnostic_reports_by_title = {}
+    screen._last_run_report = None
+    screen._diagnostics_button = SimpleNamespace(visible=False)
+
+    screen._remember_diagnostic(
+        DownloadEvent(
+            DownloadEventType.ERROR,
+            lesson="Урок",
+            lesson_url="https://school.example/lesson/1",
+            diagnostic_report="C:/reports/lesson.json",
+        )
+    )
+    screen._remember_diagnostic(
+        DownloadEvent(
+            DownloadEventType.SUMMARY,
+            diagnostic_report="C:/reports/last-run.json",
+        )
+    )
+
+    assert screen._diagnostic_reports["https://school.example/lesson/1"] == Path(
+        "C:/reports/lesson.json"
+    )
+    assert screen._diagnostic_reports_by_title["Урок"] == Path("C:/reports/lesson.json")
+    assert screen._last_run_report == Path("C:/reports/last-run.json")
+    assert screen._diagnostics_button.visible is True
+
+
+def test_no_video_row_exposes_its_diagnostic_report_without_relayout():
+    item = SelectedLesson(("Курс",), Lesson("Урок", "https://school.example/lesson/1"))
+    lesson_row = build_download_lesson_row(item, on_details=lambda: None)
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen.page = SimpleNamespace(update=lambda: None)
+    screen._download_rows = {item.lesson.url: lesson_row}
+
+    screen._update_download_row(
+        DownloadEvent(
+            DownloadEventType.LESSON_NO_VIDEO,
+            lesson="Урок",
+            lesson_url=item.lesson.url,
+            error_code="VIDEO_NOT_FOUND",
+            diagnostic_report="C:/reports/no-video.json",
+        )
+    )
+
+    assert lesson_row.status_text.value == "Видео не найдено"
+    assert lesson_row.details_button.visible is True
+    assert lesson_row.status_text.max_lines == 1
+
+
+def test_diagnostic_report_viewport_fits_inside_overlay_card(tmp_path):
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps({"error_code": "HTTP_403"}), encoding="utf-8")
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen.page = SimpleNamespace(update=lambda: None)
+    screen.overlay = SimpleNamespace(visible=False)
+    screen._overlay_card = ft.Container(width=600, padding=ft.Padding.all(24))
+
+    screen._show_diagnostic_report(path, "Отчёт по уроку")
+
+    report_column = screen._overlay_card.content
+    viewport = next(
+        control for control in report_column.controls if isinstance(control, ft.Container)
+    )
+    available_width = (
+        screen._overlay_card.width
+        - screen._overlay_card.padding.left
+        - screen._overlay_card.padding.right
+    )
+    assert viewport.width <= available_width
+    assert screen.overlay.visible is True
+
+
+def test_failed_run_does_not_offer_previous_runs_report_as_current():
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen.page = SimpleNamespace(update=lambda: None)
+    screen.overlay = SimpleNamespace(visible=False)
+    screen._overlay_card = ft.Container()
+    screen._last_run_report = Path("C:/reports/previous-run.json")
+    screen._current_run_report = None
+
+    screen._show_completion_overlay("Ошибка запуска", is_error=True)
+
+    buttons = [
+        control
+        for control in screen._overlay_card.content.controls
+        if isinstance(control, ft.OutlinedButton)
+    ]
+    assert not any(button.content == "Открыть общий отчёт" for button in buttons)
+
+    screen._current_run_report = Path("C:/reports/current-run.json")
+    screen._show_completion_overlay("Загрузка с ошибкой", is_error=True)
+    buttons = [
+        control
+        for control in screen._overlay_card.content.controls
+        if isinstance(control, ft.OutlinedButton)
+    ]
+    assert any(button.content == "Открыть общий отчёт" for button in buttons)
+
+
+def test_closing_diagnostics_restores_active_download_controls(tmp_path):
+    path = tmp_path / "lesson.json"
+    path.write_text(json.dumps({"error_code": "HTTP_403"}), encoding="utf-8")
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen.page = SimpleNamespace(update=lambda: None)
+    screen.overlay = SimpleNamespace(visible=True)
+    original_controls = ft.Column(controls=[ft.Text("Загрузка"), ft.OutlinedButton("Отмена")])
+    screen._overlay_card = ft.Container(content=original_controls)
+
+    screen._show_diagnostic_report(path, "Отчёт по уроку")
+    report_controls = screen._overlay_card.content.controls
+    report_controls[-1].on_click(None)
+
+    assert screen._overlay_card.content is original_controls
+    assert screen.overlay.visible is True
+
+
+def test_closing_diagnostics_from_header_hides_only_the_report(tmp_path):
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({"failed_lessons": []}), encoding="utf-8")
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen.page = SimpleNamespace(update=lambda: None)
+    screen.overlay = SimpleNamespace(visible=False)
+    previous_content = ft.Text("Предыдущий экран")
+    screen._overlay_card = ft.Container(content=previous_content)
+
+    screen._show_diagnostic_report(path, "Последний отчёт")
+    screen._overlay_card.content.controls[-1].on_click(None)
+
+    assert screen._overlay_card.content is previous_content
+    assert screen.overlay.visible is False
 
 
 def test_download_scroll_targets_lesson_and_ignores_detached_control():

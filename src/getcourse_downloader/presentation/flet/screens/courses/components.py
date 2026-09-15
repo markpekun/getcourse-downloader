@@ -22,6 +22,7 @@ class DownloadLessonRow:
     control: ft.Container
     status_holder: ft.Container
     status_text: ft.Text
+    details_button: ft.Container
     progress: ft.ProgressBar
     progress_text: ft.Text
 
@@ -112,17 +113,11 @@ def build_course_tree(
         lesson_urls = {item.lesson.url for item in descendants}
         selected_count = len(lesson_urls & selected_urls)
         total = len(lesson_urls)
-        folder_value: bool | None
-        if total and selected_count == total:
-            folder_value = True
-        elif selected_count:
-            folder_value = None
-        else:
-            folder_value = False
+        folder_value = bool(total and selected_count == total)
 
         folder_checkbox = ft.Checkbox(
             value=folder_value,
-            tristate=True,
+            tristate=False,
             disabled=not total,
             active_color=accent,
             check_color=Color.TEXT,
@@ -271,7 +266,11 @@ def build_course_tree(
     return CourseTreeView(root, lesson_checkboxes, folder_checkboxes, folder_badges)
 
 
-def build_download_lesson_row(item: SelectedLesson) -> DownloadLessonRow:
+def build_download_lesson_row(
+    item: SelectedLesson,
+    *,
+    on_details: Callable[[], None] | None = None,
+) -> DownloadLessonRow:
     status_holder = ft.Container(
         width=24,
         height=24,
@@ -283,7 +282,23 @@ def build_download_lesson_row(item: SelectedLesson) -> DownloadLessonRow:
         size=11,
         color=Color.TEXT_MUTED,
         width=112,
+        max_lines=1,
+        overflow=ft.TextOverflow.ELLIPSIS,
         text_align=ft.TextAlign.RIGHT,
+    )
+    details_button = ft.Container(
+        visible=False,
+        padding=ft.Padding.symmetric(horizontal=6, vertical=3),
+        border_radius=6,
+        bgcolor="rgba(124,58,237,0.18)",
+        ink=on_details is not None,
+        on_click=(lambda _event: on_details()) if on_details is not None else None,
+        content=ft.Text(
+            "Подробнее",
+            size=10,
+            color=Color.ACCENT_LIGHT,
+            weight=ft.FontWeight.W_600,
+        ),
     )
     progress = ft.ProgressBar(
         value=0,
@@ -335,10 +350,18 @@ def build_download_lesson_row(item: SelectedLesson) -> DownloadLessonRow:
                             ],
                         ),
                         status_text,
+                        details_button,
                     ],
                 ),
                 ft.Row(spacing=8, controls=[ft.Container(width=24), progress, progress_text]),
             ],
         ),
     )
-    return DownloadLessonRow(control, status_holder, status_text, progress, progress_text)
+    return DownloadLessonRow(
+        control,
+        status_holder,
+        status_text,
+        details_button,
+        progress,
+        progress_text,
+    )
