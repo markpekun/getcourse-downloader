@@ -6,13 +6,16 @@ import threading
 import time
 import traceback
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
+from getcourse_downloader import __version__
 from getcourse_downloader.application.use_cases.download_lessons import DownloadLessons
 from getcourse_downloader.domain.errors import InvalidDataError
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.domain.models import DownloadRequest
 from getcourse_downloader.infrastructure.browser.playwright import PlaywrightBrowserFactory
+from getcourse_downloader.infrastructure.diagnostics.reports import DownloadDiagnostics
 from getcourse_downloader.infrastructure.getcourse.downloader import PlaywrightDownloadGateway
 from getcourse_downloader.infrastructure.media.ffmpeg import FfmpegMuxer
 from getcourse_downloader.infrastructure.media.hls import HlsDownloader
@@ -32,6 +35,27 @@ class JsonLineEventSink:
                 stream.flush()
         except OSError:
             return
+
+
+class DiagnosticEventSink:
+    """Adds local diagnostic report paths to worker events before forwarding them."""
+
+    def __init__(self, sink: JsonLineEventSink, diagnostics: DownloadDiagnostics) -> None:
+        self._sink = sink
+        self._diagnostics = diagnostics
+
+    def __call__(self, event: DownloadEvent) -> None:
+        report = self._diagnostics.record(event)
+        if event.type is DownloadEventType.SUMMARY:
+            report = self._diagnostics.finish(
+                total=event.total or 0,
+                downloaded=event.downloaded or 0,
+                already_present=event.already_present or 0,
+                no_video=event.no_video or 0,
+            )
+        if report is not None:
+            event = replace(event, diagnostic_report=str(report))
+        self._sink(event)
 
 
 class WorkerCommandListener:
@@ -90,12 +114,15 @@ def _load_request(path: Path) -> DownloadRequest:
 def main(argv: Sequence[str] | None = None) -> int:
     request: DownloadRequest | None = None
     listener: WorkerCommandListener | None = None
-    sink: JsonLineEventSink | None = None
+    sink: DiagnosticEventSink | None = None
     paths = AppPaths.discover()
     paths.ensure_runtime_directories()
     try:
         args = build_parser().parse_args(argv)
-        sink = JsonLineEventSink(Path(args.events_file))
+        sink = DiagnosticEventSink(
+            JsonLineEventSink(Path(args.events_file)),
+            DownloadDiagnostics(paths.data, app_version=__version__),
+        )
         request = _load_request(Path(args.request_file))
         gateway = PlaywrightDownloadGateway(
             PlaywrightBrowserFactory(paths),

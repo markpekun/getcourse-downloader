@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from getcourse_downloader.domain.errors import DownloaderError
-from getcourse_downloader.domain.events import DownloadEventType
+from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.domain.models import (
     DownloadRequest,
     Lesson,
@@ -63,6 +63,142 @@ def test_subprocess_gateway_rejects_worker_without_summary(tmp_path):
 
     with pytest.raises(DownloaderError, match="без итогового события"):
         gateway.run(request, lambda _: None)
+
+
+def test_subprocess_gateway_stops_worker_that_no_longer_reports_progress(tmp_path):
+    worker = tmp_path / "stalled_worker.py"
+    worker.write_text(
+        "import argparse,json,time\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--request-file')\n"
+        "p.add_argument('--events-file')\n"
+        "p.add_argument('--commands-file')\n"
+        "a=p.parse_args()\n"
+        "event={'protocol_version':2,'type':'video_found','message':'Загрузка',"
+        "'lesson':'Урок','lesson_url':'https://example.com/lesson/1'}\n"
+        "open(a.events_file,'a',encoding='utf-8').write(json.dumps(event)+'\\n')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    gateway = SubprocessDownloadGateway(
+        [sys.executable, str(worker)],
+        inactivity_timeout_seconds=1.0,
+        diagnostics_directory=tmp_path,
+    )
+    request = DownloadRequest(
+        lessons=(
+            SelectedLesson(
+                ("Курс",),
+                Lesson("Урок", "https://example.com/lesson/1"),
+            ),
+        ),
+        quality=VideoQuality.AUTO,
+        save_path=tmp_path,
+    )
+    events = []
+
+    summary = gateway.run(request, events.append)
+
+    assert summary.failed == ("Урок",)
+    assert [event.type for event in events[-3:]] == [
+        DownloadEventType.ERROR,
+        DownloadEventType.LESSON_FAILED,
+        DownloadEventType.SUMMARY,
+    ]
+    assert events[-3].error_code == "DOWNLOAD_STALLED"
+    assert Path(events[-3].diagnostic_report).is_file()
+    assert Path(events[-1].diagnostic_report).name == "last-run.json"
+
+
+def test_stalled_run_report_keeps_earlier_failed_and_no_video_lessons(tmp_path):
+    worker = tmp_path / "partially_stalled_worker.py"
+    worker.write_text(
+        "import argparse,json,time\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--request-file')\n"
+        "p.add_argument('--events-file')\n"
+        "p.add_argument('--commands-file')\n"
+        "a=p.parse_args()\n"
+        "events=[\n"
+        " {'protocol_version':2,'type':'lesson_failed','message':'HTTP 403',"
+        "  'stage':'playlist','error_code':'HTTP_403','lesson':'Урок 1',"
+        "  'lesson_url':'https://example.com/lesson/1'},\n"
+        " {'protocol_version':2,'type':'lesson_no_video','message':'Плеер не найден',"
+        "  'stage':'player','lesson':'Урок 2',"
+        "  'lesson_url':'https://example.com/lesson/2'},\n"
+        " {'protocol_version':2,'type':'video_found','message':'Загрузка',"
+        "  'lesson':'Урок 3','lesson_url':'https://example.com/lesson/3'},\n"
+        "]\n"
+        "with open(a.events_file,'a',encoding='utf-8') as f:\n"
+        "  for event in events: f.write(json.dumps(event)+'\\n')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    gateway = SubprocessDownloadGateway(
+        [sys.executable, str(worker)],
+        inactivity_timeout_seconds=1.0,
+        diagnostics_directory=tmp_path,
+    )
+    request = DownloadRequest(
+        lessons=tuple(
+            SelectedLesson(
+                ("Курс",), Lesson(f"Урок {number}", f"https://example.com/lesson/{number}")
+            )
+            for number in range(1, 4)
+        ),
+        quality=VideoQuality.AUTO,
+        save_path=tmp_path,
+    )
+    events = []
+
+    summary = gateway.run(request, events.append)
+
+    report = json.loads(Path(events[-1].diagnostic_report).read_text(encoding="utf-8"))
+    assert summary.failed == ("Урок 1", "Урок 3")
+    assert summary.no_video == 1
+    assert report["counts"] == {
+        "already_present": 0,
+        "downloaded": 0,
+        "failed": 2,
+        "no_video": 1,
+        "total": 3,
+    }
+    assert [lesson["error_code"] for lesson in report["failed_lessons"]] == [
+        "HTTP_403",
+        "DOWNLOAD_STALLED",
+    ]
+    assert [lesson["error_code"] for lesson in report["no_video_lessons"]] == ["VIDEO_NOT_FOUND"]
+
+
+def test_stalled_lessons_with_the_same_title_are_counted_separately(tmp_path):
+    first = SelectedLesson(("Первый модуль",), Lesson("Урок 1", "https://example.com/lesson/1"))
+    second = SelectedLesson(("Второй модуль",), Lesson("Урок 1", "https://example.com/lesson/2"))
+    request = DownloadRequest(
+        lessons=(first, second),
+        quality=VideoQuality.AUTO,
+        save_path=tmp_path,
+    )
+    gateway = SubprocessDownloadGateway(diagnostics_directory=tmp_path)
+    earlier_failure = DownloadEvent(
+        DownloadEventType.LESSON_FAILED,
+        message="Не удалось скачать первый урок",
+        lesson=first.lesson.title,
+        lesson_url=first.lesson.url,
+    )
+    events = []
+
+    summary = gateway._stalled_summary(
+        request,
+        events.append,
+        {first.lesson.url: DownloadEventType.LESSON_FAILED},
+        [first.lesson.title],
+        second.lesson.url,
+        [earlier_failure],
+    )
+
+    report = json.loads(Path(events[-1].diagnostic_report).read_text(encoding="utf-8"))
+    assert summary.failed == ("Урок 1", "Урок 1")
+    assert report["counts"]["failed"] == 2
 
 
 def test_subprocess_gateway_sends_cancel_and_receives_cancelled_summary(tmp_path):

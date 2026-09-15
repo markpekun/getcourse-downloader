@@ -36,5 +36,7 @@ def build_container() -> AppContainer:
         courses=courses,
         settings=settings,
         discover_courses=DiscoverCourses(GetCourseDiscoverer(browsers), courses),
-        download_lessons=DownloadLessons(SubprocessDownloadGateway()),
+        download_lessons=DownloadLessons(
+            SubprocessDownloadGateway(diagnostics_directory=paths.data)
+        ),
     )
