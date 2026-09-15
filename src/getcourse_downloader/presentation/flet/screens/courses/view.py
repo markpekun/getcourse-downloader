@@ -114,21 +114,6 @@ class CoursesScreen:
             color=Color.TEXT_SECONDARY,
             weight=ft.FontWeight.W_500,
         )
-        self._logs_button = ft.Container(
-            visible=False,
-            content=ft.Icon(
-                ft.Icons.SUBJECT_OUTLINED,
-                size=19,
-                color=Color.ACCENT_LIGHT,
-            ),
-            padding=ft.Padding.all(7),
-            border_radius=8,
-            bgcolor="rgba(124,58,237,0.10)",
-            ink=True,
-            tooltip="Открыть логи загрузки",
-            on_click=self._show_logs,
-        )
-
         self.course_list = ft.Column(spacing=12, scroll=ft.ScrollMode.AUTO, expand=True)
         self._build_course_list()
 
@@ -181,16 +166,6 @@ class CoursesScreen:
                 padding=ft.Padding.symmetric(horizontal=20, vertical=9),
             ),
         )
-        self._overlay_logs_button = ft.OutlinedButton(
-            "Логи",
-            icon=ft.Icons.SUBJECT_OUTLINED,
-            on_click=self._show_logs,
-            style=ft.ButtonStyle(
-                color=Color.ACCENT_LIGHT,
-                side=ft.BorderSide(1, "rgba(124,58,237,0.55)"),
-            ),
-        )
-
         self._auth_icon = ft.Container(
             width=38,
             height=38,
@@ -279,7 +254,6 @@ class CoursesScreen:
                     ),
                     self._download_rows_container,
                     self._continue_btn,
-                    self._overlay_logs_button,
                     self._cancel_btn,
                 ],
             ),
@@ -298,63 +272,6 @@ class CoursesScreen:
                         alignment=ft.MainAxisAlignment.CENTER,
                         controls=[self._overlay_card],
                     ),
-                ],
-            ),
-        )
-
-        self._logs_overlay = ft.Container(
-            expand=True,
-            bgcolor="rgba(0,0,0,0.58)",
-            visible=False,
-            content=ft.Row(
-                expand=True,
-                alignment=ft.MainAxisAlignment.CENTER,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[
-                    ft.Container(
-                        width=620,
-                        padding=ft.Padding.all(24),
-                        border_radius=20,
-                        bgcolor=Color.BG_CARD,
-                        border=ft.Border.all(1, Color.BORDER),
-                        shadow=Shadow.CARD,
-                        gradient=Gradient.CARD,
-                        content=ft.Column(
-                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                            spacing=14,
-                            controls=[
-                                ft.Row(
-                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                    controls=[
-                                        ft.Row(
-                                            spacing=8,
-                                            controls=[
-                                                ft.Icon(
-                                                    ft.Icons.SUBJECT_OUTLINED,
-                                                    size=24,
-                                                    color=Color.ACCENT_LIGHT,
-                                                ),
-                                                ft.Text(
-                                                    "Логи загрузки",
-                                                    size=19,
-                                                    weight=ft.FontWeight.W_700,
-                                                    color=Color.TEXT,
-                                                ),
-                                            ],
-                                        ),
-                                        ft.IconButton(
-                                            icon=ft.Icons.CLOSE,
-                                            icon_color=Color.TEXT_SECONDARY,
-                                            tooltip="Закрыть логи",
-                                            on_click=self._close_logs,
-                                        ),
-                                    ],
-                                ),
-                                self._log_container,
-                                ft.OutlinedButton("Закрыть", on_click=self._close_logs),
-                            ],
-                        ),
-                    )
                 ],
             ),
         )
@@ -474,7 +391,6 @@ class CoursesScreen:
                         ],
                     ),
                     self.overlay,
-                    self._logs_overlay,
                     self.error_overlay,
                 ],
             ),
@@ -544,7 +460,6 @@ class CoursesScreen:
                                         "(обновляется раз в 3 секунды)"
                                     ),
                                 ),
-                                self._logs_button,
                                 ft.Container(
                                     content=ft.Icon(
                                         ft.Icons.DELETE_ROUNDED,
@@ -1150,7 +1065,6 @@ class CoursesScreen:
                 self._download_title,
                 self._download_rows_container,
                 self._continue_btn,
-                self._overlay_logs_button,
                 self._cancel_btn,
             ],
         )
@@ -1238,7 +1152,6 @@ class CoursesScreen:
         self._log_column.controls.clear()
         self._diagnostic_reports.clear()
         self._diagnostic_reports_by_title.clear()
-        self._logs_button.visible = True
         self._download_rows.clear()
         self._download_rows_column.controls.clear()
         for item in lessons_to_download:
@@ -1336,14 +1249,6 @@ class CoursesScreen:
             self._show_snack("Для этого урока нет отчёта", is_error=True)
             return
         self._show_diagnostic_report(report, "Отчёт по уроку")
-
-    def _show_logs(self, _event=None) -> None:
-        self._logs_overlay.visible = True
-        self.page.update()
-
-    def _close_logs(self, _event=None) -> None:
-        self._logs_overlay.visible = False
-        self.page.update()
 
     def _show_diagnostic_report(self, path: Path, title: str) -> None:
         try:
