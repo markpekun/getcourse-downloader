@@ -219,6 +219,45 @@ def test_stale_download_completion_does_not_replace_active_overlay():
     assert screen.state.downloading is True
 
 
+def test_logs_overlay_does_not_replace_active_download_overlay():
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen.page = _FakePage()
+    original_content = ft.Column(controls=[ft.Text("Загрузка"), ft.OutlinedButton("Отмена")])
+    screen.overlay = SimpleNamespace(visible=True)
+    screen._overlay_card = ft.Container(content=original_content)
+    screen._logs_overlay = SimpleNamespace(visible=False)
+
+    screen._show_logs()
+
+    assert screen._logs_overlay.visible is True
+    assert screen.overlay.visible is True
+    assert screen._overlay_card.content is original_content
+
+    screen._close_logs()
+
+    assert screen._logs_overlay.visible is False
+    assert screen.overlay.visible is True
+    assert screen._overlay_card.content is original_content
+
+
+def test_active_download_overlay_exposes_the_logs_button():
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen.page = _FakePage()
+    screen._diagnostic_open = False
+    screen._diagnostic_previous_content = None
+    screen._auth_overlay_task = None
+    screen._download_title = ft.Text("Подготовка")
+    screen._download_rows_container = ft.Container()
+    screen._continue_btn = ft.OutlinedButton("Продолжить")
+    screen._overlay_logs_button = ft.OutlinedButton("Логи")
+    screen._cancel_btn = ft.OutlinedButton("Отмена")
+    screen._overlay_card = ft.Container()
+
+    screen._switch_overlay_to_download()
+
+    assert screen._overlay_logs_button in screen._overlay_card.content.controls
+
+
 def _nested_course() -> Course:
     lessons = tuple(
         Lesson(f"Урок {index}", f"https://school.example/lesson/{index}") for index in range(1, 15)
