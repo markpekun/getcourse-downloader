@@ -342,6 +342,71 @@ def test_landing_page_stays_alive_while_firefox_creates_stream_tabs():
     assert browser.active_pages == 0
 
 
+def test_direct_custom_course_shell_adds_hidden_modules_to_standard_discovery():
+    base = "https://school.example"
+    root_url = f"{base}/teach/control/stream/view/id/1000"
+    module_urls = [
+        f"{base}/teach/control/stream/view/id/{identifier}" for identifier in range(1101, 1111)
+    ]
+    pages: dict[str, dict[str, Any]] = {
+        root_url: _page_from_fixture("custom_course_shell.html"),
+    }
+    for index, module_url in enumerate(module_urls, start=1):
+        pages[module_url] = {
+            "title": f"Модуль {index}",
+            "content": (f'<div class="breadcrumbs"><a href="{root_url}">Большой курс</a></div>'),
+            "lessons": [_lesson_html(2000 + index, f"Урок {index}")],
+        }
+
+    discoverer = GetCourseDiscoverer(browser_factory=None)  # type: ignore[arg-type]
+    browser = _FakeBrowser(pages)
+
+    courses = asyncio.run(
+        discoverer._parse_page(  # type: ignore[arg-type]
+            browser,
+            browser.landing_page(root_url),
+            root_url,
+        )
+    )
+
+    assert len(courses) == 1
+    assert courses[0].title == "Большой курс с собственной навигацией"
+    assert [child.title for child in courses[0].children] == [
+        f"Модуль {index}" for index in range(1, 11)
+    ]
+    assert courses[0].lesson_count == 10
+    assert browser.visited_urls == module_urls
+
+
+def test_standard_stream_rows_take_priority_over_fallback_markup():
+    base = "https://school.example"
+    root_url = f"{base}/teach/control/stream/view/id/1000"
+    standard_url = f"{base}/teach/control/stream/view/id/1101"
+    hidden_url = f"{base}/teach/control/stream/view/id/1199"
+    pages = {
+        root_url: {
+            "title": "Обычный курс",
+            "stream_rows": [_stream_row_html(1101, "Основной модуль")],
+            "content": r'hidden="\/teach\/control\/stream\/view\/id\/1199"',
+        },
+        standard_url: {"title": "Основной модуль", "content": ""},
+        hidden_url: {"title": "Служебный модуль", "content": ""},
+    }
+    discoverer = GetCourseDiscoverer(browser_factory=None)  # type: ignore[arg-type]
+    browser = _FakeBrowser(pages)
+
+    courses = asyncio.run(
+        discoverer._parse_page(  # type: ignore[arg-type]
+            browser,
+            browser.landing_page(root_url),
+            root_url,
+        )
+    )
+
+    assert [child.title for child in courses[0].children] == ["Основной модуль"]
+    assert browser.visited_urls == [standard_url]
+
+
 def test_sample_nested_tree_keeps_folder_and_fourteen_lessons():
     base = "https://school.example"
     club_url = f"{base}/teach/control/stream/view/id/100"

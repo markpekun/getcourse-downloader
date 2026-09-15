@@ -48,7 +48,8 @@ class _ProfileLease:
                 if _process_exists(owner):
                     raise ExternalServiceError(
                         "Профиль браузера уже используется другой копией приложения. "
-                        "Закройте её и повторите загрузку."
+                        "Закройте её и повторите загрузку.",
+                        code="BROWSER_PROFILE_BUSY",
                     ) from None
                 self._path.unlink(missing_ok=True)
                 continue
@@ -72,15 +73,25 @@ class PlaywrightBrowserFactory:
     def __init__(self, paths: AppPaths) -> None:
         self._paths = paths
         self._paths.ensure_runtime_directories()
-        bundled_browsers = paths.resources / "ms-playwright"
-        if bundled_browsers.is_dir():
-            os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(bundled_browsers))
+        self._bundled_browsers = (paths.resources / "ms-playwright").resolve()
+        self._bundled_firefox = next(
+            self._bundled_browsers.glob("firefox-*/firefox/firefox.exe"),
+            None,
+        )
+        if self._bundled_browsers.is_dir():
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(self._bundled_browsers)
 
     @property
     def profile_path(self) -> str:
         return str(self._paths.session)
 
     async def launch(self, playwright: Playwright, *, headless: bool) -> BrowserContext:
+        if self._bundled_firefox is None or not self._bundled_firefox.is_file():
+            raise ExternalServiceError(
+                "Встроенный Firefox отсутствует или повреждён. "
+                "Полностью распакуйте архив приложения и повторите загрузку.",
+                code="BROWSER_RESOURCES_MISSING",
+            )
         lease = _ProfileLease(self._paths.session)
         lease.acquire()
         try:
@@ -95,10 +106,14 @@ class PlaywrightBrowserFactory:
                 raise ExternalServiceError(
                     "Встроенный Firefox не запустился. Возможно, предыдущая загрузка "
                     "завершилась некорректно и браузер ещё закрывается. "
-                    "Подождите несколько секунд и повторите."
+                    "Подождите несколько секунд и повторите.",
+                    code="BROWSER_START_FAILED",
+                    technical_details=str(error),
                 ) from error
             raise ExternalServiceError(
-                f"Не удалось запустить встроенный Firefox: {error}"
+                "Не удалось запустить встроенный Firefox.",
+                code="BROWSER_START_FAILED",
+                technical_details=str(error),
             ) from error
         context.on("close", lambda *_: lease.release())
         return context

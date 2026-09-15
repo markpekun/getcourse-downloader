@@ -10,8 +10,10 @@ def test_profile_lease_rejects_another_live_owner(tmp_path):
     owner = tmp_path / ".gcd-profile-owner"
     owner.write_text(str(os.getpid()), encoding="ascii")
 
-    with pytest.raises(ExternalServiceError, match="уже используется"):
+    with pytest.raises(ExternalServiceError, match="уже используется") as captured:
         _ProfileLease(tmp_path).acquire()
+
+    assert getattr(captured.value, "code", "") == "BROWSER_PROFILE_BUSY"
 
 
 def test_profile_lease_replaces_stale_owner_and_releases(tmp_path):

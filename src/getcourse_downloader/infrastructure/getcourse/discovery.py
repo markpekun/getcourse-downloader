@@ -10,6 +10,8 @@ from html.parser import HTMLParser
 from urllib.parse import parse_qs, urljoin, urlsplit, urlunsplit
 
 from playwright.async_api import BrowserContext, Page, Playwright, async_playwright
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from getcourse_downloader.application.ports.discovery import (
     AuthRequiredCallback,
@@ -27,6 +29,19 @@ _STREAM_REFERENCE_RE = re.compile(
     r"(?:(?:https?:)?//[^\"'<>\s\\]+)?/(?:pl/)?teach/control/stream/"
     r"(?:view/id/\d+|view\?[^\"'<>\s\\]*\bid=\d+[^\"'<>\s\\]*)",
     flags=re.IGNORECASE,
+)
+
+_PARENT_STREAM_REFERENCE_RE = re.compile(
+    r"(?:parent|back|breadcrumb)[^\n]{0,160}?"
+    r"((?:(?:https?:)?//[^\"'<>\s\\]+)?/(?:pl/)?teach/control/stream/"
+    r"(?:view/id/\d+|view\?[^\"'<>\s\\]*\bid=\d+[^\"'<>\s\\]*))",
+    flags=re.IGNORECASE,
+)
+
+_BREADCRUMB_BLOCK_RE = re.compile(
+    r"<(?:div|nav|ol)[^>]*class=[\"'][^\"']*breadcrumb[^\"']*[\"'][^>]*>"
+    r".*?</(?:div|nav|ol)>",
+    flags=re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -197,13 +212,19 @@ class GetCourseDiscoverer:
             browser = await self._browsers.launch(playwright, headless=True)
             try:
                 page = browser.pages[0] if browser.pages else await browser.new_page()
-                await page.goto(url, wait_until="domcontentloaded")
+                response = await self._navigate(page, url)
                 if await _is_authentication_required(page):
                     await browser.close()
                     await self._authenticate_interactive(playwright, url, on_auth_required)
                     browser = await self._browsers.launch(playwright, headless=True)
                     page = browser.pages[0] if browser.pages else await browser.new_page()
-                    await page.goto(url, wait_until="domcontentloaded")
+                    response = await self._navigate(page, url)
+                    if await _is_authentication_required(page):
+                        raise ExternalServiceError(
+                            "Авторизация не была завершена.",
+                            code="AUTH_REQUIRED",
+                        )
+                self._raise_for_http_error(response)
                 return await self._parse_page(
                     browser,
                     page,
@@ -222,7 +243,7 @@ class GetCourseDiscoverer:
         browser = await self._browsers.launch(playwright, headless=False)
         try:
             login_page = browser.pages[0] if browser.pages else await browser.new_page()
-            await login_page.goto(url, wait_until="domcontentloaded")
+            await self._navigate(login_page, url)
             message = "Войдите в аккаунт в открывшемся браузере"
             while True:
                 if callback:
@@ -233,8 +254,9 @@ class GetCourseDiscoverer:
 
                 check_page = await browser.new_page()
                 try:
-                    await check_page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+                    response = await self._navigate(check_page, url, timeout=15_000)
                     if not await _is_authentication_required(check_page):
+                        self._raise_for_http_error(response)
                         return
                     message = "Вход ещё не выполнен. Войдите и повторите проверку"
                 finally:
@@ -420,7 +442,8 @@ class GetCourseDiscoverer:
         async with semaphore:
             page = await browser.new_page()
             try:
-                await page.goto(stream.url, wait_until="domcontentloaded", timeout=30_000)
+                response = await self._navigate(page, stream.url, timeout=30_000)
+                self._raise_for_http_error(response)
                 snapshot = await self._read_loaded_stream(page, stream)
             finally:
                 with contextlib.suppress(Exception):
@@ -441,6 +464,54 @@ class GetCourseDiscoverer:
         return snapshot
 
     @staticmethod
+    async def _navigate(page: Page, url: str, *, timeout: int | None = None):
+        try:
+            if timeout is None:
+                return await page.goto(url, wait_until="domcontentloaded")
+            return await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        except PlaywrightTimeoutError as error:
+            raise ExternalServiceError(
+                "Сайт не ответил за отведённое время.",
+                code="SITE_TIMEOUT",
+                technical_details=str(error),
+            ) from error
+        except PlaywrightError as error:
+            raise ExternalServiceError(
+                "Не удалось подключиться к сайту.",
+                code="SITE_CONNECTION_FAILED",
+                technical_details=str(error),
+            ) from error
+
+    @staticmethod
+    def _raise_for_http_error(response) -> None:
+        status = getattr(response, "status", 0)
+        if not isinstance(status, int) or status < 400:
+            return
+        if status in (401, 403):
+            raise ExternalServiceError(
+                "Сайт открылся, но у аккаунта нет доступа к этой странице.",
+                code=f"HTTP_{status}",
+                technical_details=f"HTTP {status}",
+            )
+        if status == 404:
+            raise ExternalServiceError(
+                "Страница курса не найдена.",
+                code="HTTP_404",
+                technical_details="HTTP 404",
+            )
+        if status >= 500:
+            raise ExternalServiceError(
+                "Сервер GetCourse временно недоступен.",
+                code="HTTP_5XX",
+                technical_details=f"HTTP {status}",
+            )
+        raise ExternalServiceError(
+            f"Сайт вернул ошибку HTTP {status}.",
+            code="HTTP_ERROR",
+            technical_details=f"HTTP {status}",
+        )
+
+    @staticmethod
     def _discovery_update(stream: _StreamLink) -> CourseDiscoveryUpdate:
         fallback = stream.url.rstrip("/").rsplit("/", maxsplit=1)[-1]
         return CourseDiscoveryUpdate(stream.url, stream.title or f"Курс {fallback}")
@@ -454,8 +525,12 @@ class GetCourseDiscoverer:
             await self._extract_stream_links(
                 page,
                 page.url,
-                allow_fallback=False,
+                allow_fallback=True,
             )
+        )
+        current_stream = normalize_stream_url(page.url, page.url)
+        children = tuple(
+            child for child in children if child.url != current_stream and child.url != stream.url
         )
         return _StreamSnapshot(title=title, lessons=lessons, children=children)
 
@@ -505,10 +580,22 @@ class GetCourseDiscoverer:
             ordered.append(_StreamLink(url=url, title=hint))
 
         if allow_fallback and not ordered:
-            for url in extract_stream_urls(await page.content(), base_url):
-                if url not in indexes:
-                    indexes[url] = len(ordered)
-                    ordered.append(_StreamLink(url=url))
+            content = await page.content()
+            normalized_content = unescape(content).replace("\\/", "/")
+            navigation_urls: set[str] = set()
+            for block in _BREADCRUMB_BLOCK_RE.findall(normalized_content):
+                navigation_urls.update(extract_stream_urls(block, base_url))
+            for match in _PARENT_STREAM_REFERENCE_RE.finditer(normalized_content):
+                parent_url = normalize_stream_url(base_url, match.group(1))
+                if parent_url:
+                    navigation_urls.add(parent_url)
+
+            current_stream = normalize_stream_url(base_url, base_url)
+            for url in extract_stream_urls(content, base_url):
+                if url in indexes or url in navigation_urls or url == current_stream:
+                    continue
+                indexes[url] = len(ordered)
+                ordered.append(_StreamLink(url=url))
         return ordered
 
     @staticmethod
