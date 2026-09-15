@@ -2,6 +2,8 @@ import asyncio
 import json
 from pathlib import Path
 
+import aiohttp
+
 from getcourse_downloader.domain.events import DownloadEventType
 from getcourse_downloader.infrastructure.media import hls as hls_module
 from getcourse_downloader.infrastructure.media.hls import (
@@ -218,6 +220,109 @@ def test_segment_network_failure_preserves_downloaded_checkpoint(tmp_path):
     assert (checkpoint / "segments" / "000000.bin").read_bytes() == b"A"
     assert not (checkpoint / "segments" / "000001.bin").exists()
     assert not output.exists()
+
+
+def test_segment_http_failure_has_safe_code_host_and_progress_for_diagnostics(tmp_path):
+    stem = tmp_path / "Lesson"
+    playlist = "#EXTM3U\n#EXTINF:1,\nseg.ts?token=secret\n"
+    requests: list[str] = []
+    responses = {
+        "https://cdn.example/master.m3u8?sign=secret": _Response(text=playlist),
+        "https://cdn.example/seg.ts?token=secret": _Response(
+            error=aiohttp.ClientResponseError(
+                request_info=None,
+                history=(),
+                status=403,
+                message="Forbidden",
+                headers=None,
+            )
+        ),
+    }
+
+    result, events = _run(
+        _downloader(responses, requests),
+        "https://cdn.example/master.m3u8?sign=secret",
+        stem,
+    )
+
+    assert result.status is HlsDownloadStatus.FAILED
+    failure = events[-1]
+    assert failure.error_code == "HTTP_403"
+    assert failure.source_host == "cdn.example"
+    assert (failure.current, failure.total) == (0, 1)
+    assert "secret" not in failure.message
+
+
+def test_unknown_playlist_failure_is_not_misreported_as_segment_failure(tmp_path):
+    playlist_url = "https://cdn.example/master.m3u8?sign=secret"
+    responses = {playlist_url: _Response(error=OSError("connection reset"))}
+
+    result, events = _run(_downloader(responses, []), playlist_url, tmp_path / "Lesson")
+
+    assert result.status is HlsDownloadStatus.FAILED
+    assert events[-1].stage == "playlist"
+    assert events[-1].error_code == "PLAYLIST_REQUEST_FAILED"
+    assert events[-1].message == "Не удалось получить плейлист видео"
+
+
+def test_encrypted_hls_is_rejected_before_segments_are_downloaded(tmp_path):
+    stem = tmp_path / "Lesson"
+    playlist_url = "https://cdn.example/encrypted.m3u8?sign=abc"
+    segment_url = "https://cdn.example/encrypted.ts"
+    playlist = (
+        "#EXTM3U\n"
+        '#EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="org.w3.clearkey",URI="license"\n'
+        "#EXTINF:1,\n"
+        "encrypted.ts\n"
+    )
+    requests: list[str] = []
+    responses = {
+        playlist_url: _Response(text=playlist),
+        segment_url: _Response(content=b"encrypted"),
+    }
+
+    result, events = _run(_downloader(responses, requests), playlist_url, stem)
+
+    assert result.status is HlsDownloadStatus.FAILED
+    assert requests == [playlist_url]
+    assert events[-1].type is DownloadEventType.ERROR
+    assert "SAMPLE-AES" in events[-1].message
+
+
+def test_kinescope_referer_and_origin_are_used_for_signed_hls_requests(tmp_path):
+    playlist_url = "https://kinescope.io/video-id/video.m3u8?expires=123&sign=abc"
+    segment_url = "https://kinescope.io/video-id/segment.ts?expires=123&sign=abc"
+    responses = {
+        playlist_url: _Response(text="#EXTM3U\n#EXTINF:1,\nsegment.ts?expires=123&sign=abc\n"),
+        segment_url: _Response(content=b"segment"),
+    }
+    requests: list[str] = []
+    session_options = {}
+
+    def session_factory(**options):
+        session_options.update(options)
+        return _Session(responses, requests, **options)
+
+    downloader = HlsDownloader(
+        _Muxer(),  # type: ignore[arg-type]
+        concurrency=1,
+        session_factory=session_factory,
+    )
+
+    result = asyncio.run(
+        downloader.download(
+            playlist_url,
+            tmp_path / "Lesson",
+            "Урок",
+            lambda _: None,
+            lesson_url="https://school.example/lesson/1",
+            referer_url="https://kinescope.io/embed/public-id",
+        )
+    )
+
+    assert result.status is HlsDownloadStatus.DOWNLOADED
+    assert session_options["headers"]["Referer"] == "https://kinescope.io/embed/public-id"
+    assert session_options["headers"]["Origin"] == "https://kinescope.io"
 
 
 def test_cancel_preserves_segments_and_next_run_resumes(tmp_path):

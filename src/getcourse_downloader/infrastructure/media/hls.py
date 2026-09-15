@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import time
 from collections.abc import Callable
@@ -23,6 +24,24 @@ _SPEED_UPDATE_SECONDS = 3.0
 _monotonic = time.monotonic
 
 
+def _download_error_details(error: BaseException, *, playlist: bool = False) -> tuple[str, str]:
+    if isinstance(error, aiohttp.ClientResponseError) and error.status:
+        return f"HTTP_{error.status}", f"Сервер вернул HTTP {error.status}"
+    if isinstance(error, aiohttp.ClientConnectorDNSError):
+        return "DNS_FAILED", "Не удалось найти сервер видео"
+    if isinstance(error, aiohttp.ClientConnectorCertificateError):
+        return "TLS_FAILED", "Не удалось установить защищённое соединение с сервером видео"
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError, aiohttp.ServerTimeoutError)):
+        return "NETWORK_TIMEOUT", "Превышено время ожидания ответа сервера видео"
+    if isinstance(error, aiohttp.ClientConnectorError):
+        return "CONNECTION_FAILED", "Не удалось подключиться к серверу видео"
+    if isinstance(error, OSError) and str(error) == "empty HLS segment":
+        return "EMPTY_SEGMENT", "Сервер вернул пустой сегмент видео"
+    if playlist:
+        return "PLAYLIST_REQUEST_FAILED", "Не удалось получить плейлист видео"
+    return "SEGMENT_REQUEST_FAILED", "Не удалось получить сегмент видео"
+
+
 def extract_quality(url: str) -> int:
     path = url.split("?", 1)[0]
     numeric_parts = [part for part in path.split("/") if part.isdigit()]
@@ -30,8 +49,6 @@ def extract_quality(url: str) -> int:
 
 
 def parse_master_playlist(text: str, master_url: str) -> dict[int, str]:
-    import re
-
     qualities: dict[int, str] = {}
     last_resolution: int | None = None
     expects_variant = False
@@ -57,6 +74,19 @@ def is_hls_playlist(text: str) -> bool:
 
 def is_hls_master_playlist(text: str) -> bool:
     return is_hls_playlist(text) and "#EXT-X-STREAM-INF" in text
+
+
+def encrypted_hls_method(text: str) -> str | None:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith(("#EXT-X-KEY:", "#EXT-X-SESSION-KEY:")):
+            continue
+        match = re.search(r"(?::|,)METHOD=([^,]+)", line, flags=re.IGNORECASE)
+        if match:
+            method = match.group(1).strip().upper()
+            if method != "NONE":
+                return method
+    return None
 
 
 def select_quality_url(qualities: dict[int, str], quality: str) -> str | None:
@@ -220,6 +250,7 @@ class HlsDownloader:
         emit: EventHandler,
         *,
         lesson_url: str = "",
+        referer_url: str = "",
         course_path: tuple[str, ...] = (),
         requested_quality: str = "auto",
         video_index: int = 1,
@@ -255,6 +286,8 @@ class HlsDownloader:
             total: int | None = None,
             level: str = "info",
             speed_bps: float | None = None,
+            error_code: str = "",
+            source_host: str = "",
         ) -> DownloadEvent:
             return DownloadEvent(
                 event_type,
@@ -269,13 +302,19 @@ class HlsDownloader:
                 total=total,
                 speed_bps=speed_bps,
                 level=level,
+                error_code=error_code,
+                source_host=source_host,
             )
 
         parts = urlsplit(playlist_url)
+        request_referer = referer_url or lesson_url or f"{parts.scheme}://{parts.netloc}/"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": f"{parts.scheme}://{parts.netloc}/",
+            "Referer": request_referer,
         }
+        referer_parts = urlsplit(request_referer)
+        if referer_parts.scheme and referer_parts.netloc:
+            headers["Origin"] = f"{referer_parts.scheme}://{referer_parts.netloc}"
         timeout = aiohttp.ClientTimeout(
             total=600,
             connect=15,
@@ -289,12 +328,29 @@ class HlsDownloader:
                     response.raise_for_status()
                     playlist = await response.text()
             except Exception as error:
+                error_code, summary = _download_error_details(error, playlist=True)
                 emit(
                     event(
                         DownloadEventType.ERROR,
-                        f"Не удалось получить плейлист: {error}",
+                        summary,
                         stage="playlist",
                         level="error",
+                        error_code=error_code,
+                        source_host=parts.netloc,
+                    )
+                )
+                return HlsDownloadResult(HlsDownloadStatus.FAILED)
+
+            encryption_method = encrypted_hls_method(playlist)
+            if encryption_method:
+                emit(
+                    event(
+                        DownloadEventType.ERROR,
+                        f"Плейлист использует защищённое шифрование {encryption_method}",
+                        stage="playlist",
+                        level="error",
+                        error_code="ENCRYPTED_PLAYLIST_UNSUPPORTED",
+                        source_host=parts.netloc,
                     )
                 )
                 return HlsDownloadResult(HlsDownloadStatus.FAILED)
@@ -308,6 +364,8 @@ class HlsDownloader:
                         "В плейлисте нет сегментов",
                         stage="segments",
                         level="error",
+                        error_code="EMPTY_PLAYLIST",
+                        source_host=parts.netloc,
                     )
                 )
                 return HlsDownloadResult(HlsDownloadStatus.FAILED)
@@ -336,6 +394,7 @@ class HlsDownloader:
             started_at = _monotonic()
             last_speed_report = started_at
             transferred_bytes = 0
+            segment_failures: list[tuple[int, str, str, str]] = []
 
             async def download_segment(index: int, url: str) -> bool:
                 nonlocal completed, last_progress_report, last_speed_report, transferred_bytes
@@ -382,9 +441,13 @@ class HlsDownloader:
                                     )
                                 )
                             return True
-                        except (TimeoutError, aiohttp.ClientError, OSError):
+                        except (TimeoutError, aiohttp.ClientError, OSError) as error:
                             temporary.unlink(missing_ok=True)
                             if attempt == 2:
+                                error_code, summary = _download_error_details(error)
+                                segment_failures.append(
+                                    (index, error_code, summary, urlsplit(url).netloc)
+                                )
                                 return False
                             await asyncio.sleep(2**attempt)
                 return False
@@ -400,12 +463,17 @@ class HlsDownloader:
                 )
             if not all(results):
                 failed_count = sum(not result for result in results)
+                failed_index, error_code, summary, source_host = min(segment_failures)
                 emit(
                     event(
                         DownloadEventType.ERROR,
-                        f"Не удалось скачать сегментов: {failed_count}",
+                        f"{summary}: сегмент {failed_index + 1}/{total}; ошибок: {failed_count}",
                         stage="segments",
+                        current=completed,
+                        total=total,
                         level="error",
+                        error_code=error_code,
+                        source_host=source_host,
                     )
                 )
                 return HlsDownloadResult(
@@ -449,6 +517,7 @@ class HlsDownloader:
                         f"Ошибка FFmpeg: {error_message}",
                         stage="ffmpeg",
                         level="error",
+                        error_code="FFMPEG_FAILED",
                     )
                 )
                 return HlsDownloadResult(

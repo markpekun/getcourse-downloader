@@ -21,14 +21,17 @@ from getcourse_downloader.domain.models import DownloadRequest, DownloadSummary,
 from getcourse_downloader.infrastructure.browser.playwright import PlaywrightBrowserFactory
 from getcourse_downloader.infrastructure.getcourse.video_signals import (
     VIDEO_PLAYER_SELECTOR,
+    extract_hls_urls,
     is_hls_playlist_url,
 )
 from getcourse_downloader.infrastructure.media.hls import (
     HlsDownloader,
     HlsDownloadStatus,
     canonical_media_url,
+    encrypted_hls_method,
     is_hls_master_playlist,
     is_hls_playlist,
+    parse_master_playlist,
     select_stream_playlist_url,
 )
 from getcourse_downloader.infrastructure.storage.download_catalog import (
@@ -67,6 +70,7 @@ class _LessonResult:
 class _Playlist:
     url: str
     text: str
+    referer_url: str = ""
 
 
 class PlaywrightDownloadGateway:
@@ -109,6 +113,7 @@ class PlaywrightDownloadGateway:
         stage: str = "lesson",
         level: str = "info",
         quality: str = "",
+        error_code: str = "",
     ) -> DownloadEvent:
         return DownloadEvent(
             event_type,
@@ -119,6 +124,7 @@ class PlaywrightDownloadGateway:
             course_path=item.course_path,
             quality=quality,
             level=level,
+            error_code=error_code,
         )
 
     @staticmethod
@@ -307,8 +313,11 @@ class PlaywrightDownloadGateway:
                             self._event(
                                 item,
                                 DownloadEventType.LESSON_NO_VIDEO,
-                                f"Видео не найдено: {item.lesson.title}",
+                                "На странице урока не найден поддерживаемый видеоплеер: "
+                                f"{item.lesson.title}",
+                                stage="player",
                                 level="warning",
+                                error_code="VIDEO_NOT_FOUND",
                             )
                         )
                     elif result.status is _LessonStatus.CANCELLED:
@@ -460,7 +469,11 @@ class PlaywrightDownloadGateway:
             except Exception:
                 return
             if is_hls_master_playlist(text) or is_hls_playlist(text):
-                playlists[url] = _Playlist(url, text)
+                referer_url = ""
+                with contextlib.suppress(Exception):
+                    headers = await response.request.all_headers()
+                    referer_url = headers.get("referer", "")
+                playlists[url] = _Playlist(url, text, referer_url)
                 last_playlist_at = time.monotonic()
 
         def schedule_response(response) -> None:
@@ -483,6 +496,11 @@ class PlaywrightDownloadGateway:
                 raise _AuthenticationExpired
 
             player_present = await self._has_supported_player(page)
+            embedded = await self._read_embedded_playlists(page)
+            for playlist in embedded:
+                playlists.setdefault(playlist.url, playlist)
+            if embedded:
+                last_playlist_at = time.monotonic()
             started_at = time.monotonic()
             while time.monotonic() - started_at < PLAYLIST_WAIT_SECONDS:
                 if self._cancelled.is_set():
@@ -493,6 +511,10 @@ class PlaywrightDownloadGateway:
 
             if response_tasks:
                 await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
+
+            if not playlists:
+                for playlist in await self._read_embedded_playlists(page):
+                    playlists.setdefault(playlist.url, playlist)
 
             if not playlists:
                 player_present = player_present or await self._has_supported_player(page)
@@ -509,7 +531,29 @@ class PlaywrightDownloadGateway:
                     return _LessonResult(_LessonStatus.FAILED)
                 return _LessonResult(_LessonStatus.NO_VIDEO)
 
-            selected = self._select_playlist_urls(playlists.values(), quality)
+            encrypted_master = next(
+                (
+                    playlist
+                    for playlist in playlists.values()
+                    if is_hls_master_playlist(playlist.text) and encrypted_hls_method(playlist.text)
+                ),
+                None,
+            )
+            if encrypted_master is not None:
+                encryption_method = encrypted_hls_method(encrypted_master.text)
+                emit(
+                    self._event(
+                        item,
+                        DownloadEventType.ERROR,
+                        f"Плейлист использует защищённое шифрование {encryption_method}",
+                        stage="playlist",
+                        level="error",
+                        error_code="ENCRYPTED_PLAYLIST_UNSUPPORTED",
+                    )
+                )
+                return _LessonResult(_LessonStatus.FAILED)
+
+            selected = self._select_playlists(playlists.values(), quality)
 
             if not selected:
                 emit(
@@ -524,14 +568,15 @@ class PlaywrightDownloadGateway:
                 return _LessonResult(_LessonStatus.FAILED)
 
             download_results = []
-            for video_index, playlist_url in enumerate(selected, start=1):
+            for video_index, playlist in enumerate(selected, start=1):
                 output = output_stem if len(selected) == 1 else output_stem / f"video_{video_index}"
                 result = await self._hls.download(
-                    playlist_url,
+                    playlist.url,
                     output,
                     item.lesson.title,
                     emit,
                     lesson_url=item.lesson.url,
+                    referer_url=playlist.referer_url,
                     course_path=item.course_path,
                     requested_quality=quality,
                     video_index=video_index,
@@ -563,12 +608,82 @@ class PlaywrightDownloadGateway:
 
     @staticmethod
     def _select_playlist_urls(playlists: Iterable[_Playlist], quality: str) -> list[str]:
-        selected: dict[str, str] = {}
-        for playlist in playlists:
+        return [
+            playlist.url
+            for playlist in PlaywrightDownloadGateway._select_playlists(playlists, quality)
+        ]
+
+    @staticmethod
+    def _select_playlists(playlists: Iterable[_Playlist], quality: str) -> list[_Playlist]:
+        candidates = tuple(playlists)
+        selected: dict[str, _Playlist] = {}
+        master_variant_keys: set[str] = set()
+
+        for playlist in candidates:
+            if not is_hls_master_playlist(playlist.text):
+                continue
+            master_variant_keys.update(
+                canonical_media_url(url)
+                for url in parse_master_playlist(playlist.text, playlist.url).values()
+            )
             selected_url = select_stream_playlist_url(playlist.text, playlist.url, quality)
             if selected_url:
-                selected.setdefault(canonical_media_url(selected_url), selected_url)
+                key = canonical_media_url(selected_url)
+                selected.setdefault(key, _Playlist(selected_url, "", playlist.referer_url))
+
+        for playlist in candidates:
+            if is_hls_master_playlist(playlist.text):
+                continue
+            key = canonical_media_url(playlist.url)
+            if key in master_variant_keys:
+                continue
+            selected_url = select_stream_playlist_url(playlist.text, playlist.url, quality)
+            if selected_url:
+                selected.setdefault(
+                    canonical_media_url(selected_url),
+                    _Playlist(selected_url, "", playlist.referer_url),
+                )
         return [selected[key] for key in sorted(selected)]
+
+    @staticmethod
+    async def _read_embedded_playlists(page: Any) -> list[_Playlist]:
+        frames: list[Any] = []
+        with contextlib.suppress(Exception):
+            frames.extend(page.frames)
+        if not frames:
+            frames.append(page)
+
+        playlists: list[_Playlist] = []
+        seen: set[str] = set()
+        for frame in frames:
+            try:
+                frame_url = frame.url or page.url
+                content = await frame.content()
+            except Exception:
+                continue
+            for candidate in extract_hls_urls(content, frame_url):
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                try:
+                    result = await frame.evaluate(
+                        """async (url) => {
+                            const response = await fetch(url, {credentials: "include"});
+                            return {url: response.url || url, text: await response.text()};
+                        }""",
+                        candidate,
+                    )
+                except Exception:
+                    continue
+                if not isinstance(result, dict):
+                    continue
+                url = result.get("url")
+                text = result.get("text")
+                if not isinstance(url, str) or not isinstance(text, str):
+                    continue
+                if is_hls_master_playlist(text) or is_hls_playlist(text):
+                    playlists.append(_Playlist(url, text, frame_url))
+        return playlists
 
     @staticmethod
     async def _has_supported_player(page: Any) -> bool:
