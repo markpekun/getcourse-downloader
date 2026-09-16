@@ -3,6 +3,7 @@ from html import unescape
 from urllib.parse import urljoin, urlsplit
 
 MASTER_PLAYLIST_PATH = "/api/playlist/master/"
+MEDIA_PLAYLIST_PATH = "/api/playlist/media/"
 VIDEO_PLAYER_SELECTOR = ", ".join(
     (
         "iframe.vhi-iframe",
@@ -20,11 +21,29 @@ _HLS_REFERENCE_RE = re.compile(
 
 def is_hls_playlist_url(url: str) -> bool:
     normalized = url.casefold()
-    return MASTER_PLAYLIST_PATH in normalized or urlsplit(normalized).path.endswith(".m3u8")
+    return (
+        MASTER_PLAYLIST_PATH in normalized
+        or MEDIA_PLAYLIST_PATH in normalized
+        or urlsplit(normalized).path.endswith(".m3u8")
+    )
 
 
 def is_master_playlist_url(url: str) -> bool:
     return is_hls_playlist_url(url)
+
+
+def stream_manifest_kind(url: str, content_type: str = "") -> str | None:
+    """Classify a manifest response without retaining its sensitive URL query."""
+
+    normalized_content_type = content_type.casefold()
+    if is_hls_playlist_url(url) or "mpegurl" in normalized_content_type:
+        return "hls"
+    path = urlsplit(url.casefold()).path
+    if path.endswith(".mpd") or "dash+xml" in normalized_content_type:
+        return "dash"
+    if any(marker in path for marker in ("/playlist", "/manifest", "/video", "/media", "/stream")):
+        return "media_api"
+    return None
 
 
 def extract_hls_urls(content: str, base_url: str) -> list[str]:

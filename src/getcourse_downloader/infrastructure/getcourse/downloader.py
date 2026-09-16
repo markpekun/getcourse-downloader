@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -22,7 +23,7 @@ from getcourse_downloader.infrastructure.browser.playwright import PlaywrightBro
 from getcourse_downloader.infrastructure.getcourse.video_signals import (
     VIDEO_PLAYER_SELECTOR,
     extract_hls_urls,
-    is_hls_playlist_url,
+    stream_manifest_kind,
 )
 from getcourse_downloader.infrastructure.media.hls import (
     HlsDownloader,
@@ -73,6 +74,13 @@ class _Playlist:
     referer_url: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class _ManifestObservation:
+    kind: str
+    host: str
+    status: int | None
+
+
 class PlaywrightDownloadGateway:
     """Open only selected lessons, detect their streams, and download their media."""
 
@@ -114,6 +122,7 @@ class PlaywrightDownloadGateway:
         level: str = "info",
         quality: str = "",
         error_code: str = "",
+        source_host: str = "",
     ) -> DownloadEvent:
         return DownloadEvent(
             event_type,
@@ -125,6 +134,7 @@ class PlaywrightDownloadGateway:
             quality=quality,
             level=level,
             error_code=error_code,
+            source_host=source_host,
         )
 
     @staticmethod
@@ -456,13 +466,27 @@ class PlaywrightDownloadGateway:
 
         page = await browser.new_page()
         playlists: dict[str, _Playlist] = {}
+        observed_manifests: list[_ManifestObservation] = []
+        observed_manifest_keys: set[tuple[str, str, int | None]] = set()
         response_tasks: set[asyncio.Task[None]] = set()
         last_playlist_at = 0.0
 
         async def on_response(response) -> None:
             nonlocal last_playlist_at
             url = response.url
-            if not is_hls_playlist_url(url) or url in playlists:
+            response_headers: dict[str, str] = {}
+            with contextlib.suppress(Exception):
+                response_headers = await response.all_headers()
+            kind = stream_manifest_kind(url, response_headers.get("content-type", ""))
+            host = urlsplit(url).hostname or ""
+            raw_status = getattr(response, "status", None)
+            status = raw_status if isinstance(raw_status, int) else None
+            if kind:
+                key = (kind, host, status)
+                if key not in observed_manifest_keys:
+                    observed_manifest_keys.add(key)
+                    observed_manifests.append(_ManifestObservation(kind, host, status))
+            if kind != "hls" or url in playlists:
                 return
             try:
                 text = await asyncio.wait_for(response.text(), timeout=15)
@@ -519,6 +543,54 @@ class PlaywrightDownloadGateway:
             if not playlists:
                 player_present = player_present or await self._has_supported_player(page)
                 if player_present:
+                    dash = next(
+                        (
+                            observation
+                            for observation in observed_manifests
+                            if observation.kind == "dash"
+                        ),
+                        None,
+                    )
+                    if dash is not None:
+                        status_suffix = f" (HTTP {dash.status})" if dash.status else ""
+                        emit(
+                            self._event(
+                                item,
+                                DownloadEventType.ERROR,
+                                "Обнаружен DASH manifest на "
+                                f"{dash.host or 'сервере видео'}{status_suffix}; "
+                                "поддерживается только HLS",
+                                stage="playlist",
+                                level="error",
+                                error_code="DASH_STREAM_UNSUPPORTED",
+                                source_host=dash.host,
+                            )
+                        )
+                        return _LessonResult(_LessonStatus.FAILED)
+                    media_api = next(
+                        (
+                            observation
+                            for observation in observed_manifests
+                            if observation.kind == "media_api"
+                        ),
+                        None,
+                    )
+                    if media_api is not None:
+                        status_suffix = f" (HTTP {media_api.status})" if media_api.status else ""
+                        emit(
+                            self._event(
+                                item,
+                                DownloadEventType.ERROR,
+                                "Плеер найден, но поддерживаемый HLS поток не получен. "
+                                "Обнаружен Media API на "
+                                f"{media_api.host or 'сервере видео'}{status_suffix}",
+                                stage="playlist",
+                                level="error",
+                                error_code="PLAYLIST_NOT_OBSERVED",
+                                source_host=media_api.host,
+                            )
+                        )
+                        return _LessonResult(_LessonStatus.FAILED)
                     emit(
                         self._event(
                             item,
@@ -526,6 +598,7 @@ class PlaywrightDownloadGateway:
                             "Плеер найден, но видеопоток не получен",
                             stage="playlist",
                             level="error",
+                            error_code="PLAYLIST_NOT_OBSERVED",
                         )
                     )
                     return _LessonResult(_LessonStatus.FAILED)

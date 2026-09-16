@@ -131,6 +131,36 @@ class _LateKinescopePage(_Page):
         return [] if self._frame_reads == 1 else [_KinescopeFrame()]
 
 
+class _DashResponse:
+    url = "https://cdn.example/video/manifest.mpd?token=secret"
+    status = 200
+
+    async def all_headers(self):
+        return {"content-type": "application/dash+xml"}
+
+
+class _DashPage(_Page):
+    async def goto(self, url, **kwargs):
+        await super().goto(url, **kwargs)
+        for handler in self._handlers:
+            handler(_DashResponse())
+
+
+class _MediaApiResponse:
+    url = "https://player.example/api/video/session?token=secret"
+    status = 200
+
+    async def all_headers(self):
+        return {"content-type": "application/json"}
+
+
+class _MediaApiPage(_Page):
+    async def goto(self, url, **kwargs):
+        await super().goto(url, **kwargs)
+        for handler in self._handlers:
+            handler(_MediaApiResponse())
+
+
 def _item():
     return SelectedLesson(("Course", "Module"), Lesson("Lesson", "https://school/lesson/1"))
 
@@ -208,6 +238,76 @@ def test_player_without_hls_is_technical_failure(monkeypatch, tmp_path):
     assert result.status.value == "failed"
     assert events[-1].type is DownloadEventType.ERROR
     assert events[-1].lesson_url == "https://school/lesson/1"
+
+
+def test_player_with_dash_manifest_reports_sanitized_unsupported_stream(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+    gateway = PlaywrightDownloadGateway(None, _Hls())  # type: ignore[arg-type]
+    events = []
+
+    result = asyncio.run(
+        gateway._download_lesson(
+            _Browser(_DashPage(player=True)),
+            _item(),
+            tmp_path / "Lesson",
+            "auto",
+            events.append,
+        )
+    )
+
+    assert result.status.value == "failed"
+    assert events[-1].error_code == "DASH_STREAM_UNSUPPORTED"
+    assert events[-1].source_host == "cdn.example"
+    assert "DASH" in events[-1].message
+    assert "secret" not in events[-1].message
+
+
+def test_player_with_media_api_reports_sanitized_discovery_trace(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+    gateway = PlaywrightDownloadGateway(None, _Hls())  # type: ignore[arg-type]
+    events = []
+
+    result = asyncio.run(
+        gateway._download_lesson(
+            _Browser(_MediaApiPage(player=True)),
+            _item(),
+            tmp_path / "Lesson",
+            "auto",
+            events.append,
+        )
+    )
+
+    assert result.status.value == "failed"
+    assert events[-1].error_code == "PLAYLIST_NOT_OBSERVED"
+    assert events[-1].source_host == "player.example"
+    assert "Media API" in events[-1].message
+    assert "HTTP 200" in events[-1].message
+    assert "secret" not in events[-1].message
+
+
+def test_getcourse_media_playlist_response_is_downloaded(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+    hls = _SuccessfulHls()
+    page = _Page(
+        player=True,
+        playlist=(
+            "https://school.example/api/playlist/media/342118993/360?token=secret",
+            "#EXTM3U\n#EXTINF:5,\nsegment.ts\n",
+        ),
+    )
+
+    result = asyncio.run(
+        PlaywrightDownloadGateway(None, hls)._download_lesson(
+            _Browser(page),
+            _item(),
+            tmp_path / "Lesson",
+            "360",
+            lambda _: None,
+        )
+    )
+
+    assert result.status.value == "downloaded"
+    assert hls.calls == 1
 
 
 def test_player_inserted_during_settle_is_not_reported_as_no_video(monkeypatch, tmp_path):
