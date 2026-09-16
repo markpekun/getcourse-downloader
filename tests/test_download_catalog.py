@@ -34,3 +34,10 @@ def test_download_catalog_is_scoped_to_lesson_and_output_location(tmp_path):
 
     assert catalog.find("https://school/lesson/2", stem) == ()
     assert catalog.find("https://school/lesson/1", tmp_path / "other" / "Lesson") == ()
+
+
+def test_invalid_utf8_catalog_does_not_prevent_downloading_again(tmp_path):
+    path = tmp_path / "downloads.json"
+    path.write_bytes(b"\xff\xfe\x00")
+
+    assert JsonDownloadCatalog(path).find("https://school/lesson/1", tmp_path / "Lesson") == ()

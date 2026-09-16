@@ -21,6 +21,7 @@ from getcourse_downloader.application.ports.discovery import (
 from getcourse_downloader.domain.errors import ExternalServiceError
 from getcourse_downloader.domain.models import Course, Lesson
 from getcourse_downloader.infrastructure.browser.playwright import PlaywrightBrowserFactory
+from getcourse_downloader.infrastructure.getcourse.authentication import is_authentication_url
 
 MAX_STREAMS = 500
 DISCOVERY_CONCURRENCY = 4
@@ -32,7 +33,7 @@ _STREAM_REFERENCE_RE = re.compile(
 )
 
 _PARENT_STREAM_REFERENCE_RE = re.compile(
-    r"(?:parent|back|breadcrumb)[^\n]{0,160}?"
+    r"\b(?:parent(?:[-_]?stream)?|back|breadcrumbs?)(?:[-_]?(?:url|link))?\b[^<>\n]{0,160}?"
     r"((?:(?:https?:)?//[^\"'<>\s\\]+)?/(?:pl/)?teach/control/stream/"
     r"(?:view/id/\d+|view\?[^\"'<>\s\\]*\bid=\d+[^\"'<>\s\\]*))",
     flags=re.IGNORECASE,
@@ -186,7 +187,7 @@ def _is_stream_landing_url(url: str) -> bool:
 async def _is_authentication_required(page: Page) -> bool:
     with contextlib.suppress(Exception):
         await page.wait_for_load_state("domcontentloaded", timeout=10_000)
-    return "login" in page.url.lower() or "required=true" in page.url.lower()
+    return is_authentication_url(page.url)
 
 
 class GetCourseDiscoverer:

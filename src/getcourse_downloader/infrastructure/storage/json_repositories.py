@@ -14,7 +14,7 @@ from getcourse_downloader.domain.models import Course, Settings
 def _read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise InvalidDataError(f"Не удалось прочитать {path.name}") from error
 
 

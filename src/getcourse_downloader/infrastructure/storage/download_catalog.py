@@ -28,7 +28,7 @@ class JsonDownloadCatalog:
             return {"schema_version": 1, "records": {}}
         try:
             payload = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return {"schema_version": 1, "records": {}}
         if not isinstance(payload, dict) or payload.get("schema_version") != 1:
             return {"schema_version": 1, "records": {}}

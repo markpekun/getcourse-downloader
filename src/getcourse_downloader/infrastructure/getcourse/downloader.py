@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import threading
 import time
-from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -20,6 +19,7 @@ from getcourse_downloader.application.ports.download import EventHandler
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.domain.models import DownloadRequest, DownloadSummary, SelectedLesson
 from getcourse_downloader.infrastructure.browser.playwright import PlaywrightBrowserFactory
+from getcourse_downloader.infrastructure.getcourse.authentication import is_authentication_url
 from getcourse_downloader.infrastructure.getcourse.video_signals import (
     VIDEO_PLAYER_SELECTOR,
     extract_hls_urls,
@@ -29,10 +29,10 @@ from getcourse_downloader.infrastructure.media.hls import (
     HlsDownloader,
     HlsDownloadStatus,
     canonical_media_url,
-    encrypted_hls_method,
+    has_unsupported_hls_encryption,
     is_hls_master_playlist,
     is_hls_playlist,
-    parse_master_playlist,
+    parse_master_variants,
     select_stream_playlist_url,
 )
 from getcourse_downloader.infrastructure.storage.download_catalog import (
@@ -43,6 +43,7 @@ from getcourse_downloader.infrastructure.storage.filenames import (
     collision_safe_component,
     collision_safe_stem,
     safe_lesson_output_stem,
+    sanitize_filename,
 )
 
 PLAYLIST_WAIT_SECONDS = 30.0
@@ -97,9 +98,11 @@ class PlaywrightDownloadGateway:
         self._authentication_continued = threading.Event()
 
     def run(self, request: DownloadRequest, on_event: EventHandler) -> DownloadSummary:
-        self._cancelled.clear()
-        self._authentication_continued.clear()
-        return asyncio.run(self._run_async(request, on_event))
+        try:
+            return asyncio.run(self._run_async(request, on_event))
+        finally:
+            self._cancelled.clear()
+            self._authentication_continued.clear()
 
     def continue_authentication(self) -> None:
         self._authentication_continued.set()
@@ -172,56 +175,27 @@ class PlaywrightDownloadGateway:
 
     @staticmethod
     def _output_stems(request: DownloadRequest) -> list[Path]:
-        initial_stems = [
-            safe_lesson_output_stem(
+        stems: list[Path] = []
+        for item in request.lessons:
+            stem = safe_lesson_output_stem(
                 request.save_path,
                 item.course_path,
                 item.lesson.title,
             )
-            for item in request.lessons
-        ]
-        relative_parts = [list(stem.relative_to(request.save_path).parts) for stem in initial_stems]
-
-        max_course_depth = max((len(item.course_path) for item in request.lessons), default=0)
-        for depth in range(max_course_depth):
-            groups: dict[tuple[tuple[str, ...], str], list[int]] = {}
-            for index, item in enumerate(request.lessons):
-                if depth >= len(item.course_path):
-                    continue
-                key = (
-                    tuple(part.casefold() for part in relative_parts[index][:depth]),
-                    relative_parts[index][depth].casefold(),
-                )
-                groups.setdefault(key, []).append(index)
-            for indexes in groups.values():
-                raw_prefixes = {
-                    request.lessons[index].course_path[: depth + 1] for index in indexes
-                }
-                if len(raw_prefixes) < 2:
-                    continue
-                for index in indexes:
-                    identity = "\x1f".join(request.lessons[index].course_path[: depth + 1])
-                    relative_parts[index][depth] = collision_safe_component(
-                        relative_parts[index][depth],
-                        identity,
+            parts = list(stem.relative_to(request.save_path).parts)
+            for depth, raw_component in enumerate(item.course_path):
+                if sanitize_filename(raw_component, fallback="course") != raw_component:
+                    parts[depth] = collision_safe_component(
+                        parts[depth],
+                        "\x1f".join(item.course_path[: depth + 1]),
                     )
-
-        stems = [request.save_path.joinpath(*parts) for parts in relative_parts]
-        counts = Counter(str(stem).casefold() for stem in stems)
-        url_counts = Counter(item.lesson.url for item in request.lessons)
-        return [
-            (
+            stems.append(
                 collision_safe_stem(
-                    stems[index],
-                    item.lesson.url
-                    if url_counts[item.lesson.url] == 1
-                    else f"{item.lesson.url}#{index}",
+                    request.save_path.joinpath(*parts),
+                    item.lesson.url,
                 )
-                if counts[str(stems[index]).casefold()] > 1
-                else stems[index]
             )
-            for index, item in enumerate(request.lessons)
-        ]
+        return stems
 
     async def _run_async(self, request: DownloadRequest, emit: EventHandler) -> DownloadSummary:
         downloaded = 0
@@ -290,6 +264,25 @@ class PlaywrightDownloadGateway:
                             if browser is None:
                                 result = _LessonResult(_LessonStatus.CANCELLED)
                                 break
+                        except Exception as error:
+                            if self._cancelled.is_set():
+                                result = _LessonResult(_LessonStatus.CANCELLED)
+                                break
+                            emit(
+                                self._event(
+                                    item,
+                                    DownloadEventType.ERROR,
+                                    "Ошибка обработки урока: "
+                                    + (
+                                        "не удалось прочитать или сохранить файлы"
+                                        if isinstance(error, OSError)
+                                        else "не удалось открыть страницу или обработать видео"
+                                    ),
+                                    level="error",
+                                    error_code="LESSON_PROCESSING_FAILED",
+                                )
+                            )
+                            break
 
                     if result.status is _LessonStatus.DOWNLOADED:
                         downloaded += 1
@@ -608,12 +601,13 @@ class PlaywrightDownloadGateway:
                 (
                     playlist
                     for playlist in playlists.values()
-                    if is_hls_master_playlist(playlist.text) and encrypted_hls_method(playlist.text)
+                    if is_hls_master_playlist(playlist.text)
+                    and has_unsupported_hls_encryption(playlist.text)
                 ),
                 None,
             )
             if encrypted_master is not None:
-                encryption_method = encrypted_hls_method(encrypted_master.text)
+                encryption_method = has_unsupported_hls_encryption(encrypted_master.text)
                 emit(
                     self._event(
                         item,
@@ -696,8 +690,8 @@ class PlaywrightDownloadGateway:
             if not is_hls_master_playlist(playlist.text):
                 continue
             master_variant_keys.update(
-                canonical_media_url(url)
-                for url in parse_master_playlist(playlist.text, playlist.url).values()
+                canonical_media_url(variant.url)
+                for variant in parse_master_variants(playlist.text, playlist.url)
             )
             selected_url = select_stream_playlist_url(playlist.text, playlist.url, quality)
             if selected_url:
@@ -769,8 +763,7 @@ class PlaywrightDownloadGateway:
         with contextlib.suppress(PlaywrightError):
             await page.wait_for_load_state("domcontentloaded", timeout=10_000)
         await page.wait_for_timeout(500)
-        current_url = page.url.lower()
-        return "login" in current_url or "required=true" in current_url
+        return is_authentication_url(page.url)
 
     async def _goto_or_cancel(self, page: Any, url: str) -> bool:
         navigation = asyncio.create_task(page.goto(url, wait_until="commit", timeout=60_000))

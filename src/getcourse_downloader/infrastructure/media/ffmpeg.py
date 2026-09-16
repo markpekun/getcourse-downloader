@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -84,24 +85,21 @@ class FfmpegMuxer:
         )
         communicate = asyncio.create_task(process.communicate())
         started_at = asyncio.get_running_loop().time()
-        while not communicate.done():
-            if is_cancelled and is_cancelled():
-                process.kill()
-                await process.wait()
-                communicate.cancel()
-                return False, "cancelled"
-            if asyncio.get_running_loop().time() - started_at >= 300:
-                process.kill()
-                await process.wait()
-                communicate.cancel()
-                return False, "ffmpeg завис (таймаут 5 минут)"
-            await asyncio.sleep(0.1)
         try:
+            while not communicate.done():
+                if is_cancelled and is_cancelled():
+                    return False, "cancelled"
+                if asyncio.get_running_loop().time() - started_at >= 300:
+                    return False, "ffmpeg завис (таймаут 5 минут)"
+                await asyncio.sleep(0.1)
             _, stderr = await communicate
-        except asyncio.CancelledError:
-            process.kill()
-            await process.wait()
-            raise
+        finally:
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await communicate
+                await process.wait()
         if process.returncode != 0:
             return False, stderr.decode("utf-8", errors="replace")[-300:]
         return True, ""
@@ -129,9 +127,12 @@ class FfmpegMuxer:
         try:
             stdout, _ = await asyncio.wait_for(process.communicate(), timeout=15)
         except TimeoutError:
-            process.kill()
-            await process.wait()
             return None
+        finally:
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
+                await process.wait()
         if process.returncode != 0:
             return None
         try:

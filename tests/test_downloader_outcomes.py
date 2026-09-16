@@ -385,7 +385,7 @@ def test_kinescope_signed_master_is_found_passively_and_best_quality_is_download
     assert kwargs["referer_url"] == "https://kinescope.io/embed/public-id"
 
 
-def test_master_session_key_is_rejected_before_variant_is_downloaded(monkeypatch, tmp_path):
+def test_identity_sample_aes_master_passes_to_hls_downloader(monkeypatch, tmp_path):
     monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
     hls = _RecordingHls()
     gateway = PlaywrightDownloadGateway(None, hls)  # type: ignore[arg-type]
@@ -411,10 +411,9 @@ def test_master_session_key_is_rejected_before_variant_is_downloaded(monkeypatch
         )
     )
 
-    assert result.status.value == "failed"
-    assert hls.calls == []
-    assert events[-1].error_code == "ENCRYPTED_PLAYLIST_UNSUPPORTED"
-    assert "SAMPLE-AES" in events[-1].message
+    assert result.status.value == "downloaded"
+    assert hls.calls[0][0] == "https://cdn.example/1080.m3u8?sign=abc"
+    assert not any(event.error_code == "ENCRYPTED_PLAYLIST_UNSUPPORTED" for event in events)
 
 
 def test_kinescope_master_available_after_initial_page_read_is_downloaded(monkeypatch, tmp_path):
@@ -493,6 +492,41 @@ def test_multiple_video_order_is_stable_despite_response_order():
     ]
 
 
+def test_query_identified_videos_are_not_collapsed_into_one_download():
+    master = _Playlist(
+        "https://cdn.example/master.m3u8?video=one",
+        "#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=1280x720\n"
+        "play.m3u8?video=one&quality=720&token=secret\n",
+    )
+    other = _Playlist(
+        "https://cdn.example/play.m3u8?video=two&quality=720&token=other",
+        "#EXTM3U\n#EXTINF:5,\nsegment.ts\n",
+    )
+
+    selected = PlaywrightDownloadGateway._select_playlist_urls((master, other), "auto")
+
+    assert set(selected) == {
+        "https://cdn.example/play.m3u8?video=one&quality=720&token=secret",
+        "https://cdn.example/play.m3u8?video=two&quality=720&token=other",
+    }
+
+
+def test_bandwidth_only_master_selects_best_and_suppresses_captured_variants():
+    master = _Playlist(
+        "https://cdn.example/master.m3u8",
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\nlow.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=5000000\nhigh.m3u8\n",
+    )
+    captured = _Playlist(
+        "https://cdn.example/low.m3u8",
+        "#EXTM3U\n#EXTINF:5,\nsegment.ts\n",
+    )
+
+    assert PlaywrightDownloadGateway._select_playlist_urls((captured, master), "auto") == [
+        "https://cdn.example/high.m3u8"
+    ]
+
+
 def test_output_stems_preserve_hierarchy_and_hash_all_collisions(tmp_path):
     lessons = (
         SelectedLesson(("Course", "Module"), Lesson("A:B", "https://school/lesson/1")),
@@ -506,7 +540,8 @@ def test_output_stems_preserve_hierarchy_and_hash_all_collisions(tmp_path):
     assert stems[0].name.startswith("A_B~")
     assert stems[1].name.startswith("A_B~")
     assert stems[0] != stems[1]
-    assert stems[2] == tmp_path / "Course" / "Other" / "A_B"
+    assert stems[2].parent == tmp_path / "Course" / "Other"
+    assert stems[2].name.startswith("A_B~")
 
 
 def test_output_stems_disambiguate_sanitized_folder_collisions_stably(tmp_path):
@@ -551,3 +586,97 @@ def test_path_too_long_is_rejected(tmp_path):
 
     with pytest.raises(ValueError, match="слишком длинный"):
         safe_lesson_output_stem(Path("C:/") / ("x" * 190), ("Course",), "Lesson")
+
+
+def test_output_paths_do_not_change_with_selection_or_alias_other_lessons(tmp_path):
+    first = SelectedLesson(("A:B",), Lesson("Same title", "https://school/lesson/1"))
+    second = SelectedLesson(("A?B",), Lesson("Same title", "https://school/lesson/2"))
+    together = PlaywrightDownloadGateway._output_stems(
+        DownloadRequest((first, second), VideoQuality.AUTO, tmp_path)
+    )
+    individually = [
+        PlaywrightDownloadGateway._output_stems(
+            DownloadRequest((item,), VideoQuality.AUTO, tmp_path)
+        )[0]
+        for item in (first, second)
+    ]
+
+    assert together == individually
+    assert individually[0] != individually[1]
+    assert individually[0].parent != individually[1].parent
+
+
+def test_same_title_lessons_downloaded_separately_have_distinct_output_paths(tmp_path):
+    outputs = [
+        PlaywrightDownloadGateway._output_stems(
+            DownloadRequest(
+                (SelectedLesson(("Course",), Lesson("Lesson", f"https://school/lesson/{number}")),),
+                VideoQuality.AUTO,
+                tmp_path,
+            )
+        )[0]
+        for number in (1, 2)
+    ]
+
+    assert outputs[0] != outputs[1]
+
+
+def test_lesson_navigation_failure_is_reported_and_next_lesson_still_runs(monkeypatch, tmp_path):
+    class PlaywrightContext:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_):
+            return None
+
+    items = (
+        SelectedLesson(("Course",), Lesson("First", "https://school/lesson/1")),
+        SelectedLesson(("Course",), Lesson("Second", "https://school/lesson/2")),
+    )
+    gateway = PlaywrightDownloadGateway(None, _Hls())
+
+    async def launch(*_):
+        return _Browser(_Page(player=False))
+
+    async def download_lesson(_browser, item, *_):
+        if item == items[0]:
+            raise RuntimeError("Failed to open https://school/lesson/1?token=secret")
+        return downloader_module._LessonResult(downloader_module._LessonStatus.NO_VIDEO)
+
+    monkeypatch.setattr(downloader_module, "async_playwright", PlaywrightContext)
+    monkeypatch.setattr(gateway, "_launch_authenticated_context", launch)
+    monkeypatch.setattr(gateway, "_download_lesson", download_lesson)
+    events = []
+
+    summary = asyncio.run(
+        gateway._run_async(DownloadRequest(items, VideoQuality.AUTO, tmp_path), events.append)
+    )
+
+    assert summary.failed == ("First",)
+    assert summary.no_video == 1
+    assert summary.processed == 2
+    assert events[-1].type is DownloadEventType.SUMMARY
+    assert "secret" not in "\n".join(event.message for event in events)
+
+
+def test_download_gateway_preserves_cancel_received_before_run(monkeypatch, tmp_path):
+    gateway = PlaywrightDownloadGateway(None, _Hls())
+
+    async def run_async(*_):
+        return gateway._cancelled.is_set()
+
+    monkeypatch.setattr(gateway, "_run_async", run_async)
+    gateway.cancel()
+
+    assert gateway.run(DownloadRequest((), VideoQuality.AUTO, tmp_path), lambda _: None) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://login-school.getcourse.ru/lesson/1", "https://school/lesson/1?next=/login"],
+)
+def test_lesson_url_with_login_outside_path_is_not_authentication(url):
+    page = _Page(player=False)
+    page.url = url
+
+    assert asyncio.run(PlaywrightDownloadGateway._authentication_required(page)) is False

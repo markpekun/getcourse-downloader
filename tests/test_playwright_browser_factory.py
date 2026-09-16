@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 
 import pytest
 
@@ -28,7 +29,8 @@ def test_bundled_firefox_overrides_an_existing_playwright_browser_path(monkeypat
     assert os.environ["PLAYWRIGHT_BROWSERS_PATH"] == str(bundled.resolve())
 
 
-def test_launch_fails_clearly_when_bundled_firefox_is_missing(tmp_path):
+def test_launch_fails_clearly_when_bundled_firefox_is_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
     paths = _paths(tmp_path)
     factory = PlaywrightBrowserFactory(paths)
 
@@ -65,3 +67,46 @@ def test_browser_launch_error_has_stable_diagnostic_code(tmp_path):
         asyncio.run(factory.launch(Playwright(), headless=True))  # type: ignore[arg-type]
 
     assert getattr(captured.value, "code", "") == "BROWSER_START_FAILED"
+
+
+def test_source_launch_uses_installed_playwright_firefox(tmp_path):
+    paths = _paths(tmp_path)
+    factory = PlaywrightBrowserFactory(paths)
+
+    class Context:
+        def on(self, event, callback):
+            assert event == "close"
+            self.close_callback = callback
+
+    context = Context()
+
+    class Firefox:
+        async def launch_persistent_context(self, profile, *, headless):
+            assert profile == str(paths.session)
+            assert headless is True
+            return context
+
+    class Playwright:
+        firefox = Firefox()
+
+    assert asyncio.run(factory.launch(Playwright(), headless=True)) is context
+    context.close_callback()
+    assert not (paths.session / ".gcd-profile-owner").exists()
+
+
+def test_cancelled_browser_launch_releases_profile(tmp_path):
+    paths = _paths(tmp_path)
+    bundled = paths.resources / "ms-playwright" / "firefox-1538" / "firefox"
+    bundled.mkdir(parents=True)
+    (bundled / "firefox.exe").write_bytes(b"firefox")
+
+    class Firefox:
+        async def launch_persistent_context(self, *_args, **_kwargs):
+            raise asyncio.CancelledError
+
+    class Playwright:
+        firefox = Firefox()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(PlaywrightBrowserFactory(paths).launch(Playwright(), headless=True))
+    assert not (paths.session / ".gcd-profile-owner").exists()

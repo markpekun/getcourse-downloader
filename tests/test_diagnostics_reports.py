@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.infrastructure.diagnostics.reports import DownloadDiagnostics
 
@@ -138,3 +140,56 @@ def test_no_video_lesson_is_included_in_individual_and_run_reports(tmp_path):
     assert lesson_report["error_code"] == "VIDEO_NOT_FOUND"
     assert run_report["no_video_lessons"] == [lesson_report]
     assert run_report["failed_lessons"] == []
+
+
+def test_report_removes_url_credentials_from_urls_messages_and_source_hosts(tmp_path):
+    report_path = DownloadDiagnostics(tmp_path).record(
+        DownloadEvent(
+            DownloadEventType.ERROR,
+            lesson="Lesson",
+            lesson_url="https://user:secret@school.example/lesson?token=secret",
+            message="Failed https://user:secret@cdn.example/video?token=secret#secret",
+            source_host="user:secret@cdn.example",
+        )
+    )
+
+    assert report_path is not None
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["lesson_url"] == "https://school.example/lesson"
+    assert payload["source_host"] == "cdn.example"
+    assert payload["summary"] == "Failed https://cdn.example/video"
+    assert "secret" not in report_path.read_text(encoding="utf-8")
+
+
+def test_report_removes_credentials_from_derived_source_host(tmp_path):
+    report_path = DownloadDiagnostics(tmp_path).record(
+        DownloadEvent(
+            DownloadEventType.ERROR,
+            lesson="Lesson",
+            lesson_url="https://user:secret@school.example/lesson",
+        )
+    )
+
+    assert report_path is not None
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["source_host"] == "school.example"
+    assert "secret" not in report_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "lesson_url", ["https://[broken/lesson?token=secret", "https://[::1]/lesson?token=secret"]
+)
+def test_report_handles_malformed_and_ipv6_urls_without_leaking_query(tmp_path, lesson_url):
+    report_path = DownloadDiagnostics(tmp_path).record(
+        DownloadEvent(
+            DownloadEventType.ERROR,
+            lesson="Lesson",
+            lesson_url=lesson_url,
+            message=f"Failed {lesson_url}",
+        )
+    )
+
+    assert report_path is not None
+    payload = report_path.read_text(encoding="utf-8")
+    assert "Failed" in payload
+    assert "secret" not in payload

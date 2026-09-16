@@ -130,6 +130,17 @@ def test_parse_master_playlist_empty():
     assert parse_master_playlist("", "https://example.com/master.m3u8") == {}
 
 
+def test_bandwidth_only_variants_are_selectable_without_inventing_a_resolution():
+    playlist = (
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5000000\nhigh.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=2000000\nlow.m3u8\n"
+    )
+    for quality in ("auto", "720"):
+        assert select_stream_playlist_url(playlist, "https://cdn/master.m3u8", quality) == (
+            "https://cdn/high.m3u8"
+        )
+
+
 def test_hls_playlist_types_and_stream_selection():
     media_playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nsegment/00001\n"
 

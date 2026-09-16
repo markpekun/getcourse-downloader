@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import ctypes
 import os
+import time
+from ctypes import wintypes
 from pathlib import Path
 
 from playwright.async_api import BrowserContext, Playwright
 from playwright.async_api import Error as PlaywrightError
 
 from getcourse_downloader.domain.errors import ExternalServiceError
-from getcourse_downloader.infrastructure.platform.paths import AppPaths
+from getcourse_downloader.infrastructure.platform.paths import AppPaths, is_frozen
 
 
 def _process_exists(pid: int) -> bool:
@@ -24,6 +26,10 @@ def _process_exists(pid: int) -> bool:
     if windll is None:
         return False
     kernel32 = windll.kernel32
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
     process = kernel32.OpenProcess(0x1000, False, pid)
     if not process:
         return False
@@ -45,7 +51,12 @@ class _ProfileLease:
                     owner = int(self._path.read_text(encoding="ascii").strip())
                 except (OSError, ValueError):
                     owner = 0
-                if _process_exists(owner):
+                # A competing process may have created the file but not written its PID yet.
+                try:
+                    initializing = owner == 0 and time.time() - self._path.stat().st_mtime < 5
+                except FileNotFoundError:
+                    continue
+                if initializing or _process_exists(owner):
                     raise ExternalServiceError(
                         "Профиль браузера уже используется другой копией приложения. "
                         "Закройте её и повторите загрузку.",
@@ -86,7 +97,7 @@ class PlaywrightBrowserFactory:
         return str(self._paths.session)
 
     async def launch(self, playwright: Playwright, *, headless: bool) -> BrowserContext:
-        if self._bundled_firefox is None or not self._bundled_firefox.is_file():
+        if is_frozen() and (self._bundled_firefox is None or not self._bundled_firefox.is_file()):
             raise ExternalServiceError(
                 "Встроенный Firefox отсутствует или повреждён. "
                 "Полностью распакуйте архив приложения и повторите загрузку.",
@@ -115,5 +126,8 @@ class PlaywrightBrowserFactory:
                 code="BROWSER_START_FAILED",
                 technical_details=str(error),
             ) from error
+        except BaseException:
+            lease.release()
+            raise
         context.on("close", lambda *_: lease.release())
         return context

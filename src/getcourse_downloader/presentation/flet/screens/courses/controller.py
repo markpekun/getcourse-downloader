@@ -9,6 +9,7 @@ from getcourse_downloader.application.ports.repositories import (
     SettingsRepository,
 )
 from getcourse_downloader.application.use_cases.download_lessons import DownloadLessons
+from getcourse_downloader.domain.errors import InvalidDataError
 from getcourse_downloader.domain.events import DownloadEvent
 from getcourse_downloader.domain.models import (
     Course,
@@ -44,7 +45,10 @@ class CoursesController:
         self._courses.delete()
 
     def load_save_path(self) -> str:
-        return self._settings.load().save_path
+        try:
+            return self._settings.load().save_path
+        except InvalidDataError:
+            return Settings().save_path
 
     def save_save_path(self, path: str) -> None:
         self._settings.save(Settings(save_path=path))

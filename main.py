@@ -20,6 +20,11 @@ def _prepare_worker_stdio() -> None:
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        from getcourse_downloader.presentation.cli.self_test import main as self_test_main
+
+        raise SystemExit(self_test_main([arg for arg in sys.argv[1:] if arg != "--self-test"]))
+
     if "--download-worker" in sys.argv:
         from getcourse_downloader.presentation.cli.worker import main as worker_main
 

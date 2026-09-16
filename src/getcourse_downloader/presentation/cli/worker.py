@@ -74,15 +74,20 @@ class WorkerCommandListener:
 
     def _run(self) -> None:
         try:
-            with self._path.open("r", encoding="utf-8") as stream:
+            with self._path.open("rb") as stream:
+                pending = b""
                 while not self._stopped.is_set():
-                    line = stream.readline()
-                    if not line:
+                    chunk = stream.readline()
+                    if not chunk:
                         time.sleep(0.05)
                         continue
+                    pending += chunk
+                    if not pending.endswith(b"\n"):
+                        continue
+                    line, pending = pending, b""
                     try:
                         payload = json.loads(line)
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
                     command = payload.get("command") if isinstance(payload, dict) else None
                     if command == "cancel":

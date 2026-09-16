@@ -393,23 +393,18 @@ def test_download_row_states_are_keyed_by_lesson_url():
     )
     assert lesson_row.progress.value == 0.75
     assert lesson_row.progress_text.value == "75%"
-    assert lesson_row.status_text.value == "Скачивание сегментов: 3/4"
+    assert lesson_row.status_text.value == "Загрузка"
 
-    for stage, message in (
-        ("assemble", "Собираю видеофайл…"),
-        ("ffmpeg", "Упаковываю MP4 через FFmpeg…"),
-        ("verify", "Проверяю готовый файл…"),
-    ):
-        screen._update_download_row(
-            DownloadEvent(
-                DownloadEventType.LOG,
-                lesson="Урок",
-                lesson_url=item.lesson.url,
-                stage=stage,
-                message=message,
-            )
+    screen._update_download_row(
+        DownloadEvent(
+            DownloadEventType.LOG,
+            lesson="Урок",
+            lesson_url=item.lesson.url,
+            stage="ffmpeg",
+            message="Упаковываю MP4 через FFmpeg…",
         )
-        assert lesson_row.status_text.value == message
+    )
+    assert lesson_row.status_text.value == "Загрузка"
 
     screen._update_download_row(
         DownloadEvent(

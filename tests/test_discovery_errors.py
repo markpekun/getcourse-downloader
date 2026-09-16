@@ -6,7 +6,10 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from getcourse_downloader.domain.errors import ExternalServiceError
-from getcourse_downloader.infrastructure.getcourse.discovery import GetCourseDiscoverer
+from getcourse_downloader.infrastructure.getcourse.discovery import (
+    GetCourseDiscoverer,
+    _is_authentication_required,
+)
 
 
 @pytest.mark.parametrize(
@@ -48,3 +51,24 @@ def test_navigation_failures_have_stable_codes(error, code):
         asyncio.run(discoverer._navigate(Page(), "https://school.example/course"))
 
     assert captured.value.code == code
+
+
+@pytest.mark.parametrize(
+    ("url", "required"),
+    [
+        ("https://login-school.getcourse.ru/teach/control/stream/view/id/100", False),
+        ("https://school.example/teach/control?next=/login", False),
+        ("https://school.example/teach/control?notrequired=true", False),
+        ("https://school.example/cms/system/login", True),
+        ("https://school.example/teach/control?required=true", True),
+    ],
+)
+def test_authentication_detection_uses_login_route_and_exact_query_parameter(url, required):
+    class Page:
+        async def wait_for_load_state(self, *_args, **_kwargs):
+            return None
+
+    page = Page()
+    page.url = url
+
+    assert asyncio.run(_is_authentication_required(page)) is required

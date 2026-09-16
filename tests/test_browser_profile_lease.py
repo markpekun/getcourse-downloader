@@ -25,3 +25,11 @@ def test_profile_lease_replaces_stale_owner_and_releases(tmp_path):
     assert owner.read_text(encoding="ascii") == str(os.getpid())
     lease.release()
     assert not owner.exists()
+
+
+def test_profile_lease_does_not_steal_lock_before_owner_pid_is_written(tmp_path):
+    owner = tmp_path / ".gcd-profile-owner"
+    owner.write_bytes(b"")
+    with pytest.raises(ExternalServiceError):
+        _ProfileLease(tmp_path).acquire()
+    assert owner.read_bytes() == b""

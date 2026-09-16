@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import shutil
+import sys
 
 import pytest
 
@@ -71,3 +73,47 @@ def test_mux_concat_uses_ffmpeg_concat_demuxer(monkeypatch, tmp_path):
         "aac_adtstoasc",
         str(tmp_path / "output.mp4"),
     ]
+
+
+@pytest.mark.parametrize("operation", ["mux", "probe"])
+def test_task_cancellation_reaps_the_running_media_process(monkeypatch, tmp_path, operation):
+    async def scenario():
+        original_spawn = asyncio.create_subprocess_exec
+        started = asyncio.Event()
+        processes = []
+
+        async def spawn(*_args, **kwargs):
+            process = await original_spawn(
+                sys.executable, "-c", "import time; time.sleep(30)", **kwargs
+            )
+            processes.append(process)
+            started.set()
+            return process
+
+        muxer = FfmpegMuxer(_paths(tmp_path))
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(muxer, "executable", lambda: sys.executable)
+        monkeypatch.setattr(muxer, "probe_executable", lambda: sys.executable)
+        coroutine = (
+            muxer.mux(tmp_path / "source.ts", tmp_path / "output.mp4")
+            if operation == "mux"
+            else muxer.probe_height(tmp_path / "source.mp4")
+        )
+        task = asyncio.create_task(coroutine)
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            returncode = processes[0].returncode
+        finally:
+            for process in processes:
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        assert returncode is not None
+
+    asyncio.run(scenario())

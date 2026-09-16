@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -11,17 +12,39 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import aiohttp
 
 from getcourse_downloader.application.ports.download import EventHandler
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.infrastructure.media.ffmpeg import FfmpegMuxer
+from getcourse_downloader.infrastructure.media.sample_aes import (
+    SampleAesError,
+    decrypt_sample_aes_ts,
+)
 
 _PROGRESS_UPDATE_SECONDS = 0.25
 _SPEED_UPDATE_SECONDS = 3.0
 _monotonic = time.monotonic
+_VOLATILE_QUERY_PARAMETERS = {
+    "access_token",
+    "auth",
+    "authorization",
+    "exp",
+    "expire",
+    "expires",
+    "expiration",
+    "hdntl",
+    "hdnts",
+    "jwt",
+    "key-pair-id",
+    "policy",
+    "sig",
+    "sign",
+    "signature",
+    "token",
+}
 
 
 def _download_error_details(error: BaseException, *, playlist: bool = False) -> tuple[str, str]:
@@ -48,24 +71,170 @@ def extract_quality(url: str) -> int:
     return int(numeric_parts[-1]) if numeric_parts else 0
 
 
-def parse_master_playlist(text: str, master_url: str) -> dict[int, str]:
-    qualities: dict[int, str] = {}
-    last_resolution: int | None = None
-    expects_variant = False
+@dataclass(frozen=True, slots=True)
+class HlsVariant:
+    url: str
+    height: int = 0
+    bandwidth: int = 0
+
+
+class HlsKeyError(ValueError):
+    """A media playlist has no usable clear-key SAMPLE-AES declaration."""
+
+
+@dataclass(frozen=True, slots=True)
+class HlsSampleAesKey:
+    uri: str
+    iv: bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class HlsMediaSegment:
+    url: str
+    sequence_number: int
+    sample_aes_key: HlsSampleAesKey | None
+
+    @property
+    def iv(self) -> bytes | None:
+        return self.sample_aes_key.iv if self.sample_aes_key is not None else None
+
+
+def _hls_attributes(attribute_list: str) -> dict[str, str]:
+    attributes: dict[str, str] = {}
+    position = 0
+    while position < len(attribute_list):
+        match = re.match(r"([A-Za-z0-9-]+)=", attribute_list[position:])
+        if match is None:
+            raise HlsKeyError("invalid HLS key attribute")
+        name = match.group(1).upper()
+        position += match.end()
+        if position < len(attribute_list) and attribute_list[position] == '"':
+            end = attribute_list.find('"', position + 1)
+            if end == -1:
+                raise HlsKeyError("unterminated HLS key string")
+            value = attribute_list[position + 1 : end]
+            position = end + 1
+        else:
+            end = attribute_list.find(",", position)
+            if end == -1:
+                end = len(attribute_list)
+            value = attribute_list[position:end]
+            position = end
+        if not value or name in attributes:
+            raise HlsKeyError("invalid HLS key attribute")
+        attributes[name] = value
+        if position < len(attribute_list):
+            if attribute_list[position] != ",":
+                raise HlsKeyError("invalid HLS key separator")
+            position += 1
+    return attributes
+
+
+def _parse_sample_aes_key(attributes: dict[str, str], playlist_url: str) -> HlsSampleAesKey | None:
+    method = attributes.get("METHOD", "").upper()
+    if method == "NONE":
+        if len(attributes) != 1:
+            raise HlsKeyError("METHOD=NONE cannot contain key attributes")
+        return None
+    if method != "SAMPLE-AES":
+        raise HlsKeyError(f"unsupported HLS encryption method {method or 'missing'}")
+    if attributes.get("KEYFORMAT", "identity").casefold() != "identity":
+        raise HlsKeyError("SAMPLE-AES requires KEYFORMAT=identity")
+    uri = attributes.get("URI")
+    if uri is None:
+        raise HlsKeyError("SAMPLE-AES key URI is missing")
+    absolute_uri = urljoin(playlist_url, uri)
+    if urlsplit(absolute_uri).scheme.casefold() != "https":
+        raise HlsKeyError("SAMPLE-AES key URI must use HTTPS")
+    iv_value = attributes.get("IV")
+    if iv_value is None:
+        iv = None
+    else:
+        if not iv_value.startswith(("0x", "0X")) or len(iv_value) != 34:
+            raise HlsKeyError("SAMPLE-AES IV must be a 128-bit hexadecimal value")
+        try:
+            iv = bytes.fromhex(iv_value[2:])
+        except ValueError as error:
+            raise HlsKeyError("SAMPLE-AES IV must be hexadecimal") from error
+    return HlsSampleAesKey(absolute_uri, iv)
+
+
+def parse_sample_aes_segments(playlist: str, playlist_url: str) -> tuple[HlsMediaSegment, ...]:
+    """Parse media segments together with their effective clear-key declaration."""
+
+    segments: list[HlsMediaSegment] = []
+    sequence_number = 0
+    active_key: HlsSampleAesKey | None = None
+    for raw_line in playlist.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            try:
+                sequence_number = int(line.split(":", 1)[1])
+            except ValueError as error:
+                raise HlsKeyError("invalid HLS media sequence") from error
+            if sequence_number < 0:
+                raise HlsKeyError("invalid HLS media sequence")
+        elif line.startswith("#EXT-X-KEY:"):
+            active_key = _parse_sample_aes_key(_hls_attributes(line.split(":", 1)[1]), playlist_url)
+        elif not line.startswith("#"):
+            absolute_url = urljoin(playlist_url, line)
+            if not urlsplit(absolute_url).path.casefold().endswith(".m3u8"):
+                segments.append(HlsMediaSegment(absolute_url, sequence_number, active_key))
+                sequence_number += 1
+    return tuple(segments)
+
+
+def has_unsupported_hls_encryption(text: str) -> str | None:
+    """Return a protected method that is outside the clear-key SAMPLE-AES scope."""
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith(("#EXT-X-KEY:", "#EXT-X-SESSION-KEY:")):
+            continue
+        try:
+            attributes = _hls_attributes(line.split(":", 1)[1])
+        except HlsKeyError:
+            return "UNKNOWN"
+        method = attributes.get("METHOD", "").upper()
+        if method == "NONE":
+            continue
+        key_format = attributes.get("KEYFORMAT", "identity").casefold()
+        if method == "SAMPLE-AES" and key_format == "identity":
+            continue
+        return method or "UNKNOWN"
+    return None
+
+
+def parse_master_variants(text: str, master_url: str) -> tuple[HlsVariant, ...]:
+    variants: list[HlsVariant] = []
+    attributes: str | None = None
     for raw_line in text.strip().splitlines():
         line = raw_line.strip()
         if line.startswith("#EXT-X-STREAM-INF:"):
-            match = re.search(r"RESOLUTION=\d+x(\d+)", line)
-            last_resolution = int(match.group(1)) if match else None
-            expects_variant = True
-        elif line and not line.startswith("#") and expects_variant:
+            attributes = line
+        elif line and not line.startswith("#") and attributes is not None:
             absolute_url = urljoin(master_url, line)
-            quality = last_resolution or extract_quality(absolute_url) or 0
-            if quality > 0:
-                qualities[quality] = absolute_url
-            last_resolution = None
-            expects_variant = False
-    return qualities
+            resolution = re.search(r"(?:[:,])RESOLUTION=\d+x(\d+)", attributes)
+            bandwidth = re.search(r"(?:[:,])BANDWIDTH=(\d+)", attributes)
+            variants.append(
+                HlsVariant(
+                    absolute_url,
+                    int(resolution.group(1)) if resolution else extract_quality(absolute_url),
+                    int(bandwidth.group(1)) if bandwidth else 0,
+                )
+            )
+            attributes = None
+    return tuple(variants)
+
+
+def parse_master_playlist(text: str, master_url: str) -> dict[int, str]:
+    return {
+        variant.height: variant.url
+        for variant in parse_master_variants(text, master_url)
+        if variant.height > 0
+    }
 
 
 def is_hls_playlist(text: str) -> bool:
@@ -105,7 +274,10 @@ def select_quality_url(qualities: dict[int, str], quality: str) -> str | None:
 def select_stream_playlist_url(text: str, playlist_url: str, quality: str) -> str | None:
     if is_hls_master_playlist(text):
         qualities = parse_master_playlist(text, playlist_url)
-        return select_quality_url(qualities, quality)
+        if qualities:
+            return select_quality_url(qualities, quality)
+        variants = parse_master_variants(text, playlist_url)
+        return max(variants, key=lambda variant: variant.bandwidth).url if variants else None
     if is_hls_playlist(text):
         return playlist_url
     return None
@@ -125,10 +297,17 @@ def extract_segment_urls(playlist: str, playlist_url: str) -> list[str]:
 
 
 def canonical_media_url(url: str) -> str:
-    """Strip volatile signatures while retaining the stable media identity."""
+    """Retain media identity without persisting query values or rotating credentials."""
 
     parts = urlsplit(url)
-    return urlunsplit((parts.scheme.casefold(), parts.netloc.casefold(), parts.path, "", ""))
+    identity = sorted(
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key.casefold() not in _VOLATILE_QUERY_PARAMETERS
+        and not key.casefold().startswith(("x-amz-", "x-goog-"))
+    )
+    digest = hashlib.sha256(urlencode(identity).encode("utf-8")).hexdigest() if identity else ""
+    return urlunsplit((parts.scheme.casefold(), parts.netloc.casefold(), parts.path, "", digest))
 
 
 class HlsDownloadStatus(StrEnum):
@@ -188,16 +367,18 @@ def _prepare_checkpoint(
     requested_quality: str,
     playlist_url: str,
     segment_urls: list[str],
+    segment_encryption: list[dict[str, str | int] | None] | None = None,
 ) -> tuple[Path, list[Path], int]:
     checkpoint = _checkpoint_path(output_mp4)
     manifest_path = checkpoint / "manifest.json"
     canonical_segments = [canonical_media_url(url) for url in segment_urls]
     expected_manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "lesson_url": lesson_url,
         "requested_quality": requested_quality,
         "playlist_url": canonical_media_url(playlist_url),
         "segments": canonical_segments,
+        "segment_encryption": segment_encryption or [None] * len(segment_urls),
     }
 
     current_manifest: object = None
@@ -351,7 +532,7 @@ class HlsDownloader:
                 )
                 return HlsDownloadResult(HlsDownloadStatus.FAILED)
 
-            encryption_method = encrypted_hls_method(playlist)
+            encryption_method = has_unsupported_hls_encryption(playlist)
             if encryption_method:
                 emit(
                     event(
@@ -365,8 +546,44 @@ class HlsDownloader:
                 )
                 return HlsDownloadResult(HlsDownloadStatus.FAILED)
 
-            segment_urls = extract_segment_urls(playlist, playlist_url)
-            total = len(segment_urls)
+            try:
+                segments = parse_sample_aes_segments(playlist, playlist_url)
+            except HlsKeyError as error:
+                emit(
+                    event(
+                        DownloadEventType.ERROR,
+                        f"Некорректный ключ SAMPLE-AES: {error}",
+                        stage="playlist",
+                        level="error",
+                        error_code="HLS_KEY_INVALID",
+                        source_host=parts.netloc,
+                    )
+                )
+                return HlsDownloadResult(HlsDownloadStatus.FAILED)
+
+            unsupported_tag = next(
+                (
+                    line.strip().split(":", 1)[0]
+                    for line in playlist.splitlines()
+                    if line.strip().startswith(("#EXT-X-MAP:", "#EXT-X-BYTERANGE:"))
+                ),
+                None,
+            )
+            if unsupported_tag:
+                emit(
+                    event(
+                        DownloadEventType.ERROR,
+                        f"Неподдерживаемая структура HLS: {unsupported_tag}",
+                        stage="playlist",
+                        level="error",
+                        error_code="HLS_STRUCTURE_UNSUPPORTED",
+                        source_host=parts.netloc,
+                    )
+                )
+                return HlsDownloadResult(HlsDownloadStatus.FAILED)
+
+            segment_urls = [segment.url for segment in segments]
+            total = len(segments)
             if not total:
                 emit(
                     event(
@@ -380,13 +597,65 @@ class HlsDownloader:
                 )
                 return HlsDownloadResult(HlsDownloadStatus.FAILED)
 
+            def checkpoint_encryption(segment: HlsMediaSegment) -> dict[str, str | int] | None:
+                key = segment.sample_aes_key
+                if key is None:
+                    return None
+                iv = key.iv or segment.sequence_number.to_bytes(16, "big")
+                return {
+                    "method": "SAMPLE-AES",
+                    "key_uri": canonical_media_url(key.uri),
+                    "iv": iv.hex(),
+                }
+
             checkpoint, segment_paths, resumed = _prepare_checkpoint(
                 output_mp4,
                 lesson_url=lesson_url,
                 requested_quality=requested_quality,
                 playlist_url=playlist_url,
                 segment_urls=segment_urls,
+                segment_encryption=[checkpoint_encryption(segment) for segment in segments],
             )
+            key_bytes: dict[str, bytes] = {}
+            if resumed < total:
+                key_host = parts.netloc
+                try:
+                    for segment in segments:
+                        key = segment.sample_aes_key
+                        if key is None or key.uri in key_bytes:
+                            continue
+                        key_host = urlsplit(key.uri).netloc
+                        async with session.get(key.uri) as response:
+                            response.raise_for_status()
+                            key_data = await response.read()
+                        if len(key_data) != 16:
+                            raise HlsKeyError("сервер ключа вернул не 16 байт")
+                        key_bytes[key.uri] = key_data
+                except HlsKeyError as error:
+                    emit(
+                        event(
+                            DownloadEventType.ERROR,
+                            f"Некорректный ключ SAMPLE-AES: {error}",
+                            stage="playlist",
+                            level="error",
+                            error_code="HLS_KEY_INVALID",
+                            source_host=key_host,
+                        )
+                    )
+                    return HlsDownloadResult(HlsDownloadStatus.FAILED)
+                except (TimeoutError, aiohttp.ClientError, OSError) as error:
+                    error_code, summary = _download_error_details(error)
+                    emit(
+                        event(
+                            DownloadEventType.ERROR,
+                            f"{summary} при получении ключа SAMPLE-AES",
+                            stage="playlist",
+                            level="error",
+                            error_code=f"HLS_KEY_{error_code}",
+                            source_host=key_host,
+                        )
+                    )
+                    return HlsDownloadResult(HlsDownloadStatus.FAILED)
             completed = resumed
             emit(
                 event(
@@ -406,8 +675,9 @@ class HlsDownloader:
             transferred_bytes = 0
             segment_failures: list[tuple[int, str, str, str]] = []
 
-            async def download_segment(index: int, url: str) -> bool:
+            async def download_segment(index: int, segment: HlsMediaSegment) -> bool:
                 nonlocal completed, last_progress_report, last_speed_report, transferred_bytes
+                url = segment.url
                 path = segment_paths[index]
                 if path.is_file() and path.stat().st_size > 0:
                     return True
@@ -422,6 +692,10 @@ class HlsDownloader:
                                 content = await response.read()
                             if not content:
                                 raise OSError("empty HLS segment")
+                            if segment.sample_aes_key is not None:
+                                key = segment.sample_aes_key
+                                iv = key.iv or segment.sequence_number.to_bytes(16, "big")
+                                content = decrypt_sample_aes_ts(content, key_bytes[key.uri], iv)
                             temporary.write_bytes(content)
                             os.replace(temporary, path)
                             completed += 1
@@ -451,6 +725,17 @@ class HlsDownloader:
                                     )
                                 )
                             return True
+                        except SampleAesError:
+                            temporary.unlink(missing_ok=True)
+                            segment_failures.append(
+                                (
+                                    index,
+                                    "SAMPLE_AES_DECRYPT_FAILED",
+                                    "Не удалось расшифровать SAMPLE-AES сегмент",
+                                    urlsplit(url).netloc,
+                                )
+                            )
+                            return False
                         except (TimeoutError, aiohttp.ClientError, OSError) as error:
                             temporary.unlink(missing_ok=True)
                             if attempt == 2:
@@ -463,7 +748,7 @@ class HlsDownloader:
                 return False
 
             results = await asyncio.gather(
-                *(download_segment(index, url) for index, url in enumerate(segment_urls))
+                *(download_segment(index, segment) for index, segment in enumerate(segments))
             )
             if is_cancelled and is_cancelled():
                 return HlsDownloadResult(
@@ -494,9 +779,7 @@ class HlsDownloader:
 
             temporary_output = checkpoint / "output.part.mp4"
             concat_list = checkpoint / "segments.ffconcat"
-            emit(event(DownloadEventType.LOG, "Собираю видеофайл…", stage="assemble"))
             _write_concat_list(concat_list, segment_paths)
-            emit(event(DownloadEventType.LOG, "Упаковываю MP4 через FFmpeg…", stage="ffmpeg"))
             success, error_message = await self._muxer.mux_concat(
                 concat_list,
                 temporary_output,
@@ -509,19 +792,11 @@ class HlsDownloader:
                     total_segments=total,
                 )
             if not success:
-                emit(
-                    event(
-                        DownloadEventType.LOG,
-                        "Оптимизированная сборка недоступна; собираю видео стандартным способом…",
-                        stage="assemble",
-                        level="warning",
-                    )
-                )
                 transport_stream = checkpoint / "video.ts"
                 temporary_transport = checkpoint / "video.ts.tmp"
                 with temporary_transport.open("wb") as destination:
-                    for segment in segment_paths:
-                        with segment.open("rb") as source:
+                    for segment_path in segment_paths:
+                        with segment_path.open("rb") as source:
                             shutil.copyfileobj(source, destination, length=1024 * 1024)
                 os.replace(temporary_transport, transport_stream)
                 if is_cancelled and is_cancelled():
@@ -530,7 +805,6 @@ class HlsDownloader:
                         resumed_segments=resumed,
                         total_segments=total,
                     )
-                emit(event(DownloadEventType.LOG, "Упаковываю MP4 через FFmpeg…", stage="ffmpeg"))
                 success, error_message = await self._muxer.mux(
                     transport_stream,
                     temporary_output,
@@ -558,7 +832,6 @@ class HlsDownloader:
                     total_segments=total,
                 )
             os.replace(temporary_output, output_mp4)
-            emit(event(DownloadEventType.LOG, "Проверяю готовый файл…", stage="verify"))
             fallback = (
                 f"{extract_quality(playlist_url)}p"
                 if extract_quality(playlist_url)

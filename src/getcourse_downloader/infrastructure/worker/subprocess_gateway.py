@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import json
 import os
@@ -131,6 +132,7 @@ class SubprocessDownloadGateway:
         self._process: subprocess.Popen[str] | None = None
         self._job: _WindowsProcessJob | None = None
         self._command_file: Path | None = None
+        self._cancel_requested = False
         self._lock = threading.Lock()
         self._done = threading.Event()
         self._done.set()
@@ -152,6 +154,7 @@ class SubprocessDownloadGateway:
         event_file: Path | None = None
         command_file: Path | None = None
         job: _WindowsProcessJob | None = None
+        process: subprocess.Popen[str] | None = None
         summary: DownloadSummary | None = None
         failed_titles: list[str] = []
         outcomes: dict[str, DownloadEventType] = {}
@@ -201,13 +204,15 @@ class SubprocessDownloadGateway:
                 self._process = process
                 self._job = job
                 self._command_file = command_file
+                if self._cancel_requested:
+                    self._write_command("cancel")
 
-            def consume(line: str) -> None:
+            def consume(line: bytes) -> None:
                 nonlocal active_lesson_url, last_activity_at, summary
                 nonlocal waiting_for_authentication
                 try:
-                    event = DownloadEvent.from_json(line)
-                except InvalidDataError:
+                    event = DownloadEvent.from_json(line.decode("utf-8"))
+                except (InvalidDataError, UnicodeDecodeError):
                     return
                 last_activity_at = time.monotonic()
                 if event.type is DownloadEventType.AUTH_REQUIRED:
@@ -242,18 +247,20 @@ class SubprocessDownloadGateway:
                         cancelled=event.cancelled or 0,
                     )
 
-            with event_file.open("r", encoding="utf-8") as stream:
+            with event_file.open("rb") as events_stream:
+                pending = b""
                 while True:
-                    raw_line = stream.readline()
+                    raw_line = events_stream.readline()
                     if raw_line:
-                        line = raw_line.strip()
-                        if line:
-                            consume(line)
+                        pending += raw_line
+                        if pending.endswith(b"\n"):
+                            if pending.strip():
+                                consume(pending)
+                            pending = b""
                         continue
                     if process.poll() is not None:
-                        for remaining in stream:
-                            line = remaining.strip()
-                            if line:
+                        for line in (pending + events_stream.read()).splitlines():
+                            if line.strip():
                                 consume(line)
                         break
                     if (
@@ -280,19 +287,20 @@ class SubprocessDownloadGateway:
                 )
             return summary
         finally:
+            if process is not None and process.poll() is None:
+                self._terminate_process(process, job)
+            if job is not None:
+                job.close()
+            for path in (request_file, event_file, command_file):
+                if path is not None:
+                    with contextlib.suppress(OSError):
+                        path.unlink(missing_ok=True)
             with self._lock:
                 self._process = None
                 self._job = None
                 self._command_file = None
+                self._cancel_requested = False
                 self._done.set()
-            if job is not None:
-                job.close()
-            if request_file:
-                request_file.unlink(missing_ok=True)
-            if event_file:
-                event_file.unlink(missing_ok=True)
-            if command_file:
-                command_file.unlink(missing_ok=True)
 
     def _stalled_summary(
         self,
@@ -384,16 +392,22 @@ class SubprocessDownloadGateway:
 
     def _send_command(self, command: str) -> None:
         with self._lock:
-            path = self._command_file
-            process = self._process
-            if path is None or process is None or process.poll() is not None:
-                return
-            try:
-                with path.open("a", encoding="utf-8") as stream:
-                    stream.write(json.dumps({"command": command}) + "\n")
-                    stream.flush()
-            except OSError:
-                return
+            if command == "cancel":
+                self._cancel_requested = True
+            self._write_command(command)
+
+    def _write_command(self, command: str) -> None:
+        """Write a command while the caller holds the lifecycle lock."""
+        path = self._command_file
+        process = self._process
+        if path is None or process is None or process.poll() is not None:
+            return
+        try:
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"command": command}) + "\n")
+                stream.flush()
+        except OSError:
+            return
 
     def continue_authentication(self) -> None:
         self._send_command("continue_authentication")
@@ -402,6 +416,8 @@ class SubprocessDownloadGateway:
         self._send_command("cancel")
 
     def shutdown(self, timeout: float = 6.0) -> None:
+        if self._done.is_set():
+            return
         self.cancel()
         if self._done.wait(timeout):
             return
@@ -433,3 +449,4 @@ class SubprocessDownloadGateway:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
             process.kill()
+            process.wait(timeout=2)

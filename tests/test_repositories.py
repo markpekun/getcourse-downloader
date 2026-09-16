@@ -65,3 +65,21 @@ def test_settings_repository_invalid_value_uses_default(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text('{"save_path": 123}', encoding="utf-8")
     assert JsonSettingsRepository(path).load() == Settings()
+
+
+def test_course_repository_invalid_utf8_is_reported_as_corrupt_data(tmp_path):
+    path = tmp_path / "courses.json"
+    path.write_bytes(b"\xff\xfe\x00")
+    repository = JsonCourseRepository(path)
+
+    assert repository.has_courses() is False
+    with pytest.raises(InvalidDataError):
+        repository.load()
+
+
+def test_settings_repository_invalid_utf8_is_reported_as_corrupt_data(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_bytes(b"\xff\xfe\x00")
+
+    with pytest.raises(InvalidDataError):
+        JsonSettingsRepository(path).load()

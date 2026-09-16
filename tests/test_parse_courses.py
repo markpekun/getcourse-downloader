@@ -530,3 +530,54 @@ def test_regex_fallback_is_not_used_on_non_landing_page():
 
     assert courses == []
     assert browser.visited_urls == []
+
+
+def test_custom_module_with_background_style_is_not_treated_as_parent_navigation():
+    root_url = "https://school.example/teach/control/stream/view/id/100"
+    module_url = "https://school.example/teach/control/stream/view/id/200"
+    pages = {
+        root_url: {
+            "title": "Course",
+            "content": (
+                '<a style="background-color: white" '
+                'href="/teach/control/stream/view/id/200">Module</a>'
+            ),
+        },
+        module_url: {"title": "Module", "lessons": [_lesson_html(201, "Lesson")]},
+    }
+    browser = _FakeBrowser(pages)
+    discoverer = GetCourseDiscoverer(browser_factory=None)  # type: ignore[arg-type]
+
+    courses = asyncio.run(
+        discoverer._parse_page(  # type: ignore[arg-type]
+            browser, browser.landing_page(root_url), root_url
+        )
+    )
+
+    assert [child.url for child in courses[0].children] == [module_url]
+    assert courses[0].lesson_count == 1
+
+
+def test_custom_module_after_landing_breadcrumb_is_still_discovered():
+    root_url = "https://school.example/teach/control/stream/view/id/100"
+    module_url = "https://school.example/teach/control/stream/view/id/200"
+    pages = {
+        root_url: {
+            "title": "Course",
+            "content": (
+                '<div class="breadcrumbs"><a href="/teach/control/stream/index">All</a></div>'
+                '<a href="/teach/control/stream/view/id/200">Module</a>'
+            ),
+        },
+        module_url: {"title": "Module", "lessons": [_lesson_html(201, "Lesson")]},
+    }
+    browser = _FakeBrowser(pages)
+    discoverer = GetCourseDiscoverer(browser_factory=None)  # type: ignore[arg-type]
+
+    courses = asyncio.run(
+        discoverer._parse_page(  # type: ignore[arg-type]
+            browser, browser.landing_page(root_url), root_url
+        )
+    )
+
+    assert [child.url for child in courses[0].children] == [module_url]

@@ -9,12 +9,24 @@ from urllib.parse import urlsplit, urlunsplit
 
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 
-_URL_PATTERN = re.compile(r"https?://[^\s\]\[\"']+", re.IGNORECASE)
+_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
 def _without_query(value: str) -> str:
-    parts = urlsplit(value)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return "<некорректный URL>"
+    authority = parts.netloc.rsplit("@", maxsplit=1)[-1]
+    return urlunsplit((parts.scheme, authority, parts.path, "", ""))
+
+
+def _source_host(value: str) -> str:
+    try:
+        parts = urlsplit(value if "://" in value else f"//{value}")
+    except ValueError:
+        return ""
+    return parts.netloc.rsplit("@", maxsplit=1)[-1]
 
 
 def _sanitize_text(value: str) -> str:
@@ -92,7 +104,7 @@ class DownloadDiagnostics:
         return target
 
     def _lesson_report(self, event: DownloadEvent) -> dict[str, object]:
-        source_host = event.source_host or urlsplit(event.lesson_url).netloc
+        source_host = _source_host(event.source_host or event.lesson_url)
         return {
             "app_version": self._app_version,
             "error_code": event.error_code or self._default_error_code(event),

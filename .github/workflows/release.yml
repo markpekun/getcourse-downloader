@@ -59,7 +59,9 @@ jobs:
         shell: pwsh
         run: |
           $Version = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}".TrimStart("v") } else { "0.0.0" }
-          $Parts = (($Version -split '\.') + @("0", "0", "0", "0"))[0..3]
+          $NumericVersion = $Version -replace "-.*$", ""
+          if ($NumericVersion -notmatch '^\d+(\.\d+){0,3}$') { throw "Invalid release version: $Version" }
+          $Parts = (($NumericVersion -split '\.') + @("0", "0", "0", "0"))[0..3]
           uv run --no-sync flet pack main.py -y -D -n GetCourseVideoDownloader `
             --product-name "GetCourse Video Downloader" `
             --file-description "Загрузка видео с GetCourse" `
@@ -127,6 +129,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+          body_path: docs/RELEASE_NOTES_v3.2.0-beta.1.md
           files: |
             dist/GetCourseVideoDownloader-win-x64.zip
             dist/GetCourseVideoDownloader-win-x64.zip.sha256
