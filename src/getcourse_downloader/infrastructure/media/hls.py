@@ -171,6 +171,16 @@ def _write_json_atomic(path: Path, payload: object) -> None:
     os.replace(temporary, path)
 
 
+def _write_concat_list(path: Path, segment_paths: list[Path]) -> None:
+    """Write an FFmpeg concat-demuxer list without exposing it outside the checkpoint."""
+
+    lines = ["ffconcat version 1.0"]
+    for segment in segment_paths:
+        value = segment.resolve().as_posix().replace("'", r"'\\''")
+        lines.append(f"file '{value}'")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _prepare_checkpoint(
     output_mp4: Path,
     *,
@@ -482,28 +492,50 @@ class HlsDownloader:
                     total_segments=total,
                 )
 
-            transport_stream = checkpoint / "video.ts"
-            temporary_transport = checkpoint / "video.ts.tmp"
-            with temporary_transport.open("wb") as destination:
-                for segment in segment_paths:
-                    with segment.open("rb") as source:
-                        shutil.copyfileobj(source, destination, length=1024 * 1024)
-            os.replace(temporary_transport, transport_stream)
-
+            temporary_output = checkpoint / "output.part.mp4"
+            concat_list = checkpoint / "segments.ffconcat"
+            emit(event(DownloadEventType.LOG, "Собираю видеофайл…", stage="assemble"))
+            _write_concat_list(concat_list, segment_paths)
+            emit(event(DownloadEventType.LOG, "Упаковываю MP4 через FFmpeg…", stage="ffmpeg"))
+            success, error_message = await self._muxer.mux_concat(
+                concat_list,
+                temporary_output,
+                is_cancelled=is_cancelled,
+            )
             if is_cancelled and is_cancelled():
                 return HlsDownloadResult(
                     HlsDownloadStatus.CANCELLED,
                     resumed_segments=resumed,
                     total_segments=total,
                 )
-
-            temporary_output = checkpoint / "output.part.mp4"
-            emit(event(DownloadEventType.LOG, "Собираю MP4 через FFmpeg", stage="ffmpeg"))
-            success, error_message = await self._muxer.mux(
-                transport_stream,
-                temporary_output,
-                is_cancelled=is_cancelled,
-            )
+            if not success:
+                emit(
+                    event(
+                        DownloadEventType.LOG,
+                        "Оптимизированная сборка недоступна; собираю видео стандартным способом…",
+                        stage="assemble",
+                        level="warning",
+                    )
+                )
+                transport_stream = checkpoint / "video.ts"
+                temporary_transport = checkpoint / "video.ts.tmp"
+                with temporary_transport.open("wb") as destination:
+                    for segment in segment_paths:
+                        with segment.open("rb") as source:
+                            shutil.copyfileobj(source, destination, length=1024 * 1024)
+                os.replace(temporary_transport, transport_stream)
+                if is_cancelled and is_cancelled():
+                    return HlsDownloadResult(
+                        HlsDownloadStatus.CANCELLED,
+                        resumed_segments=resumed,
+                        total_segments=total,
+                    )
+                emit(event(DownloadEventType.LOG, "Упаковываю MP4 через FFmpeg…", stage="ffmpeg"))
+                success, error_message = await self._muxer.mux(
+                    transport_stream,
+                    temporary_output,
+                    is_cancelled=is_cancelled,
+                )
             if is_cancelled and is_cancelled():
                 return HlsDownloadResult(
                     HlsDownloadStatus.CANCELLED,
@@ -526,6 +558,7 @@ class HlsDownloader:
                     total_segments=total,
                 )
             os.replace(temporary_output, output_mp4)
+            emit(event(DownloadEventType.LOG, "Проверяю готовый файл…", stage="verify"))
             fallback = (
                 f"{extract_quality(playlist_url)}p"
                 if extract_quality(playlist_url)

@@ -55,8 +55,30 @@ class _Session:
 
 
 class _Muxer:
-    def __init__(self, *, succeeds: bool = True):
+    def __init__(self, *, succeeds: bool = True, concat_succeeds: bool | None = None):
         self.succeeds = succeeds
+        self.concat_succeeds = succeeds if concat_succeeds is None else concat_succeeds
+        self.concat_sources: list[Path] = []
+        self.mux_sources: list[Path] = []
+
+    async def mux_concat(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        is_cancelled=None,
+    ) -> tuple[bool, str]:
+        del is_cancelled
+        self.concat_sources.append(source)
+        if not self.concat_succeeds:
+            return False, "concat boom"
+        segments = [
+            Path(line.removeprefix("file '").removesuffix("'"))
+            for line in source.read_text(encoding="utf-8").splitlines()
+            if line.startswith("file '")
+        ]
+        destination.write_bytes(b"".join(segment.read_bytes() for segment in segments))
+        return True, ""
 
     async def mux(
         self,
@@ -66,6 +88,7 @@ class _Muxer:
         is_cancelled=None,
     ) -> tuple[bool, str]:
         del is_cancelled
+        self.mux_sources.append(source)
         if not self.succeeds:
             return False, "boom"
         destination.write_bytes(source.read_bytes())
@@ -200,6 +223,48 @@ def test_failed_mux_preserves_checkpoint_and_success_cleans_it(tmp_path):
     assert succeeded.status is HlsDownloadStatus.DOWNLOADED
     assert not checkpoint.exists()
     assert output.is_file()
+
+
+def test_fast_concat_assembles_mp4_without_intermediate_transport_stream(tmp_path):
+    stem = tmp_path / "Lesson"
+    playlist = "#EXTM3U\n#EXTINF:1,\na.ts\n#EXTINF:1,\nb.ts\n"
+    responses = {
+        "https://cdn/master.m3u8": _Response(text=playlist),
+        "https://cdn/a.ts": _Response(content=b"A"),
+        "https://cdn/b.ts": _Response(content=b"B"),
+    }
+    muxer = _Muxer()
+
+    result, events = _run(_downloader(responses, [], muxer=muxer), "https://cdn/master.m3u8", stem)
+
+    assert result.status is HlsDownloadStatus.DOWNLOADED
+    assert (tmp_path / "Lesson.mp4").read_bytes() == b"AB"
+    assert len(muxer.concat_sources) == 1
+    assert muxer.mux_sources == []
+    assert [event.message for event in events if event.type is DownloadEventType.LOG] == [
+        "Собираю видеофайл…",
+        "Упаковываю MP4 через FFmpeg…",
+        "Проверяю готовый файл…",
+    ]
+
+
+def test_failed_fast_concat_falls_back_to_transport_stream_and_cleans_checkpoint(tmp_path):
+    stem = tmp_path / "Lesson"
+    playlist = "#EXTM3U\n#EXTINF:1,\nseg.ts\n"
+    responses = {
+        "https://cdn/master.m3u8": _Response(text=playlist),
+        "https://cdn/seg.ts": _Response(content=b"segment"),
+    }
+    muxer = _Muxer(concat_succeeds=False)
+
+    result, events = _run(_downloader(responses, [], muxer=muxer), "https://cdn/master.m3u8", stem)
+
+    assert result.status is HlsDownloadStatus.DOWNLOADED
+    assert (tmp_path / "Lesson.mp4").read_bytes() == b"segment"
+    assert len(muxer.concat_sources) == 1
+    assert len(muxer.mux_sources) == 1
+    assert any("стандартным способом" in event.message for event in events)
+    assert not _checkpoint_path(tmp_path / "Lesson.mp4").exists()
 
 
 def test_segment_network_failure_preserves_downloaded_checkpoint(tmp_path):

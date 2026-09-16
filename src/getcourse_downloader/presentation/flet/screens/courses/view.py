@@ -1353,8 +1353,24 @@ class CoursesScreen:
             video_suffix = ""
             if event.video_index and (event.video_total or 0) > 1:
                 video_suffix = f" · видео {event.video_index}/{event.video_total}"
-            row.status_text.value = f"{current}/{total}{video_suffix}" if total else "Загрузка"
+            row.status_text.value = (
+                f"Скачивание сегментов: {current}/{total}{video_suffix}" if total else "Загрузка"
+            )
             row.status_text.color = Color.ACCENT_LIGHT
+        elif event.type is DownloadEventType.LOG and event.stage in {
+            "assemble",
+            "ffmpeg",
+            "verify",
+        }:
+            row.status_holder.content = ft.Icon(
+                ft.Icons.DOWNLOADING_ROUNDED,
+                size=18,
+                color=Color.ACCENT_LIGHT,
+            )
+            row.status_text.value = event.message
+            row.status_text.color = Color.ACCENT_LIGHT
+            row.progress.visible = True
+            row.progress_text.visible = True
         elif event.type is DownloadEventType.LESSON_COMPLETED:
             row.status_holder.content = ft.Icon(
                 ft.Icons.CHECK_CIRCLE_ROUNDED,

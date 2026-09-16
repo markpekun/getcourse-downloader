@@ -38,17 +38,46 @@ class FfmpegMuxer:
         *,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[bool, str]:
+        return await self._run_mux(
+            ("-y", "-i", str(source), "-c", "copy", "-bsf:a", "aac_adtstoasc", str(destination)),
+            is_cancelled=is_cancelled,
+        )
+
+    async def mux_concat(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[bool, str]:
+        return await self._run_mux(
+            (
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(source),
+                "-c",
+                "copy",
+                "-bsf:a",
+                "aac_adtstoasc",
+                str(destination),
+            ),
+            is_cancelled=is_cancelled,
+        )
+
+    async def _run_mux(
+        self,
+        arguments: tuple[str, ...],
+        *,
+        is_cancelled: Callable[[], bool] | None,
+    ) -> tuple[bool, str]:
         flags = getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         process = await asyncio.create_subprocess_exec(
             self.executable(),
-            "-y",
-            "-i",
-            str(source),
-            "-c",
-            "copy",
-            "-bsf:a",
-            "aac_adtstoasc",
-            str(destination),
+            *arguments,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
             creationflags=flags,
