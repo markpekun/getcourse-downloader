@@ -413,6 +413,7 @@ def test_identity_sample_aes_master_passes_to_hls_downloader(monkeypatch, tmp_pa
 
     assert result.status.value == "downloaded"
     assert hls.calls[0][0] == "https://cdn.example/1080.m3u8?sign=abc"
+    assert hls.calls[0][1]["session_key"].uri == "https://license.example/key"
     assert not any(event.error_code == "ENCRYPTED_PLAYLIST_UNSUPPORTED" for event in events)
 
 
@@ -527,7 +528,7 @@ def test_bandwidth_only_master_selects_best_and_suppresses_captured_variants():
     ]
 
 
-def test_output_stems_preserve_hierarchy_and_hash_all_collisions(tmp_path):
+def test_output_stems_preserve_hierarchy_and_hash_only_real_collisions(tmp_path):
     lessons = (
         SelectedLesson(("Course", "Module"), Lesson("A:B", "https://school/lesson/1")),
         SelectedLesson(("Course", "Module"), Lesson("A?B", "https://school/lesson/2")),
@@ -541,7 +542,21 @@ def test_output_stems_preserve_hierarchy_and_hash_all_collisions(tmp_path):
     assert stems[1].name.startswith("A_B~")
     assert stems[0] != stems[1]
     assert stems[2].parent == tmp_path / "Course" / "Other"
-    assert stems[2].name.startswith("A_B~")
+    assert stems[2].name == "A_B"
+
+
+def test_unique_output_stem_keeps_readable_lesson_title(tmp_path):
+    lesson = SelectedLesson(
+        ("Course", "Module"),
+        Lesson("Лекция №1 Жена Мечты", "https://school/lesson/1"),
+    )
+
+    stem = PlaywrightDownloadGateway._output_stems(
+        DownloadRequest((lesson,), VideoQuality.AUTO, tmp_path)
+    )[0]
+
+    assert stem.name == "Лекция №1 Жена Мечты"
+    assert "~" not in stem.name
 
 
 def test_output_stems_disambiguate_sanitized_folder_collisions_stably(tmp_path):
@@ -575,6 +590,10 @@ def test_existing_output_is_detected_before_opening_lesson(tmp_path):
     (stem.parent / "Lesson.mp4").write_bytes(b"")
     assert not PlaywrightDownloadGateway._output_exists(stem)
 
+    (stem.parent / "Lesson_720.mp4").write_bytes(b"done")
+    assert PlaywrightDownloadGateway._output_exists(stem)
+    (stem.parent / "Lesson_720.mp4").unlink()
+
     stem.mkdir()
     (stem / "video_1.mp4").write_bytes(b"one")
     (stem / "video_2.mp4").write_bytes(b"two")
@@ -588,7 +607,7 @@ def test_path_too_long_is_rejected(tmp_path):
         safe_lesson_output_stem(Path("C:/") / ("x" * 190), ("Course",), "Lesson")
 
 
-def test_output_paths_do_not_change_with_selection_or_alias_other_lessons(tmp_path):
+def test_output_paths_disambiguate_only_when_selected_paths_actually_alias(tmp_path):
     first = SelectedLesson(("A:B",), Lesson("Same title", "https://school/lesson/1"))
     second = SelectedLesson(("A?B",), Lesson("Same title", "https://school/lesson/2"))
     together = PlaywrightDownloadGateway._output_stems(
@@ -601,12 +620,12 @@ def test_output_paths_do_not_change_with_selection_or_alias_other_lessons(tmp_pa
         for item in (first, second)
     ]
 
-    assert together == individually
-    assert individually[0] != individually[1]
-    assert individually[0].parent != individually[1].parent
+    assert together != individually
+    assert together[0].parent != together[1].parent
+    assert individually[0] == individually[1]
 
 
-def test_same_title_lessons_downloaded_separately_have_distinct_output_paths(tmp_path):
+def test_same_title_lessons_need_catalog_to_detect_separate_run_collision(tmp_path):
     outputs = [
         PlaywrightDownloadGateway._output_stems(
             DownloadRequest(
@@ -618,7 +637,7 @@ def test_same_title_lessons_downloaded_separately_have_distinct_output_paths(tmp
         for number in (1, 2)
     ]
 
-    assert outputs[0] != outputs[1]
+    assert outputs[0] == outputs[1] == tmp_path / "Course" / "Lesson"
 
 
 def test_lesson_navigation_failure_is_reported_and_next_lesson_still_runs(monkeypatch, tmp_path):

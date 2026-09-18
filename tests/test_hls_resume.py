@@ -13,6 +13,9 @@ from getcourse_downloader.infrastructure.media.hls import (
     _checkpoint_path,
     _prepare_checkpoint,
     canonical_media_url,
+    parse_key_tag,
+    parse_media_resources,
+    parse_session_key,
 )
 
 
@@ -39,6 +42,60 @@ class _Response:
         return self._content
 
 
+def test_parse_key_tag_accepts_kinescope_identity_key():
+    tag = (
+        "#EXT-X-KEY:METHOD=SAMPLE-AES,"
+        'URI="https://license.kinescope.io/v2/vod/id/acquire/sample-aes/key",'
+        'KEYFORMAT="identity",IV=0x00112233445566778899aabbccddeeff'
+    )
+
+    key = parse_key_tag(tag, "https://cdn.example/media.m3u8")
+
+    assert key is not None
+    assert key.method == "SAMPLE-AES"
+    assert key.key_format == "identity"
+    assert key.uri == "https://license.kinescope.io/v2/vod/id/acquire/sample-aes/key"
+
+
+def test_parse_session_key_uses_master_url_for_relative_uri():
+    key = parse_session_key(
+        '#EXTM3U\n#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI="../key"\n',
+        "https://cdn.example/master/index.m3u8",
+    )
+
+    assert key is not None
+    assert key.uri == "https://cdn.example/key"
+
+
+def test_parse_media_resources_orders_map_and_explicit_and_implicit_ranges():
+    playlist = (
+        "#EXTM3U\n"
+        '#EXT-X-MAP:URI="https://cdn.example/1080p.mp4",BYTERANGE="901@0"\n'
+        "#EXT-X-BYTERANGE:100@901\nhttps://cdn.example/1080p.mp4?kcd=token\n"
+        "#EXT-X-BYTERANGE:200\nhttps://cdn.example/1080p.mp4?kcd=token\n"
+    )
+
+    resources = parse_media_resources(playlist, "https://cdn.example/media.m3u8")
+
+    assert [
+        (resource.role, resource.byte_range.offset, resource.byte_range.length)
+        for resource in resources
+        if resource.byte_range is not None
+    ] == [
+        ("init", 0, 901),
+        ("media", 901, 100),
+        ("media", 1001, 200),
+    ]
+    assert resources[0].url == "https://cdn.example/1080p.mp4?kcd=token"
+
+
+def test_parse_media_resources_rejects_implicit_first_range():
+    playlist = "#EXTM3U\n#EXT-X-BYTERANGE:200\nhttps://cdn.example/1080p.mp4?kcd=token\n"
+
+    with pytest.raises(ValueError, match="offset"):
+        parse_media_resources(playlist, "https://cdn.example/media.m3u8")
+
+
 class _Session:
     def __init__(self, responses: dict[str, _Response], requests: list[str], **_):
         self._responses = responses
@@ -50,17 +107,30 @@ class _Session:
     async def __aexit__(self, *_):
         return None
 
-    def get(self, url: str) -> _Response:
+    def get(self, url: str, **_) -> _Response:
         self._requests.append(url)
         return self._responses[url]
 
 
 class _Muxer:
-    def __init__(self, *, succeeds: bool = True, concat_succeeds: bool | None = None):
+    def __init__(
+        self,
+        *,
+        succeeds: bool = True,
+        concat_succeeds: bool | None = None,
+        decrypt_succeeds: bool = True,
+        decrypt_file_succeeds: bool = True,
+    ):
         self.succeeds = succeeds
         self.concat_succeeds = succeeds if concat_succeeds is None else concat_succeeds
+        self.decrypt_succeeds = decrypt_succeeds
+        self.decrypt_file_succeeds = decrypt_file_succeeds
         self.concat_sources: list[Path] = []
         self.mux_sources: list[Path] = []
+        self.decrypt_sources: list[Path] = []
+        self.decrypt_source_bytes: list[bytes] = []
+        self.decryption_keys: list[str] = []
+        self.decrypt_file_sources: list[bytes] = []
 
     async def mux_concat(
         self,
@@ -95,6 +165,38 @@ class _Muxer:
         destination.write_bytes(source.read_bytes())
         return True, ""
 
+    async def decrypt_fragments(
+        self,
+        sources,
+        destination: Path,
+        *,
+        decryption_key_hex: str,
+        is_cancelled=None,
+    ) -> tuple[bool, str]:
+        del is_cancelled
+        self.decrypt_sources = list(sources)
+        self.decrypt_source_bytes = [path.read_bytes() for path in sources]
+        self.decryption_keys.append(decryption_key_hex)
+        if not self.decrypt_succeeds:
+            return False, "Invalid data found when processing input"
+        destination.write_bytes(b"".join(path.read_bytes() for path in sources))
+        return True, ""
+
+    async def decrypt_file(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        decryption_key_hex: str,
+        is_cancelled=None,
+    ) -> tuple[bool, str]:
+        del decryption_key_hex, is_cancelled
+        self.decrypt_file_sources.append(source.read_bytes())
+        if not self.decrypt_file_succeeds:
+            return False, "decrypt failed"
+        destination.write_bytes(source.read_bytes())
+        return True, ""
+
     async def probe_height(self, _media: Path) -> int | None:
         return 720
 
@@ -122,64 +224,166 @@ def _run(downloader: HlsDownloader, playlist_url: str, stem: Path):
     return result, events
 
 
-def test_sample_aes_identity_decrypts_before_checkpoint_and_reuses_key(tmp_path):
-    from sample_aes_fixtures import IV, KEY, PLAIN, adts, encrypt_aac, transport_stream
-
-    playlist_url = "https://cdn.example/media/list.m3u8"
+def test_kinescope_identity_key_is_requested_once_and_passed_to_ffmpeg(tmp_path):
+    playlist_url = "https://cdn.example/media.m3u8"
+    key_url = "https://license.example/key"
+    signed_mp4 = "https://cdn.example/1080p.mp4?kcd=token"
     playlist = (
-        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:42\n"
-        '#EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="identity",URI="../key?k=a,b"\n'
-        "#EXTINF:1,\na.ts\n#EXTINF:1,\nb.ts\n"
-        f'#EXT-X-KEY:METHOD=SAMPLE-AES,URI="../other",IV=0x{IV.hex()}\n'
-        "#EXTINF:1,\nc.ts\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:1,\nd.ts\n"
+        "#EXTM3U\n"
+        '#EXT-X-MAP:URI="https://cdn.example/1080p.mp4",BYTERANGE="4@0"\n'
+        f'#EXT-X-KEY:METHOD=SAMPLE-AES,URI="{key_url}",KEYFORMAT="identity"\n'
+        f"#EXT-X-BYTERANGE:5@4\n{signed_mp4}\n"
     )
-    frame = adts(b"L" * 16 + PLAIN)
-    requests = []
+    requests: list[str] = []
+    muxer = _Muxer()
     responses = {
         playlist_url: _Response(text=playlist),
-        "https://cdn.example/key?k=a,b": _Response(content=KEY),
-        "https://cdn.example/other": _Response(content=KEY[::-1]),
-        "https://cdn.example/media/a.ts": _Response(
-            content=transport_stream(encrypt_aac(frame, KEY, (42).to_bytes(16, "big")))
-        ),
-        "https://cdn.example/media/b.ts": _Response(
-            content=transport_stream(encrypt_aac(frame, KEY, (43).to_bytes(16, "big")))
-        ),
-        "https://cdn.example/media/c.ts": _Response(
-            content=transport_stream(encrypt_aac(frame, KEY[::-1], IV))
-        ),
-        "https://cdn.example/media/d.ts": _Response(content=b"clear-segment"),
+        key_url: _Response(content=b"ml1C_JjWlcjeDEo="),
+        signed_mp4: _Response(content=b"initmedia"),
     }
-    options = {}
 
-    def session_factory(**kwargs):
-        options.update(kwargs)
-        return _Session(responses, requests)
-
-    downloader = HlsDownloader(_Muxer(succeeds=False), session_factory=session_factory)
-    result, events = _run(downloader, playlist_url, tmp_path / "Lesson")
-    assert result.status is HlsDownloadStatus.FAILED  # Keep checkpoint after mux failure.
-    assert events[-1].error_code == "FFMPEG_FAILED"
-    segments = _checkpoint_path(tmp_path / "Lesson.mp4") / "segments"
-    for index in range(3):
-        assert PLAIN in (segments / f"{index:06d}.bin").read_bytes()
-    assert (segments / "000003.bin").read_bytes() == b"clear-segment"
-    assert requests.count("https://cdn.example/key?k=a,b") == 1
-    assert options["headers"]["Referer"] == "https://school/lesson/1"
-    assert options["headers"]["Origin"] == "https://school"
-    # Completed checkpoint files are clear and may be resumed without key access.
-    requests.clear()
     result, _ = _run(
-        _downloader({playlist_url: responses[playlist_url]}, requests),
+        _downloader(responses, requests, muxer=muxer),
         playlist_url,
         tmp_path / "Lesson",
     )
+
     assert result.status is HlsDownloadStatus.DOWNLOADED
-    assert result.resumed_segments == 4
-    assert requests == [playlist_url]
+    assert result.output_path == tmp_path / "Lesson_720.mp4"
+    assert requests.count(key_url) == 1
+    assert muxer.decryption_keys == ["6d6c31435f4a6a576c636a6544456f3d"]
+    assert muxer.decrypt_source_bytes == [b"init", b"media"]
 
 
-@pytest.mark.parametrize("key", [b"", b"x" * 15, b"x" * 17, b"<html>key unavailable</html>"])
+def test_kinescope_key_http_403_reports_expired_access(tmp_path):
+    playlist_url = "https://cdn.example/media.m3u8"
+    key_url = "https://license.example/key"
+    playlist = f'#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI="{key_url}"\n#EXTINF:1,\nsegment.mp4\n'
+    forbidden = aiohttp.ClientResponseError(
+        request_info=None,
+        history=(),
+        status=403,
+        message="Forbidden",
+        headers=None,
+    )
+    responses = {
+        playlist_url: _Response(text=playlist),
+        key_url: _Response(error=forbidden),
+    }
+
+    result, events = _run(_downloader(responses, []), playlist_url, tmp_path / "Lesson")
+
+    assert result.status is HlsDownloadStatus.FAILED
+    assert events[-1].error_code == "HLS_KEY_HTTP_403"
+    assert events[-1].message == (
+        "Ссылка для получения ключа истекла. Перезапустите загрузку урока."
+    )
+
+
+def test_kinescope_stream_failure_uses_local_encrypted_file_without_redownload(tmp_path):
+    playlist_url = "https://cdn.example/media.m3u8"
+    key_url = "https://license.example/key"
+    signed_mp4 = "https://cdn.example/1080p.mp4?kcd=token"
+    playlist = (
+        "#EXTM3U\n"
+        '#EXT-X-MAP:URI="https://cdn.example/1080p.mp4",BYTERANGE="4@0"\n'
+        f'#EXT-X-KEY:METHOD=SAMPLE-AES,URI="{key_url}"\n'
+        f"#EXT-X-BYTERANGE:5@4\n{signed_mp4}\n"
+    )
+    requests: list[str] = []
+    muxer = _Muxer(decrypt_succeeds=False)
+    responses = {
+        playlist_url: _Response(text=playlist),
+        key_url: _Response(content=b"ml1C_JjWlcjeDEo="),
+        signed_mp4: _Response(content=b"initmedia"),
+    }
+
+    result, _ = _run(
+        _downloader(responses, requests, muxer=muxer),
+        playlist_url,
+        tmp_path / "Lesson",
+    )
+
+    assert result.status is HlsDownloadStatus.DOWNLOADED
+    assert muxer.decrypt_file_sources == [b"initmedia"]
+    assert requests.count(signed_mp4) == 2
+    assert not _checkpoint_path(tmp_path / "Lesson.mp4").exists()
+
+
+def test_kinescope_ranges_send_exact_inclusive_http_headers(tmp_path):
+    playlist_url = "https://cdn.example/media.m3u8"
+    key_url = "https://license.example/key"
+    signed_mp4 = "https://cdn.example/1080p.mp4?kcd=token"
+    playlist = (
+        "#EXTM3U\n"
+        '#EXT-X-MAP:URI="https://cdn.example/1080p.mp4",BYTERANGE="4@0"\n'
+        f'#EXT-X-KEY:METHOD=SAMPLE-AES,URI="{key_url}"\n'
+        f"#EXT-X-BYTERANGE:5@4\n{signed_mp4}\n"
+    )
+    requested_ranges: list[str | None] = []
+
+    class RangeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        def get(self, url, *, headers=None):
+            requested_ranges.append(headers.get("Range") if headers else None)
+            if url == playlist_url:
+                return _Response(text=playlist)
+            if url == key_url:
+                return _Response(content=b"ml1C_JjWlcjeDEo=")
+            ranges = {"bytes=0-3": b"init", "bytes=4-8": b"media"}
+            return _Response(content=ranges[headers["Range"]])
+
+    muxer = _Muxer()
+    downloader = HlsDownloader(
+        muxer,  # type: ignore[arg-type]
+        concurrency=1,
+        session_factory=lambda **_: RangeSession(),
+    )
+
+    result, _ = _run(downloader, playlist_url, tmp_path / "Lesson")
+
+    assert result.status is HlsDownloadStatus.DOWNLOADED
+    assert requested_ranges == [None, None, "bytes=0-3", "bytes=4-8"]
+    assert muxer.decrypt_source_bytes == [b"init", b"media"]
+
+
+def test_failed_kinescope_checkpoint_contains_no_key_or_signed_query(tmp_path):
+    playlist_url = "https://cdn.example/media.m3u8?expires=123"
+    key_url = "https://license.example/key?sign=secret"
+    signed_mp4 = "https://cdn.example/1080p.mp4?kcd=secret-token"
+    playlist = (
+        "#EXTM3U\n"
+        '#EXT-X-MAP:URI="https://cdn.example/1080p.mp4",BYTERANGE="4@0"\n'
+        f'#EXT-X-KEY:METHOD=SAMPLE-AES,URI="{key_url}"\n'
+        f"#EXT-X-BYTERANGE:5@4\n{signed_mp4}\n"
+    )
+    muxer = _Muxer(decrypt_succeeds=False, decrypt_file_succeeds=False)
+    responses = {
+        playlist_url: _Response(text=playlist),
+        key_url: _Response(content=b"ml1C_JjWlcjeDEo="),
+        signed_mp4: _Response(content=b"initmedia"),
+    }
+
+    result, _ = _run(_downloader(responses, [], muxer=muxer), playlist_url, tmp_path / "Lesson")
+
+    assert result.status is HlsDownloadStatus.FAILED
+    manifest = (_checkpoint_path(tmp_path / "Lesson.mp4") / "manifest.json").read_text(
+        encoding="utf-8"
+    )
+    assert "ml1C_JjWlcjeDEo=" not in manifest
+    assert "6d6c31435f4a6a576c636a6544456f3d" not in manifest
+    assert "secret" not in manifest
+
+
+@pytest.mark.parametrize(
+    "key",
+    [b"", b"x" * 15, b"x" * 17, b"\xff" * 16, b"<html>key unavailable</html>"],
+)
 def test_invalid_sample_aes_key_never_commits_segment(tmp_path, key):
     url = "https://cdn/list.m3u8"
     requests = []
@@ -195,15 +399,17 @@ def test_invalid_sample_aes_key_never_commits_segment(tmp_path, key):
 
 
 @pytest.mark.parametrize(
-    "tag",
+    ("tag", "expected_code"),
     [
-        'METHOD=SAMPLE-AES,URI="key",IV=0xnope',
-        'METHOD=SAMPLE-AES,URI="key",IV=0x100000000000000000000000000000000',
-        "METHOD=SAMPLE-AES",
-        'METHOD=SAMPLE-AES,URI="skd://key"',
+        ("METHOD=SAMPLE-AES", "HLS_KEY_INVALID"),
+        ('METHOD=SAMPLE-AES,URI="skd://key"', "HLS_KEY_INVALID"),
+        (
+            'METHOD=SAMPLE-AES,URI="key",KEYFORMAT="com.apple.streamingkeydelivery"',
+            "ENCRYPTED_PLAYLIST_UNSUPPORTED",
+        ),
     ],
 )
-def test_invalid_sample_aes_tag_fails_before_segment_download(tmp_path, tag):
+def test_invalid_sample_aes_tag_fails_before_segment_download(tmp_path, tag, expected_code):
     url = "https://cdn/list.m3u8"
     requests = []
     result, events = _run(
@@ -212,7 +418,7 @@ def test_invalid_sample_aes_tag_fails_before_segment_download(tmp_path, tag):
         tmp_path / "Lesson",
     )
     assert result.status is HlsDownloadStatus.FAILED
-    assert events[-1].error_code == "HLS_KEY_INVALID"
+    assert events[-1].error_code == expected_code
     assert requests == [url]
 
 
@@ -233,7 +439,8 @@ def test_existing_nonempty_mp4_is_skipped_but_zero_file_is_incomplete(tmp_path):
     }
     result, _ = _run(_downloader(responses, requests), "https://cdn/master.m3u8", stem)
     assert result.status is HlsDownloadStatus.DOWNLOADED
-    assert output.read_bytes() == b"segment"
+    assert output.read_bytes() == b""
+    assert (tmp_path / "Lesson_720.mp4").read_bytes() == b"segment"
 
 
 def test_resume_reuses_segments_when_only_query_tokens_change(tmp_path):
@@ -265,7 +472,7 @@ def test_resume_reuses_segments_when_only_query_tokens_change(tmp_path):
     assert result.resumed_segments == 1
     assert requests == ["https://cdn/master.m3u8?token=new", "https://cdn/b.ts?token=new"]
     assert events[0].current == 1
-    assert output.read_bytes() == b"AB"
+    assert (tmp_path / "Lesson_720.mp4").read_bytes() == b"AB"
     assert not checkpoint.exists()
 
 
@@ -293,7 +500,9 @@ def test_incompatible_segment_list_resets_only_checkpoint(tmp_path):
     assert not new_paths[0].exists()
     assert unrelated.read_text(encoding="utf-8") == "keep"
     manifest = json.loads((checkpoint / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["segments"] == ["https://cdn/new.ts"]
+    assert manifest["resources"] == [
+        {"role": "media", "url": "https://cdn/new.ts", "offset": None, "length": None}
+    ]
 
 
 def test_failed_mux_preserves_checkpoint_and_success_cleans_it(tmp_path):
@@ -317,7 +526,7 @@ def test_failed_mux_preserves_checkpoint_and_success_cleans_it(tmp_path):
     succeeded, _ = _run(_downloader(responses, []), "https://cdn/master.m3u8", stem)
     assert succeeded.status is HlsDownloadStatus.DOWNLOADED
     assert not checkpoint.exists()
-    assert output.is_file()
+    assert (tmp_path / "Lesson_720.mp4").is_file()
 
 
 def test_fast_concat_assembles_mp4_without_intermediate_transport_stream(tmp_path):
@@ -333,7 +542,7 @@ def test_fast_concat_assembles_mp4_without_intermediate_transport_stream(tmp_pat
     result, events = _run(_downloader(responses, [], muxer=muxer), "https://cdn/master.m3u8", stem)
 
     assert result.status is HlsDownloadStatus.DOWNLOADED
-    assert (tmp_path / "Lesson.mp4").read_bytes() == b"AB"
+    assert (tmp_path / "Lesson_720.mp4").read_bytes() == b"AB"
     assert len(muxer.concat_sources) == 1
     assert muxer.mux_sources == []
     assert [event for event in events if event.type is DownloadEventType.LOG] == []
@@ -351,7 +560,7 @@ def test_failed_fast_concat_falls_back_to_transport_stream_and_cleans_checkpoint
     result, events = _run(_downloader(responses, [], muxer=muxer), "https://cdn/master.m3u8", stem)
 
     assert result.status is HlsDownloadStatus.DOWNLOADED
-    assert (tmp_path / "Lesson.mp4").read_bytes() == b"segment"
+    assert (tmp_path / "Lesson_720.mp4").read_bytes() == b"segment"
     assert len(muxer.concat_sources) == 1
     assert len(muxer.mux_sources) == 1
     assert [event for event in events if event.type is DownloadEventType.LOG] == []
@@ -537,6 +746,9 @@ def test_cancel_preserves_segments_and_next_run_resumes(tmp_path):
 
 def test_canonical_media_url_ignores_query_and_fragment():
     assert canonical_media_url("HTTPS://CDN.Example/a.ts?token=1#x") == "https://cdn.example/a.ts"
+    assert canonical_media_url("https://cdn.example/a.mp4?kcd=rotating") == (
+        "https://cdn.example/a.mp4"
+    )
 
 
 def test_resume_does_not_reuse_segments_for_a_different_query_media_identity(tmp_path):
@@ -564,26 +776,6 @@ def test_resume_does_not_reuse_segments_for_a_different_query_media_identity(tmp
     manifest = (checkpoint / "manifest.json").read_text(encoding="utf-8")
     assert "second" not in manifest
     assert "token=" not in manifest
-
-
-@pytest.mark.parametrize(
-    "tag",
-    ['#EXT-X-MAP:URI="init.mp4"', "#EXT-X-BYTERANGE:1000@0"],
-)
-def test_unsupported_hls_structure_fails_before_requesting_media(tmp_path, tag):
-    playlist_url = "https://cdn/master.m3u8"
-    requests = []
-    responses = {
-        playlist_url: _Response(text=f"#EXTM3U\n{tag}\n#EXTINF:5,\nsegment.ts\n"),
-        "https://cdn/segment.ts": _Response(content=b"segment"),
-    }
-
-    result, events = _run(_downloader(responses, requests), playlist_url, tmp_path / "Lesson")
-
-    assert result.status is HlsDownloadStatus.FAILED
-    assert requests == [playlist_url]
-    assert events[-1].error_code == "HLS_STRUCTURE_UNSUPPORTED"
-    assert tag.split(":", 1)[0] in events[-1].message
 
 
 def test_average_speed_is_reported_every_three_seconds_and_on_completion(

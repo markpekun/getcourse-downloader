@@ -76,6 +76,25 @@ class JsonDownloadCatalog:
             media.append(DownloadedMedia(path, quality if isinstance(quality, str) else ""))
         return tuple(media)
 
+    def has_stem_conflict(self, lesson_url: str, output_stem: Path) -> bool:
+        payload = self._load()
+        records = payload["records"]
+        assert isinstance(records, dict)
+        expected = str(output_stem.resolve()).casefold()
+        for raw_record in records.values():
+            if not isinstance(raw_record, dict):
+                continue
+            recorded_stem = raw_record.get("output_stem")
+            recorded_url = raw_record.get("lesson_url")
+            if (
+                isinstance(recorded_stem, str)
+                and isinstance(recorded_url, str)
+                and recorded_stem.casefold() == expected
+                and recorded_url != lesson_url
+            ):
+                return True
+        return False
+
     def save(
         self,
         lesson_url: str,

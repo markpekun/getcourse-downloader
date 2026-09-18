@@ -41,3 +41,15 @@ def test_invalid_utf8_catalog_does_not_prevent_downloading_again(tmp_path):
     path.write_bytes(b"\xff\xfe\x00")
 
     assert JsonDownloadCatalog(path).find("https://school/lesson/1", tmp_path / "Lesson") == ()
+
+
+def test_catalog_detects_same_stem_owned_by_another_lesson(tmp_path):
+    catalog = JsonDownloadCatalog(tmp_path / "downloads.json")
+    stem = tmp_path / "target" / "Lesson"
+    media_path = stem.parent / "Lesson_720.mp4"
+    media_path.parent.mkdir(parents=True)
+    media_path.write_bytes(b"video")
+    catalog.save("https://school/lesson/1", stem, (DownloadedMedia(media_path, "720p"),))
+
+    assert not catalog.has_stem_conflict("https://school/lesson/1", stem)
+    assert catalog.has_stem_conflict("https://school/lesson/2", stem)

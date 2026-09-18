@@ -89,3 +89,29 @@ def collision_safe_component(value: str, stable_identity: str) -> str:
     target_length = max(12, len(value))
     prefix = value[: target_length - len(digest) - 1].rstrip(". ") or "item"
     return f"{prefix}~{digest}"
+
+
+def quality_suffixed_path(stem: Path, quality: str) -> Path:
+    """Return a readable MP4 path using a known actual/selected video height."""
+
+    match = re.fullmatch(r"(\d{3,4})p?", quality.strip(), flags=re.IGNORECASE)
+    suffix = f"_{match.group(1)}" if match else ""
+    return stem.with_name(f"{stem.name}{suffix}.mp4")
+
+
+def existing_output_path(stem: Path) -> Path | None:
+    """Find a legacy or quality-suffixed completed MP4 for one output stem."""
+
+    legacy = stem.with_name(f"{stem.name}.mp4")
+    try:
+        if legacy.is_file() and legacy.stat().st_size > 0:
+            return legacy
+        pattern = re.compile(rf"^{re.escape(stem.name)}_(\d{{3,4}})\.mp4$", re.IGNORECASE)
+        candidates = sorted(
+            path
+            for path in stem.parent.iterdir()
+            if path.is_file() and pattern.fullmatch(path.name) and path.stat().st_size > 0
+        )
+    except OSError:
+        return None
+    return candidates[0] if candidates else None

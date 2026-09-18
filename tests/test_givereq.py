@@ -7,7 +7,10 @@ from getcourse_downloader.infrastructure.media.hls import (
     select_quality_url,
     select_stream_playlist_url,
 )
-from getcourse_downloader.infrastructure.storage.filenames import sanitize_filename
+from getcourse_downloader.infrastructure.storage.filenames import (
+    quality_suffixed_path,
+    sanitize_filename,
+)
 
 
 def test_sanitize_filename_removes_status_words():
@@ -22,6 +25,18 @@ def test_sanitize_filename_collapses_whitespace():
 
 def test_sanitize_filename_replaces_illegal_chars():
     assert sanitize_filename('a/b\\c:d*e?f"g<h>i|') == "a_b_c_d_e_f_g_h_i_"
+
+
+def test_quality_suffix_uses_actual_height_without_hash(tmp_path):
+    path = quality_suffixed_path(tmp_path / "Лекция №1 Жена Мечты", "720p")
+
+    assert path.name == "Лекция №1 Жена Мечты_720.mp4"
+
+
+def test_quality_suffix_is_omitted_when_height_is_unknown(tmp_path):
+    path = quality_suffixed_path(tmp_path / "Лекция", "")
+
+    assert path.name == "Лекция.mp4"
 
 
 def test_sanitize_filename_protects_windows_reserved_names_with_extensions():

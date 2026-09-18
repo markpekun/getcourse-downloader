@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import aiohttp
@@ -19,9 +19,9 @@ import aiohttp
 from getcourse_downloader.application.ports.download import EventHandler
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.infrastructure.media.ffmpeg import FfmpegMuxer
-from getcourse_downloader.infrastructure.media.sample_aes import (
-    SampleAesError,
-    decrypt_sample_aes_ts,
+from getcourse_downloader.infrastructure.storage.filenames import (
+    existing_output_path,
+    quality_suffixed_path,
 )
 
 _PROGRESS_UPDATE_SECONDS = 0.25
@@ -38,6 +38,7 @@ _VOLATILE_QUERY_PARAMETERS = {
     "hdntl",
     "hdnts",
     "jwt",
+    "kcd",
     "key-pair-id",
     "policy",
     "sig",
@@ -83,20 +84,23 @@ class HlsKeyError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
-class HlsSampleAesKey:
+class HlsKeyDeclaration:
+    method: str
     uri: str
-    iv: bytes | None
+    key_format: str = "identity"
 
 
 @dataclass(frozen=True, slots=True)
-class HlsMediaSegment:
-    url: str
-    sequence_number: int
-    sample_aes_key: HlsSampleAesKey | None
+class HlsByteRange:
+    offset: int
+    length: int
 
-    @property
-    def iv(self) -> bytes | None:
-        return self.sample_aes_key.iv if self.sample_aes_key is not None else None
+
+@dataclass(frozen=True, slots=True)
+class HlsMediaResource:
+    url: str
+    byte_range: HlsByteRange | None
+    role: Literal["init", "media"]
 
 
 def _hls_attributes(attribute_list: str) -> dict[str, str]:
@@ -130,15 +134,19 @@ def _hls_attributes(attribute_list: str) -> dict[str, str]:
     return attributes
 
 
-def _parse_sample_aes_key(attributes: dict[str, str], playlist_url: str) -> HlsSampleAesKey | None:
+def parse_key_tag(line: str, playlist_url: str) -> HlsKeyDeclaration | None:
+    """Parse one identity SAMPLE-AES key tag without retaining its signed query."""
+
+    if not line.startswith(("#EXT-X-KEY:", "#EXT-X-SESSION-KEY:")):
+        raise HlsKeyError("not an HLS key tag")
+    attributes = _hls_attributes(line.split(":", 1)[1])
     method = attributes.get("METHOD", "").upper()
     if method == "NONE":
-        if len(attributes) != 1:
-            raise HlsKeyError("METHOD=NONE cannot contain key attributes")
         return None
     if method != "SAMPLE-AES":
         raise HlsKeyError(f"unsupported HLS encryption method {method or 'missing'}")
-    if attributes.get("KEYFORMAT", "identity").casefold() != "identity":
+    key_format = attributes.get("KEYFORMAT", "identity").casefold()
+    if key_format != "identity":
         raise HlsKeyError("SAMPLE-AES requires KEYFORMAT=identity")
     uri = attributes.get("URI")
     if uri is None:
@@ -146,44 +154,88 @@ def _parse_sample_aes_key(attributes: dict[str, str], playlist_url: str) -> HlsS
     absolute_uri = urljoin(playlist_url, uri)
     if urlsplit(absolute_uri).scheme.casefold() != "https":
         raise HlsKeyError("SAMPLE-AES key URI must use HTTPS")
-    iv_value = attributes.get("IV")
-    if iv_value is None:
-        iv = None
-    else:
-        if not iv_value.startswith(("0x", "0X")) or len(iv_value) != 34:
-            raise HlsKeyError("SAMPLE-AES IV must be a 128-bit hexadecimal value")
-        try:
-            iv = bytes.fromhex(iv_value[2:])
-        except ValueError as error:
-            raise HlsKeyError("SAMPLE-AES IV must be hexadecimal") from error
-    return HlsSampleAesKey(absolute_uri, iv)
+    return HlsKeyDeclaration(method, absolute_uri, key_format)
 
 
-def parse_sample_aes_segments(playlist: str, playlist_url: str) -> tuple[HlsMediaSegment, ...]:
-    """Parse media segments together with their effective clear-key declaration."""
+def parse_session_key(playlist: str, playlist_url: str) -> HlsKeyDeclaration | None:
+    for raw_line in playlist.splitlines():
+        line = raw_line.strip()
+        if line.startswith("#EXT-X-SESSION-KEY:"):
+            return parse_key_tag(line, playlist_url)
+    return None
 
-    segments: list[HlsMediaSegment] = []
-    sequence_number = 0
-    active_key: HlsSampleAesKey | None = None
+
+def _parse_byte_range(value: str, *, implicit_offset: int | None) -> HlsByteRange:
+    length_text, separator, offset_text = value.partition("@")
+    try:
+        length = int(length_text)
+        offset = int(offset_text) if separator else implicit_offset
+    except ValueError as error:
+        raise HlsKeyError("invalid HLS byte range") from error
+    if length <= 0:
+        raise HlsKeyError("HLS byte range length must be positive")
+    if offset is None:
+        raise HlsKeyError("implicit HLS byte range has no preceding offset")
+    if offset < 0:
+        raise HlsKeyError("HLS byte range offset must not be negative")
+    return HlsByteRange(offset, length)
+
+
+def parse_media_resources(playlist: str, playlist_url: str) -> tuple[HlsMediaResource, ...]:
+    """Return the exact init/media byte sequence represented by an HLS playlist."""
+
+    media: list[HlsMediaResource] = []
+    init: HlsMediaResource | None = None
+    pending_range: str | None = None
+    next_offset_by_url: dict[str, int] = {}
     for raw_line in playlist.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
-            try:
-                sequence_number = int(line.split(":", 1)[1])
-            except ValueError as error:
-                raise HlsKeyError("invalid HLS media sequence") from error
-            if sequence_number < 0:
-                raise HlsKeyError("invalid HLS media sequence")
-        elif line.startswith("#EXT-X-KEY:"):
-            active_key = _parse_sample_aes_key(_hls_attributes(line.split(":", 1)[1]), playlist_url)
-        elif not line.startswith("#"):
-            absolute_url = urljoin(playlist_url, line)
-            if not urlsplit(absolute_url).path.casefold().endswith(".m3u8"):
-                segments.append(HlsMediaSegment(absolute_url, sequence_number, active_key))
-                sequence_number += 1
-    return tuple(segments)
+        if line.startswith("#EXT-X-MAP:"):
+            attributes = _hls_attributes(line.split(":", 1)[1])
+            uri = attributes.get("URI")
+            if uri is None:
+                raise HlsKeyError("EXT-X-MAP URI is missing")
+            url = urljoin(playlist_url, uri)
+            value = attributes.get("BYTERANGE")
+            byte_range = (
+                _parse_byte_range(value, implicit_offset=None) if value is not None else None
+            )
+            init = HlsMediaResource(url, byte_range, "init")
+            continue
+        if line.startswith("#EXT-X-BYTERANGE:"):
+            pending_range = line.split(":", 1)[1]
+            continue
+        if line.startswith("#"):
+            continue
+        url = urljoin(playlist_url, line)
+        if urlsplit(url).path.casefold().endswith(".m3u8"):
+            continue
+        byte_range = None
+        if pending_range is not None:
+            byte_range = _parse_byte_range(
+                pending_range,
+                implicit_offset=next_offset_by_url.get(url),
+            )
+            next_offset_by_url[url] = byte_range.offset + byte_range.length
+            pending_range = None
+        media.append(HlsMediaResource(url, byte_range, "media"))
+
+    if pending_range is not None:
+        raise HlsKeyError("HLS byte range has no media URI")
+    if init is None:
+        return tuple(media)
+    if media:
+        init_parts = urlsplit(init.url)
+        first_parts = urlsplit(media[0].url)
+        if not init_parts.query and (init_parts.scheme, init_parts.netloc, init_parts.path) == (
+            first_parts.scheme,
+            first_parts.netloc,
+            first_parts.path,
+        ):
+            init = HlsMediaResource(media[0].url, init.byte_range, "init")
+    return (init, *media)
 
 
 def has_unsupported_hls_encryption(text: str) -> str | None:
@@ -360,6 +412,11 @@ def _write_concat_list(path: Path, segment_paths: list[Path]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _allows_local_decryption_fallback(message: str) -> bool:
+    normalized = message.casefold()
+    return bool(normalized) and normalized != "cancelled"
+
+
 def _prepare_checkpoint(
     output_mp4: Path,
     *,
@@ -368,16 +425,28 @@ def _prepare_checkpoint(
     playlist_url: str,
     segment_urls: list[str],
     segment_encryption: list[dict[str, str | int] | None] | None = None,
+    resource_ranges: list[HlsByteRange | None] | None = None,
+    resource_roles: list[str] | None = None,
 ) -> tuple[Path, list[Path], int]:
     checkpoint = _checkpoint_path(output_mp4)
     manifest_path = checkpoint / "manifest.json"
     canonical_segments = [canonical_media_url(url) for url in segment_urls]
+    ranges = resource_ranges or [None] * len(segment_urls)
+    roles = resource_roles or ["media"] * len(segment_urls)
     expected_manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "lesson_url": lesson_url,
         "requested_quality": requested_quality,
         "playlist_url": canonical_media_url(playlist_url),
-        "segments": canonical_segments,
+        "resources": [
+            {
+                "role": role,
+                "url": url,
+                "offset": byte_range.offset if byte_range else None,
+                "length": byte_range.length if byte_range else None,
+            }
+            for role, url, byte_range in zip(roles, canonical_segments, ranges, strict=True)
+        ],
         "segment_encryption": segment_encryption or [None] * len(segment_urls),
     }
 
@@ -446,11 +515,13 @@ class HlsDownloader:
         requested_quality: str = "auto",
         video_index: int = 1,
         video_total: int = 1,
+        session_key: HlsKeyDeclaration | None = None,
         is_cancelled: Callable[[], bool] | None = None,
     ) -> HlsDownloadResult:
         output_mp4 = output_without_suffix.parent / f"{output_without_suffix.name}.mp4"
         output_mp4.parent.mkdir(parents=True, exist_ok=True)
-        if output_mp4.is_file() and output_mp4.stat().st_size > 0:
+        existing_output = existing_output_path(output_without_suffix)
+        if existing_output is not None:
             checkpoint = _checkpoint_path(output_mp4)
             if checkpoint.exists():
                 _reset_checkpoint(checkpoint, output_mp4)
@@ -461,8 +532,8 @@ class HlsDownloader:
             )
             return HlsDownloadResult(
                 HlsDownloadStatus.ALREADY_PRESENT,
-                output_path=output_mp4,
-                quality=await self.probe_quality(output_mp4, fallback),
+                output_path=existing_output,
+                quality=await self.probe_quality(existing_output, fallback),
             )
 
         if is_cancelled and is_cancelled():
@@ -547,7 +618,34 @@ class HlsDownloader:
                 return HlsDownloadResult(HlsDownloadStatus.FAILED)
 
             try:
-                segments = parse_sample_aes_segments(playlist, playlist_url)
+                resources = parse_media_resources(playlist, playlist_url)
+            except HlsKeyError as error:
+                emit(
+                    event(
+                        DownloadEventType.ERROR,
+                        f"Некорректная структура HLS: {error}",
+                        stage="playlist",
+                        level="error",
+                        error_code="HLS_STRUCTURE_INVALID",
+                        source_host=parts.netloc,
+                    )
+                )
+                return HlsDownloadResult(HlsDownloadStatus.FAILED)
+
+            try:
+                key_lines = [
+                    raw_line.strip()
+                    for raw_line in playlist.splitlines()
+                    if raw_line.strip().startswith("#EXT-X-KEY:")
+                ]
+                parsed_media_keys = [parse_key_tag(line, playlist_url) for line in key_lines]
+                media_keys = [key for key in parsed_media_keys if key is not None]
+                unique_keys = {key.uri: key for key in media_keys}
+                if len(unique_keys) > 1:
+                    raise HlsKeyError("multiple SAMPLE-AES keys are unsupported")
+                key_declaration = (
+                    next(iter(unique_keys.values()), None) if key_lines else session_key
+                )
             except HlsKeyError as error:
                 emit(
                     event(
@@ -561,29 +659,8 @@ class HlsDownloader:
                 )
                 return HlsDownloadResult(HlsDownloadStatus.FAILED)
 
-            unsupported_tag = next(
-                (
-                    line.strip().split(":", 1)[0]
-                    for line in playlist.splitlines()
-                    if line.strip().startswith(("#EXT-X-MAP:", "#EXT-X-BYTERANGE:"))
-                ),
-                None,
-            )
-            if unsupported_tag:
-                emit(
-                    event(
-                        DownloadEventType.ERROR,
-                        f"Неподдерживаемая структура HLS: {unsupported_tag}",
-                        stage="playlist",
-                        level="error",
-                        error_code="HLS_STRUCTURE_UNSUPPORTED",
-                        source_host=parts.netloc,
-                    )
-                )
-                return HlsDownloadResult(HlsDownloadStatus.FAILED)
-
-            segment_urls = [segment.url for segment in segments]
-            total = len(segments)
+            segment_urls = [resource.url for resource in resources]
+            total = len(resources)
             if not total:
                 emit(
                     event(
@@ -597,16 +674,21 @@ class HlsDownloader:
                 )
                 return HlsDownloadResult(HlsDownloadStatus.FAILED)
 
-            def checkpoint_encryption(segment: HlsMediaSegment) -> dict[str, str | int] | None:
-                key = segment.sample_aes_key
-                if key is None:
-                    return None
-                iv = key.iv or segment.sequence_number.to_bytes(16, "big")
-                return {
-                    "method": "SAMPLE-AES",
-                    "key_uri": canonical_media_url(key.uri),
-                    "iv": iv.hex(),
-                }
+            if key_declaration is not None:
+                support_check = getattr(self._muxer, "sample_aes_support", None)
+                if support_check is not None:
+                    supported, support_message = await support_check()
+                    if not supported:
+                        emit(
+                            event(
+                                DownloadEventType.ERROR,
+                                support_message,
+                                stage="ffmpeg",
+                                level="error",
+                                error_code="FFMPEG_VERSION_UNSUPPORTED",
+                            )
+                        )
+                        return HlsDownloadResult(HlsDownloadStatus.FAILED)
 
             checkpoint, segment_paths, resumed = _prepare_checkpoint(
                 output_mp4,
@@ -614,23 +696,27 @@ class HlsDownloader:
                 requested_quality=requested_quality,
                 playlist_url=playlist_url,
                 segment_urls=segment_urls,
-                segment_encryption=[checkpoint_encryption(segment) for segment in segments],
+                segment_encryption=[
+                    {"method": "SAMPLE-AES"} if key_declaration is not None else None
+                    for _ in resources
+                ],
+                resource_ranges=[resource.byte_range for resource in resources],
+                resource_roles=[resource.role for resource in resources],
             )
-            key_bytes: dict[str, bytes] = {}
-            if resumed < total:
-                key_host = parts.netloc
+            decryption_key_hex: str | None = None
+            if key_declaration is not None:
+                key_host = urlsplit(key_declaration.uri).netloc
                 try:
-                    for segment in segments:
-                        key = segment.sample_aes_key
-                        if key is None or key.uri in key_bytes:
-                            continue
-                        key_host = urlsplit(key.uri).netloc
-                        async with session.get(key.uri) as response:
-                            response.raise_for_status()
-                            key_data = await response.read()
-                        if len(key_data) != 16:
-                            raise HlsKeyError("сервер ключа вернул не 16 байт")
-                        key_bytes[key.uri] = key_data
+                    async with session.get(key_declaration.uri) as response:
+                        response.raise_for_status()
+                        key_data = (await response.read()).strip(b" \t\r\n")
+                    if len(key_data) != 16:
+                        raise HlsKeyError("сервер ключа вернул не 16 байт")
+                    try:
+                        key_data.decode("ascii")
+                    except UnicodeDecodeError as error:
+                        raise HlsKeyError("сервер ключа вернул не ASCII") from error
+                    decryption_key_hex = key_data.hex()
                 except HlsKeyError as error:
                     emit(
                         event(
@@ -645,10 +731,14 @@ class HlsDownloader:
                     return HlsDownloadResult(HlsDownloadStatus.FAILED)
                 except (TimeoutError, aiohttp.ClientError, OSError) as error:
                     error_code, summary = _download_error_details(error)
+                    if error_code == "HTTP_403":
+                        summary = (
+                            "Ссылка для получения ключа истекла. Перезапустите загрузку урока."
+                        )
                     emit(
                         event(
                             DownloadEventType.ERROR,
-                            f"{summary} при получении ключа SAMPLE-AES",
+                            summary,
                             stage="playlist",
                             level="error",
                             error_code=f"HLS_KEY_{error_code}",
@@ -675,9 +765,9 @@ class HlsDownloader:
             transferred_bytes = 0
             segment_failures: list[tuple[int, str, str, str]] = []
 
-            async def download_segment(index: int, segment: HlsMediaSegment) -> bool:
+            async def download_segment(index: int, resource: HlsMediaResource) -> bool:
                 nonlocal completed, last_progress_report, last_speed_report, transferred_bytes
-                url = segment.url
+                url = resource.url
                 path = segment_paths[index]
                 if path.is_file() and path.stat().st_size > 0:
                     return True
@@ -687,15 +777,25 @@ class HlsDownloader:
                             return False
                         temporary = path.with_suffix(".tmp")
                         try:
-                            async with session.get(url) as response:
+                            request_headers = None
+                            if resource.byte_range is not None:
+                                start = resource.byte_range.offset
+                                end = start + resource.byte_range.length - 1
+                                request_headers = {"Range": f"bytes={start}-{end}"}
+                            async with session.get(url, headers=request_headers) as response:
                                 response.raise_for_status()
                                 content = await response.read()
+                            if resource.byte_range is not None:
+                                expected = resource.byte_range.length
+                                if len(content) != expected:
+                                    start = resource.byte_range.offset
+                                    end = start + expected
+                                    if len(content) >= end:
+                                        content = content[start:end]
+                                    else:
+                                        raise OSError("invalid HLS byte range length")
                             if not content:
                                 raise OSError("empty HLS segment")
-                            if segment.sample_aes_key is not None:
-                                key = segment.sample_aes_key
-                                iv = key.iv or segment.sequence_number.to_bytes(16, "big")
-                                content = decrypt_sample_aes_ts(content, key_bytes[key.uri], iv)
                             temporary.write_bytes(content)
                             os.replace(temporary, path)
                             completed += 1
@@ -725,17 +825,6 @@ class HlsDownloader:
                                     )
                                 )
                             return True
-                        except SampleAesError:
-                            temporary.unlink(missing_ok=True)
-                            segment_failures.append(
-                                (
-                                    index,
-                                    "SAMPLE_AES_DECRYPT_FAILED",
-                                    "Не удалось расшифровать SAMPLE-AES сегмент",
-                                    urlsplit(url).netloc,
-                                )
-                            )
-                            return False
                         except (TimeoutError, aiohttp.ClientError, OSError) as error:
                             temporary.unlink(missing_ok=True)
                             if attempt == 2:
@@ -748,7 +837,7 @@ class HlsDownloader:
                 return False
 
             results = await asyncio.gather(
-                *(download_segment(index, segment) for index, segment in enumerate(segments))
+                *(download_segment(index, resource) for index, resource in enumerate(resources))
             )
             if is_cancelled and is_cancelled():
                 return HlsDownloadResult(
@@ -778,20 +867,28 @@ class HlsDownloader:
                 )
 
             temporary_output = checkpoint / "output.part.mp4"
-            concat_list = checkpoint / "segments.ffconcat"
-            _write_concat_list(concat_list, segment_paths)
-            success, error_message = await self._muxer.mux_concat(
-                concat_list,
-                temporary_output,
-                is_cancelled=is_cancelled,
-            )
+            if decryption_key_hex is not None:
+                success, error_message = await self._muxer.decrypt_fragments(
+                    segment_paths,
+                    temporary_output,
+                    decryption_key_hex=decryption_key_hex,
+                    is_cancelled=is_cancelled,
+                )
+            else:
+                concat_list = checkpoint / "segments.ffconcat"
+                _write_concat_list(concat_list, segment_paths)
+                success, error_message = await self._muxer.mux_concat(
+                    concat_list,
+                    temporary_output,
+                    is_cancelled=is_cancelled,
+                )
             if is_cancelled and is_cancelled():
                 return HlsDownloadResult(
                     HlsDownloadStatus.CANCELLED,
                     resumed_segments=resumed,
                     total_segments=total,
                 )
-            if not success:
+            if not success and decryption_key_hex is None:
                 transport_stream = checkpoint / "video.ts"
                 temporary_transport = checkpoint / "video.ts.tmp"
                 with temporary_transport.open("wb") as destination:
@@ -810,6 +907,26 @@ class HlsDownloader:
                     temporary_output,
                     is_cancelled=is_cancelled,
                 )
+            elif (
+                not success
+                and decryption_key_hex is not None
+                and _allows_local_decryption_fallback(error_message)
+            ):
+                encrypted_mp4 = checkpoint / "video.enc.mp4"
+                temporary_encrypted = checkpoint / "video.enc.mp4.tmp"
+                with temporary_encrypted.open("wb") as destination:
+                    for segment_path in segment_paths:
+                        with segment_path.open("rb") as source:
+                            shutil.copyfileobj(source, destination, length=1024 * 1024)
+                os.replace(temporary_encrypted, encrypted_mp4)
+                success, error_message = await self._muxer.decrypt_file(
+                    encrypted_mp4,
+                    temporary_output,
+                    decryption_key_hex=decryption_key_hex,
+                    is_cancelled=is_cancelled,
+                )
+                if success:
+                    encrypted_mp4.unlink(missing_ok=True)
             if is_cancelled and is_cancelled():
                 return HlsDownloadResult(
                     HlsDownloadStatus.CANCELLED,
@@ -831,18 +948,19 @@ class HlsDownloader:
                     resumed_segments=resumed,
                     total_segments=total,
                 )
-            os.replace(temporary_output, output_mp4)
             fallback = (
                 f"{extract_quality(playlist_url)}p"
                 if extract_quality(playlist_url)
                 else (f"{requested_quality}p" if requested_quality.isdigit() else "")
             )
-            quality = await self.probe_quality(output_mp4, fallback)
+            quality = await self.probe_quality(temporary_output, fallback)
+            final_output = quality_suffixed_path(output_without_suffix, quality)
+            os.replace(temporary_output, final_output)
             _reset_checkpoint(checkpoint, output_mp4)
             return HlsDownloadResult(
                 HlsDownloadStatus.DOWNLOADED,
                 resumed_segments=resumed,
                 total_segments=total,
-                output_path=output_mp4,
+                output_path=final_output,
                 quality=quality,
             )

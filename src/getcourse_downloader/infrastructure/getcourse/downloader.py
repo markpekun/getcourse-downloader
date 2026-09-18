@@ -28,11 +28,13 @@ from getcourse_downloader.infrastructure.getcourse.video_signals import (
 from getcourse_downloader.infrastructure.media.hls import (
     HlsDownloader,
     HlsDownloadStatus,
+    HlsKeyDeclaration,
     canonical_media_url,
     has_unsupported_hls_encryption,
     is_hls_master_playlist,
     is_hls_playlist,
     parse_master_variants,
+    parse_session_key,
     select_stream_playlist_url,
 )
 from getcourse_downloader.infrastructure.storage.download_catalog import (
@@ -42,8 +44,8 @@ from getcourse_downloader.infrastructure.storage.download_catalog import (
 from getcourse_downloader.infrastructure.storage.filenames import (
     collision_safe_component,
     collision_safe_stem,
+    existing_output_path,
     safe_lesson_output_stem,
-    sanitize_filename,
 )
 
 PLAYLIST_WAIT_SECONDS = 30.0
@@ -73,6 +75,7 @@ class _Playlist:
     url: str
     text: str
     referer_url: str = ""
+    session_key: HlsKeyDeclaration | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,13 +158,14 @@ class PlaywrightDownloadGateway:
             if catalogued:
                 return _LessonResult(_LessonStatus.SKIPPED, catalogued)
 
-        direct = output_stem.parent / f"{output_stem.name}.mp4"
+        direct = existing_output_path(output_stem)
         try:
-            exists = direct.is_file() and direct.stat().st_size > 0
+            exists = direct is not None
         except OSError:
             exists = False
         if not exists:
             return None
+        assert direct is not None
         quality = await self._hls.probe_quality(direct)
         media = (DownloadedMedia(direct, quality),)
         if self._catalog:
@@ -170,31 +174,49 @@ class PlaywrightDownloadGateway:
 
     @staticmethod
     def _output_exists(stem: Path) -> bool:
-        direct = stem.parent / f"{stem.name}.mp4"
-        return direct.is_file() and direct.stat().st_size > 0
+        return existing_output_path(stem) is not None
 
     @staticmethod
     def _output_stems(request: DownloadRequest) -> list[Path]:
-        stems: list[Path] = []
-        for item in request.lessons:
-            stem = safe_lesson_output_stem(
+        stems = [
+            safe_lesson_output_stem(
                 request.save_path,
                 item.course_path,
                 item.lesson.title,
             )
-            parts = list(stem.relative_to(request.save_path).parts)
-            for depth, raw_component in enumerate(item.course_path):
-                if sanitize_filename(raw_component, fallback="course") != raw_component:
-                    parts[depth] = collision_safe_component(
-                        parts[depth],
-                        "\x1f".join(item.course_path[: depth + 1]),
-                    )
-            stems.append(
-                collision_safe_stem(
-                    request.save_path.joinpath(*parts),
-                    item.lesson.url,
+            for item in request.lessons
+        ]
+        folder_groups: dict[tuple[int, tuple[str, ...], str], list[int]] = {}
+        for index, (item, stem) in enumerate(zip(request.lessons, stems, strict=True)):
+            safe_parts = stem.relative_to(request.save_path).parts
+            for depth, _raw_component in enumerate(item.course_path):
+                key = (
+                    depth,
+                    tuple(part.casefold() for part in safe_parts[:depth]),
+                    safe_parts[depth].casefold(),
                 )
-            )
+                folder_groups.setdefault(key, []).append(index)
+        for (depth, _, _), indexes in folder_groups.items():
+            if len({request.lessons[index].course_path[depth] for index in indexes}) < 2:
+                continue
+            for index in indexes:
+                parts = list(stems[index].relative_to(request.save_path).parts)
+                parts[depth] = collision_safe_component(
+                    parts[depth],
+                    "\x1f".join(request.lessons[index].course_path[: depth + 1]),
+                )
+                stems[index] = request.save_path.joinpath(*parts)
+        collisions: dict[str, list[int]] = {}
+        for index, stem in enumerate(stems):
+            collisions.setdefault(str(stem.resolve()).casefold(), []).append(index)
+        for indexes in collisions.values():
+            if len(indexes) < 2:
+                continue
+            for index in indexes:
+                stems[index] = collision_safe_stem(
+                    stems[index],
+                    request.lessons[index].lesson.url,
+                )
         return stems
 
     async def _run_async(self, request: DownloadRequest, emit: EventHandler) -> DownloadSummary:
@@ -204,6 +226,13 @@ class PlaywrightDownloadGateway:
         failed: list[str] = []
         cancelled = 0
         output_stems = self._output_stems(request)
+        if self._catalog:
+            output_stems = [
+                collision_safe_stem(stem, item.lesson.url)
+                if self._catalog.has_stem_conflict(item.lesson.url, stem)
+                else stem
+                for item, stem in zip(request.lessons, output_stems, strict=True)
+            ]
 
         async with async_playwright() as playwright:
             pending: list[int] = []
@@ -648,6 +677,7 @@ class PlaywrightDownloadGateway:
                     requested_quality=quality,
                     video_index=video_index,
                     video_total=len(selected),
+                    session_key=playlist.session_key,
                     is_cancelled=self._cancelled.is_set,
                 )
                 download_results.append(result)
@@ -689,6 +719,7 @@ class PlaywrightDownloadGateway:
         for playlist in candidates:
             if not is_hls_master_playlist(playlist.text):
                 continue
+            session_key = parse_session_key(playlist.text, playlist.url)
             master_variant_keys.update(
                 canonical_media_url(variant.url)
                 for variant in parse_master_variants(playlist.text, playlist.url)
@@ -696,7 +727,10 @@ class PlaywrightDownloadGateway:
             selected_url = select_stream_playlist_url(playlist.text, playlist.url, quality)
             if selected_url:
                 key = canonical_media_url(selected_url)
-                selected.setdefault(key, _Playlist(selected_url, "", playlist.referer_url))
+                selected.setdefault(
+                    key,
+                    _Playlist(selected_url, "", playlist.referer_url, session_key),
+                )
 
         for playlist in candidates:
             if is_hls_master_playlist(playlist.text):

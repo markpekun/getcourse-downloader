@@ -2,10 +2,11 @@ import asyncio
 import contextlib
 import shutil
 import sys
+from pathlib import Path
 
 import pytest
 
-from getcourse_downloader.infrastructure.media.ffmpeg import FfmpegMuxer
+from getcourse_downloader.infrastructure.media.ffmpeg import FfmpegMuxer, _supports_sample_aes
 from getcourse_downloader.infrastructure.platform.paths import AppPaths
 
 
@@ -71,6 +72,120 @@ def test_mux_concat_uses_ffmpeg_concat_demuxer(monkeypatch, tmp_path):
         "copy",
         "-bsf:a",
         "aac_adtstoasc",
+        str(tmp_path / "output.mp4"),
+    ]
+
+
+def test_decrypt_fragments_streams_sources_and_places_key_before_input(monkeypatch, tmp_path):
+    captured: list[str] = []
+    written = bytearray()
+
+    class Stdin:
+        def write(self, data):
+            written.extend(data)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+        async def wait_closed(self):
+            return None
+
+    class Process:
+        returncode = 0
+        stdin = Stdin()
+
+        async def communicate(self):
+            return b"", b""
+
+        async def wait(self):
+            return 0
+
+    async def create_subprocess_exec(*args, **_kwargs):
+        captured.extend(args)
+        return Process()
+
+    paths = _paths(tmp_path)
+    paths.resources.mkdir()
+    (paths.resources / "ffmpeg.exe").write_bytes(b"")
+    init = tmp_path / "init.bin"
+    fragment = tmp_path / "fragment.bin"
+    init.write_bytes(b"init")
+    fragment.write_bytes(b"fragment")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+
+    success, message = asyncio.run(
+        FfmpegMuxer(paths).decrypt_fragments(
+            [init, fragment],
+            tmp_path / "output.mp4",
+            decryption_key_hex="00" * 16,
+        )
+    )
+
+    assert (success, message) == (True, "")
+    assert captured.index("-decryption_key") < captured.index("-i")
+    assert captured[captured.index("-i") + 1] == "pipe:0"
+    assert bytes(written) == b"initfragment"
+
+
+@pytest.mark.parametrize(
+    ("version_output", "supported"),
+    [
+        ("ffmpeg version 6.1.2\nlibavformat 60. 16.100", True),
+        ("ffmpeg version N-125847\nlibavformat 62. 3.100", True),
+        ("ffmpeg version 5.1.6\nlibavformat 59. 27.100", False),
+        ("unexpected output", False),
+    ],
+)
+def test_sample_aes_version_gate(version_output, supported):
+    assert _supports_sample_aes(version_output) is supported
+
+
+def test_decrypt_file_uses_local_input_and_copy(monkeypatch, tmp_path):
+    captured: list[str] = []
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+        async def wait(self):
+            return 0
+
+    async def create_subprocess_exec(*args, **_kwargs):
+        captured.extend(args)
+        return Process()
+
+    paths = _paths(tmp_path)
+    paths.resources.mkdir()
+    (paths.resources / "ffmpeg.exe").write_bytes(b"")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+    source = Path(tmp_path / "video.enc.mp4")
+
+    success, message = asyncio.run(
+        FfmpegMuxer(paths).decrypt_file(
+            source,
+            tmp_path / "output.mp4",
+            decryption_key_hex="11" * 16,
+        )
+    )
+
+    assert (success, message) == (True, "")
+    assert captured[1:] == [
+        "-y",
+        "-v",
+        "error",
+        "-decryption_key",
+        "11" * 16,
+        "-i",
+        str(source),
+        "-map",
+        "0",
+        "-c",
+        "copy",
         str(tmp_path / "output.mp4"),
     ]
 
