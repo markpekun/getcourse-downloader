@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import ClassVar, TypedDict
 
 import flet as ft
@@ -30,6 +31,13 @@ class _DecorationCircle(TypedDict, total=False):
     bottom: int
     size: int
     color: str
+
+
+@dataclass(frozen=True)
+class _ErrorGuidance:
+    title: str
+    summary: str
+    steps: tuple[str, ...]
 
 
 class StartScreen:
@@ -662,24 +670,112 @@ class StartScreen:
 
     @staticmethod
     def _error_title(code: str) -> str:
+        return StartScreen._error_guidance(code).title
+
+    @staticmethod
+    def _error_guidance(code: str) -> _ErrorGuidance:
         if code in {"BROWSER_RESOURCES_MISSING", "BROWSER_START_FAILED"}:
-            return "Встроенный Firefox не запустился"
+            return _ErrorGuidance(
+                "Встроенный Firefox не запустился",
+                "Приложению не удалось открыть встроенный браузер.",
+                (
+                    "Полностью распакуйте архив приложения в отдельную папку.",
+                    "Закройте приложение и откройте его снова.",
+                    "Если ошибка повторяется, распакуйте свежую копию архива.",
+                ),
+            )
         if code == "BROWSER_PROFILE_BUSY":
-            return "Firefox уже используется"
+            return _ErrorGuidance(
+                "Firefox уже используется",
+                "Предыдущая загрузка ещё использует встроенный браузер.",
+                (
+                    "Закройте другие открытые окна GetCourse Video Downloader.",
+                    "Подождите несколько секунд и нажмите «Повторить».",
+                ),
+            )
         if code in {"SITE_TIMEOUT", "SITE_CONNECTION_FAILED"}:
-            return "Сайт недоступен"
+            return _ErrorGuidance(
+                "Сайт недоступен",
+                "Не удалось установить соединение с сайтом курса.",
+                (
+                    "Проверьте, открывается ли ссылка в обычном браузере.",
+                    "Проверьте подключение к интернету, VPN или прокси.",
+                    "Подождите немного и нажмите «Повторить».",
+                ),
+            )
         if code in {"HTTP_401", "HTTP_403", "AUTH_REQUIRED"}:
-            return "Нет доступа к курсу"
+            return _ErrorGuidance(
+                "Нет доступа к курсу",
+                "У аккаунта нет доступа к этой странице.",
+                (
+                    "Войдите в аккаунт, на котором доступен курс.",
+                    "Убедитесь, что курс открыт для этого аккаунта.",
+                    "Скопируйте ссылку на курс из личного кабинета и повторите попытку.",
+                ),
+            )
         if code == "HTTP_404":
-            return "Страница не найдена"
+            return _ErrorGuidance(
+                "Страница не найдена",
+                "Ссылка ведёт на страницу, которой больше нет, либо содержит ошибку.",
+                (
+                    "Откройте ссылку в обычном браузере.",
+                    "Скопируйте актуальную ссылку из личного кабинета GetCourse.",
+                    "Если страница не открывается, запросите новую ссылку у автора курса.",
+                ),
+            )
         if code == "HTTP_5XX":
-            return "Ошибка сервера"
+            return _ErrorGuidance(
+                "Ошибка сервера",
+                "Сервер курса временно не смог обработать запрос.",
+                (
+                    "Подождите несколько минут и нажмите «Повторить».",
+                    "Проверьте, открывается ли курс в обычном браузере.",
+                    "Если проблема не проходит, обратитесь к владельцу курса.",
+                ),
+            )
         if code == "INVALID_CONFIGURATION":
-            return "Проверьте ссылку"
-        return "Не удалось загрузить курсы"
+            return _ErrorGuidance(
+                "Проверьте ссылку",
+                "Приложению нужен полный адрес страницы курса.",
+                (
+                    "Вставьте ссылку целиком, включая https://.",
+                    "Убедитесь, что это ссылка на страницу GetCourse, "
+                    "а не текст из адресной строки.",
+                ),
+            )
+        return _ErrorGuidance(
+            "Не удалось загрузить курсы",
+            "Не получилось получить список курсов по этой ссылке.",
+            (
+                "Проверьте, открывается ли ссылка в обычном браузере.",
+                "Убедитесь, что вы вошли в аккаунт с доступом к курсу.",
+                "Попробуйте повторить загрузку позже.",
+            ),
+        )
+
+    @staticmethod
+    def _error_card(*, width: int, height: int, content) -> ft.Container:
+        return ft.Container(
+            expand=True,
+            alignment=ft.Alignment(0, 0),
+            content=ft.Container(
+                width=width,
+                height=height,
+                alignment=ft.Alignment(0, 0),
+                padding=ft.Padding.symmetric(horizontal=28, vertical=24),
+                border_radius=18,
+                bgcolor=Color.BG_CARD,
+                border=ft.Border.all(1, "rgba(239,68,68,0.35)"),
+                gradient=Gradient.CARD,
+                shadow=Shadow.CARD_ELEVATED,
+                content=content,
+            ),
+        )
 
     def _show_error(self, error: Exception) -> None:
         code = str(getattr(error, "code", "INTERNAL_ERROR"))
+        self._error_guidance_data = self._error_guidance(code)
+        self._error_code_value = code
         message = (
             str(error).strip()
             if isinstance(error, DownloaderError)
@@ -708,17 +804,10 @@ class StartScreen:
             color=Color.TEXT_MUTED,
             selectable=True,
         )
-        self._error_details_box = ft.Container(
-            visible=False,
-            width=380,
-            padding=ft.Padding.symmetric(horizontal=12, vertical=10),
-            border_radius=8,
-            bgcolor="rgba(0,0,0,0.22)",
-            content=self._error_details,
-        )
         self._error_details_button = ft.TextButton(
-            "Показать подробности",
-            on_click=self._toggle_error_details,
+            "Что можно сделать",
+            icon=ft.Icons.INFO_OUTLINE_ROUNDED,
+            on_click=self._show_error_details,
         )
         self._error_retry_button = ft.Button(
             "Повторить",
@@ -740,56 +829,128 @@ class StartScreen:
             ),
         )
 
-        self.loader.content = ft.Container(
-            expand=True,
-            alignment=ft.Alignment(0, 0),
-            content=ft.Container(
-                width=460,
-                padding=ft.Padding.symmetric(horizontal=28, vertical=24),
-                border_radius=18,
-                bgcolor=Color.BG_CARD,
-                border=ft.Border.all(1, "rgba(239,68,68,0.35)"),
-                gradient=Gradient.CARD,
-                shadow=Shadow.CARD_ELEVATED,
-                content=ft.Column(
-                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    spacing=10,
-                    controls=[
-                        ft.Container(
-                            width=40,
-                            height=40,
-                            border_radius=12,
-                            bgcolor="rgba(239,68,68,0.14)",
-                            content=ft.Icon(ft.Icons.ERROR_OUTLINE, color=Color.RED, size=22),
-                        ),
-                        ft.Text(
-                            self._error_title(code),
-                            size=17,
-                            weight=ft.FontWeight.W_700,
-                            color=Color.TEXT,
-                            text_align=ft.TextAlign.CENTER,
-                        ),
-                        self._error_message,
-                        self._error_code,
-                        self._error_details_button,
-                        self._error_details_box,
-                        ft.Row(
-                            [close_button, self._error_retry_button],
-                            alignment=ft.MainAxisAlignment.CENTER,
-                            spacing=10,
-                        ),
-                    ],
-                ),
+        self._error_summary_view = self._error_card(
+            width=460,
+            height=300,
+            content=ft.Column(
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=10,
+                controls=[
+                    ft.Container(
+                        width=40,
+                        height=40,
+                        border_radius=12,
+                        bgcolor="rgba(239,68,68,0.14)",
+                        content=ft.Icon(ft.Icons.ERROR_OUTLINE, color=Color.RED, size=22),
+                    ),
+                    ft.Text(
+                        self._error_guidance_data.title,
+                        size=17,
+                        weight=ft.FontWeight.W_700,
+                        color=Color.TEXT,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                    self._error_message,
+                    self._error_code,
+                    self._error_details_button,
+                    ft.Row(
+                        [close_button, self._error_retry_button],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        spacing=10,
+                    ),
+                ],
             ),
         )
+        self.loader.content = self._error_summary_view
         self.loader.visible = True
         self.page.update()
 
-    def _toggle_error_details(self, _event) -> None:
-        self._error_details_box.visible = not self._error_details_box.visible
-        self._error_details_button.text = (
-            "Скрыть подробности" if self._error_details_box.visible else "Показать подробности"
+    def _show_error_details(self, _event) -> None:
+        back_button = ft.OutlinedButton(
+            "Назад",
+            icon=ft.Icons.ARROW_BACK_ROUNDED,
+            on_click=self._show_error_summary,
+            style=ft.ButtonStyle(
+                color=Color.TEXT_SECONDARY,
+                side=ft.BorderSide(1, Color.BORDER),
+                shape=ft.RoundedRectangleBorder(radius=9),
+            ),
         )
+        steps = ft.Column(
+            width=420,
+            spacing=5,
+            controls=[
+                ft.Row(
+                    [
+                        ft.Icon(ft.Icons.CHECK_CIRCLE_OUTLINE, color=Color.ACCENT_LIGHT, size=16),
+                        ft.Text(step, size=12, color=Color.TEXT_SECONDARY, expand=True),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.START,
+                    spacing=8,
+                )
+                for step in self._error_guidance_data.steps
+            ],
+        )
+        self.loader.content = self._error_card(
+            width=540,
+            height=380,
+            content=ft.Column(
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=8,
+                controls=[
+                    ft.Text(
+                        self._error_guidance_data.title,
+                        size=18,
+                        weight=ft.FontWeight.W_700,
+                        color=Color.TEXT,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                    ft.Text(
+                        f"Код ошибки: {self._error_code_value}",
+                        size=11,
+                        color=Color.RED,
+                        weight=ft.FontWeight.W_600,
+                    ),
+                    ft.Text(
+                        "Что это значит", size=13, weight=ft.FontWeight.W_600, color=Color.TEXT
+                    ),
+                    ft.Text(
+                        self._error_guidance_data.summary,
+                        size=12,
+                        color=Color.TEXT_SECONDARY,
+                        text_align=ft.TextAlign.CENTER,
+                    ),
+                    ft.Text(
+                        "Что можно сделать", size=13, weight=ft.FontWeight.W_600, color=Color.TEXT
+                    ),
+                    steps,
+                    ft.Text(
+                        "Технические сведения",
+                        size=12,
+                        weight=ft.FontWeight.W_600,
+                        color=Color.TEXT,
+                    ),
+                    ft.Container(
+                        width=420,
+                        padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+                        border_radius=8,
+                        bgcolor="rgba(0,0,0,0.22)",
+                        content=self._error_details,
+                    ),
+                    ft.Row(
+                        [back_button, self._error_retry_button],
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        spacing=10,
+                    ),
+                ],
+            ),
+        )
+        self.page.update()
+
+    def _show_error_summary(self, _event) -> None:
+        self.loader.content = self._error_summary_view
         self.page.update()
 
     def _dismiss_error(self, _event) -> None:

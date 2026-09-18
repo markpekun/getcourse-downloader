@@ -28,7 +28,11 @@ try {
     $ExactTag = git describe --tags --exact-match HEAD 2>$null
     if ($ExactTag) { $Version = $ExactTag.TrimStart("v") }
 } catch {}
-$VersionParts = (($Version -split '\.') + @("0", "0", "0", "0"))[0..3]
+$NumericVersion = $Version -replace "[^0-9.].*$", ""
+if ($NumericVersion -notmatch '^\d+(\.\d+){0,3}$') {
+    throw "Не удалось получить числовую Windows-версию из $Version"
+}
+$VersionParts = (($NumericVersion -split '\.') + @("0", "0", "0", "0"))[0..3]
 $FileVersion = $VersionParts -join "."
 
 $AppName = "GetCourseVideoDownloader"
@@ -66,14 +70,25 @@ if (-not (Test-Path -LiteralPath $FfmpegExe) -or -not (Test-Path -LiteralPath $F
 
 Write-Host "[3/7] Проверяю Firefox для Playwright..."
 $PlaywrightSource = Join-Path $env:LOCALAPPDATA "ms-playwright"
-uv run --no-sync playwright install firefox
-if ($LASTEXITCODE -ne 0) { throw "Playwright не смог установить Firefox" }
+$FirefoxDirectories = @(
+    Get-ChildItem -LiteralPath $PlaywrightSource -Directory -Filter "firefox-*" -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "firefox\firefox.exe") }
+)
+if ($FirefoxDirectories.Count -eq 0) {
+    uv run --no-sync playwright install firefox
+    if ($LASTEXITCODE -ne 0) { throw "Playwright не смог установить Firefox" }
+    $FirefoxDirectories = @(
+        Get-ChildItem -LiteralPath $PlaywrightSource -Directory -Filter "firefox-*" -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "firefox\firefox.exe") }
+    )
+}
+if ($FirefoxDirectories.Count -eq 0) { throw "Firefox Playwright не найден после установки" }
 
 Write-Host "[4/7] Копирую браузер в resources..."
 $PlaywrightDestination = Join-Path $Resources "ms-playwright"
 New-Item -ItemType Directory -Force -Path $PlaywrightDestination | Out-Null
-Get-ChildItem -LiteralPath $PlaywrightSource -Directory -Filter "firefox-*" | ForEach-Object {
-    Copy-Item -LiteralPath $_.FullName -Destination $PlaywrightDestination -Recurse -Force
+foreach ($FirefoxDirectory in $FirefoxDirectories) {
+    Copy-Item -LiteralPath $FirefoxDirectory.FullName -Destination $PlaywrightDestination -Recurse -Force
 }
 
 Write-Host "[5/7] Собираю Windows-приложение..."

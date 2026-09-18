@@ -99,24 +99,66 @@ def test_discovery_failure_stays_visible_with_code_and_sanitized_details():
     assert screen._error_message.value == "Сайт не ответил за отведённое время."
     assert "Alice" not in screen._error_details.value
     assert "private-value" not in screen._error_details.value
-    assert screen._error_details_box.visible is False
     assert callable(screen._error_details_button.on_click)
     assert callable(screen._error_retry_button.on_click)
+    assert "Timeout at" not in _control_texts(screen.loader.content)
     assert screen._parse_task is None
 
 
-def test_error_details_toggle_and_retry_reuse_the_entered_url():
+def _control_texts(control) -> set[str]:
+    values: set[str] = set()
+    for attribute in ("value", "text"):
+        value = getattr(control, attribute, None)
+        if isinstance(value, str):
+            values.add(value)
+    content = getattr(control, "content", None)
+    if content is not None:
+        values.update(_control_texts(content))
+    for child in getattr(control, "controls", []) or []:
+        values.update(_control_texts(child))
+    return values
+
+
+def test_error_details_replace_summary_with_guided_screen_and_return_to_it():
+    screen = StartScreen.__new__(StartScreen)
+    screen.page = SimpleNamespace(update=lambda: None)
+    screen.loader = SimpleNamespace(visible=False, content=None)
+    screen._show_error(
+        ExternalServiceError(
+            "Страница курса не найдена.",
+            code="HTTP_404",
+            technical_details="HTTP 404",
+        )
+    )
+    summary = screen.loader.content
+
+    screen._show_error_details(None)
+    details = _control_texts(screen.loader.content)
+
+    assert screen.loader.content is not summary
+    assert "Что это значит" in details
+    assert "Что можно сделать" in details
+    assert "Откройте ссылку в обычном браузере." in details
+    assert "HTTP 404" in details
+
+    screen._show_error_summary(None)
+    assert screen.loader.content is summary
+
+
+def test_error_guidance_gives_nontechnical_next_step_for_common_codes():
+    guidance = StartScreen._error_guidance("HTTP_403")
+
+    assert guidance.title == "Нет доступа к курсу"
+    assert guidance.summary == "У аккаунта нет доступа к этой странице."
+    assert "Войдите в аккаунт, на котором доступен курс." in guidance.steps
+
+
+def test_error_retry_reuses_the_entered_url():
     screen = StartScreen.__new__(StartScreen)
     screen.page = SimpleNamespace(update=lambda: None)
     screen.loader = SimpleNamespace(visible=True)
-    screen._error_details_box = SimpleNamespace(visible=False)
-    screen._error_details_button = SimpleNamespace(text="Показать подробности")
     retries = []
     screen._start_parse = lambda: retries.append("retry")
-
-    screen._toggle_error_details(None)
-    assert screen._error_details_box.visible is True
-    assert screen._error_details_button.text == "Скрыть подробности"
 
     screen._retry_after_error(None)
     assert retries == ["retry"]
