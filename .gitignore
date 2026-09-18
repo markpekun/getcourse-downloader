@@ -1,5 +1,7 @@
 __pycache__/
 *.egg-info/
+.cache/*
+!.cache/.gitkeep
 .pytest_cache/
 .pytest-tmp*/
 .mypy_cache/
@@ -19,3 +21,6 @@ picture
 build/
 dist/
 *.spec
+docs
+.cache/
+debug-sample-aes/

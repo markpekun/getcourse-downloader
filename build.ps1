@@ -6,6 +6,10 @@ $ErrorActionPreference = "Stop"
 $Root = [System.IO.Path]::GetFullPath($PSScriptRoot)
 Set-Location $Root
 
+$CacheRoot = Join-Path $Root ".cache"
+New-Item -ItemType Directory -Force -Path $CacheRoot | Out-Null
+$env:UV_CACHE_DIR = Join-Path $CacheRoot "uv"
+
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     throw "uv не найден. Установите его: https://docs.astral.sh/uv/getting-started/installation/"
 }
