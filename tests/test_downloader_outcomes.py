@@ -91,6 +91,17 @@ class _RecordingHls:
         )
 
 
+class _AudioRecordingHls(_RecordingHls):
+    def __init__(self) -> None:
+        super().__init__()
+        self.merges = []
+
+    async def merge_audio_video(self, video, audio, destination, **_kwargs):
+        self.merges.append((video, audio, destination))
+        destination.write_bytes(b"merged")
+        return True, ""
+
+
 class _KinescopeFrame:
     url = "https://kinescope.io/embed/public-id"
 
@@ -415,6 +426,88 @@ def test_identity_sample_aes_master_passes_to_hls_downloader(monkeypatch, tmp_pa
     assert hls.calls[0][0] == "https://cdn.example/1080.m3u8?sign=abc"
     assert hls.calls[0][1]["session_key"].uri == "https://license.example/key"
     assert not any(event.error_code == "ENCRYPTED_PLAYLIST_UNSUPPORTED" for event in events)
+
+
+def test_master_audio_playlist_is_downloaded_and_merged_with_selected_video(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+    hls = _AudioRecordingHls()
+    gateway = PlaywrightDownloadGateway(None, hls)  # type: ignore[arg-type]
+    page = _Page(
+        player=True,
+        playlist=(
+            "https://cdn.example/master.m3u8?token=master",
+            "#EXTM3U\n"
+            '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="voice",URI="audio.m3u8?token=audio"\n'
+            '#EXT-X-STREAM-INF:RESOLUTION=640x360,AUDIO="voice"\n'
+            "video.m3u8?token=video\n",
+        ),
+    )
+
+    result = asyncio.run(
+        gateway._download_lesson(
+            _Browser(page),
+            _item(),
+            tmp_path / "Lesson",
+            "360",
+            lambda _: None,
+        )
+    )
+
+    assert result.status.value == "downloaded"
+    assert [call[0] for call in hls.calls] == [
+        "https://cdn.example/video.m3u8?token=video",
+        "https://cdn.example/audio.m3u8?token=audio",
+    ]
+    assert hls.merges == [
+        (
+            tmp_path / "Lesson.mp4",
+            tmp_path / "Lesson.audio.mp4",
+            tmp_path / "Lesson.merged.mp4",
+        )
+    ]
+
+
+def test_audio_failure_preserves_video_as_partial_not_completed_output(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+
+    class AudioFailureHls:
+        def __init__(self):
+            self.calls = []
+
+        async def download(self, playlist_url, output_stem, *_args, **_kwargs):
+            self.calls.append(playlist_url)
+            if "audio.m3u8" in playlist_url:
+                return HlsDownloadResult(HlsDownloadStatus.FAILED)
+            video = Path(f"{output_stem}_360.mp4")
+            video.write_bytes(b"video without audio")
+            return HlsDownloadResult(HlsDownloadStatus.DOWNLOADED, output_path=video)
+
+        async def probe_quality(self, _media):
+            return "360p"
+
+    hls = AudioFailureHls()
+    gateway = PlaywrightDownloadGateway(None, hls)  # type: ignore[arg-type]
+    page = _Page(
+        player=True,
+        playlist=(
+            "https://cdn.example/master.m3u8",
+            "#EXTM3U\n"
+            '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="voice",URI="audio.m3u8"\n'
+            '#EXT-X-STREAM-INF:RESOLUTION=640x360,AUDIO="voice"\n'
+            "video.m3u8\n",
+        ),
+    )
+
+    result = asyncio.run(
+        gateway._download_lesson(
+            _Browser(page), _item(), tmp_path / "Lesson", "360", lambda _: None
+        )
+    )
+
+    assert result.status.value == "failed"
+    assert (tmp_path / "Lesson_360.video-only.mp4").read_bytes() == b"video without audio"
+    assert not (tmp_path / "Lesson_360.mp4").exists()
+    assert not PlaywrightDownloadGateway._output_exists(tmp_path / "Lesson")
 
 
 def test_kinescope_master_available_after_initial_page_read_is_downloaded(monkeypatch, tmp_path):

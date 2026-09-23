@@ -130,6 +130,63 @@ def test_decrypt_fragments_streams_sources_and_places_key_before_input(monkeypat
     assert bytes(written) == b"initfragment"
 
 
+def test_decrypt_fragments_ignores_empty_saiz_without_changing_media_payload(monkeypatch, tmp_path):
+    def box(name: bytes, payload: bytes) -> bytes:
+        return (len(payload) + 8).to_bytes(4, "big") + name + payload
+
+    empty_saiz = box(b"saiz", b"\x00" * 9)
+    saio = box(b"saio", b"\x00" * 12)
+    senc = box(b"senc", b"\x00" * 4 + (2).to_bytes(4, "big"))
+    fragment = box(b"moof", box(b"traf", empty_saiz + saio + senc)) + box(b"mdat", empty_saiz)
+    expected = fragment.replace(b"saiz", b"free", 1)
+    init = tmp_path / "init.bin"
+    media = tmp_path / "fragment.bin"
+    init.write_bytes(b"init")
+    media.write_bytes(fragment)
+    written = bytearray()
+
+    class Stdin:
+        def write(self, data):
+            written.extend(data)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+        async def wait_closed(self):
+            return None
+
+    class Process:
+        returncode = 0
+        stdin = Stdin()
+
+        async def communicate(self):
+            return b"", b""
+
+        async def wait(self):
+            return 0
+
+    async def create_subprocess_exec(*_args, **_kwargs):
+        return Process()
+
+    paths = _paths(tmp_path)
+    paths.resources.mkdir()
+    (paths.resources / "ffmpeg.exe").write_bytes(b"")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+
+    success, message = asyncio.run(
+        FfmpegMuxer(paths).decrypt_fragments(
+            [init, media], tmp_path / "output.mp4", decryption_key_hex="00" * 16
+        )
+    )
+
+    assert (success, message) == (True, "")
+    assert bytes(written) == b"init" + expected
+    assert media.read_bytes() == fragment
+
+
 @pytest.mark.parametrize(
     ("version_output", "supported"),
     [

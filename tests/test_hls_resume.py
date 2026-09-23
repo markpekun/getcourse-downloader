@@ -14,6 +14,7 @@ from getcourse_downloader.infrastructure.media.hls import (
     _prepare_checkpoint,
     canonical_media_url,
     parse_key_tag,
+    parse_master_variants,
     parse_media_resources,
     parse_session_key,
 )
@@ -67,6 +68,21 @@ def test_parse_session_key_uses_master_url_for_relative_uri():
     assert key.uri == "https://cdn.example/key"
 
 
+def test_parse_master_variants_attaches_the_referenced_audio_playlist():
+    master = (
+        "#EXTM3U\n"
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="voice",URI="audio.m3u8?token=audio"\n'
+        '#EXT-X-STREAM-INF:RESOLUTION=640x360,AUDIO="voice"\n'
+        "video.m3u8?token=video\n"
+    )
+
+    variants = parse_master_variants(master, "https://cdn.example/master.m3u8?token=master")
+
+    assert len(variants) == 1
+    assert variants[0].url == "https://cdn.example/video.m3u8?token=video"
+    assert variants[0].audio_url == "https://cdn.example/audio.m3u8?token=audio"
+
+
 def test_parse_media_resources_orders_map_and_explicit_and_implicit_ranges():
     playlist = (
         "#EXTM3U\n"
@@ -87,6 +103,30 @@ def test_parse_media_resources_orders_map_and_explicit_and_implicit_ranges():
         ("media", 1001, 200),
     ]
     assert resources[0].url == "https://cdn.example/1080p.mp4?kcd=token"
+
+
+def test_parse_media_resources_keeps_each_map_before_its_fragments():
+    playlist = (
+        "#EXTM3U\n"
+        '#EXT-X-MAP:URI="init-a.mp4",BYTERANGE="10@0"\n'
+        "#EXT-X-BYTERANGE:20@10\npart-a.m4s\n"
+        "#EXT-X-DISCONTINUITY\n"
+        '#EXT-X-MAP:URI="init-b.mp4",BYTERANGE="30@0"\n'
+        "#EXT-X-BYTERANGE:40@30\npart-b.m4s\n"
+    )
+
+    resources = parse_media_resources(playlist, "https://cdn.example/media.m3u8")
+
+    assert [
+        (resource.role, resource.url, resource.byte_range.offset, resource.byte_range.length)
+        for resource in resources
+        if resource.byte_range is not None
+    ] == [
+        ("init", "https://cdn.example/init-a.mp4", 0, 10),
+        ("media", "https://cdn.example/part-a.m4s", 10, 20),
+        ("init", "https://cdn.example/init-b.mp4", 0, 30),
+        ("media", "https://cdn.example/part-b.m4s", 30, 40),
+    ]
 
 
 def test_parse_media_resources_rejects_implicit_first_range():
@@ -255,6 +295,84 @@ def test_kinescope_identity_key_is_requested_once_and_passed_to_ffmpeg(tmp_path)
     assert muxer.decrypt_source_bytes == [b"init", b"media"]
 
 
+def test_hls_requests_use_a_complete_browser_user_agent(tmp_path):
+    playlist_url = "https://cdn.example/media.m3u8"
+    segment_url = "https://cdn.example/segment.ts"
+    responses = {
+        playlist_url: _Response(text=f"#EXTM3U\n#EXTINF:1,\n{segment_url}\n"),
+        segment_url: _Response(content=b"media"),
+    }
+    captured: dict[str, object] = {}
+
+    def session_factory(**kwargs):
+        captured.update(kwargs)
+        return _Session(responses, [], **kwargs)
+
+    result, _ = _run(
+        HlsDownloader(_Muxer(), concurrency=1, session_factory=session_factory),
+        playlist_url,
+        tmp_path / "Lesson",
+    )
+
+    assert result.status is HlsDownloadStatus.DOWNLOADED
+    assert "Chrome/" in captured["headers"]["User-Agent"]  # type: ignore[index]
+    assert captured["headers"]["User-Agent"].endswith("Safari/537.36")  # type: ignore[index]
+
+
+def test_kinescope_binary_identity_key_is_passed_to_ffmpeg(tmp_path):
+    playlist_url = "https://cdn.example/media.m3u8"
+    key_url = "https://license.example/key"
+    segment_url = "https://cdn.example/segment.mp4"
+    key_data = b"\x80" + bytes(range(1, 16))
+    playlist = (
+        "#EXTM3U\n"
+        f'#EXT-X-KEY:METHOD=SAMPLE-AES,URI="{key_url}",KEYFORMAT="identity"\n'
+        f"#EXTINF:1,\n{segment_url}\n"
+    )
+    muxer = _Muxer()
+    responses = {
+        playlist_url: _Response(text=playlist),
+        key_url: _Response(content=key_data),
+        segment_url: _Response(content=b"media"),
+    }
+
+    result, _ = _run(
+        _downloader(responses, [], muxer=muxer),
+        playlist_url,
+        tmp_path / "Lesson",
+    )
+
+    assert result.status is HlsDownloadStatus.DOWNLOADED
+    assert muxer.decryption_keys == [key_data.hex()]
+
+
+def test_kinescope_identity_key_preserves_binary_whitespace_bytes(tmp_path):
+    playlist_url = "https://cdn.example/media.m3u8"
+    key_url = "https://license.example/key"
+    segment_url = "https://cdn.example/segment.mp4"
+    key_data = b" \t\n\r" + bytes(range(4, 16))
+    playlist = (
+        "#EXTM3U\n"
+        f'#EXT-X-KEY:METHOD=SAMPLE-AES,URI="{key_url}",KEYFORMAT="identity"\n'
+        f"#EXTINF:1,\n{segment_url}\n"
+    )
+    muxer = _Muxer()
+    responses = {
+        playlist_url: _Response(text=playlist),
+        key_url: _Response(content=key_data),
+        segment_url: _Response(content=b"media"),
+    }
+
+    result, _ = _run(
+        _downloader(responses, [], muxer=muxer),
+        playlist_url,
+        tmp_path / "Lesson",
+    )
+
+    assert result.status is HlsDownloadStatus.DOWNLOADED
+    assert muxer.decryption_keys == [key_data.hex()]
+
+
 def test_kinescope_key_http_403_reports_expired_access(tmp_path):
     playlist_url = "https://cdn.example/media.m3u8"
     key_url = "https://license.example/key"
@@ -308,6 +426,45 @@ def test_kinescope_stream_failure_uses_local_encrypted_file_without_redownload(t
     assert muxer.decrypt_file_sources == [b"initmedia"]
     assert requests.count(signed_mp4) == 2
     assert not _checkpoint_path(tmp_path / "Lesson.mp4").exists()
+
+
+def test_kinescope_file_fallback_ignores_empty_saiz_but_keeps_raw_checkpoint(tmp_path):
+    def box(name: bytes, payload: bytes) -> bytes:
+        return (len(payload) + 8).to_bytes(4, "big") + name + payload
+
+    empty_saiz = box(b"saiz", b"\x00" * 9)
+    fragment = box(
+        b"moof",
+        box(
+            b"traf",
+            empty_saiz
+            + box(b"saio", b"\x00" * 12)
+            + box(b"senc", b"\x00" * 4 + (2).to_bytes(4, "big")),
+        ),
+    )
+    init = b"init"
+    playlist_url = "https://cdn.example/media.m3u8"
+    key_url = "https://license.example/key"
+    mp4_url = "https://cdn.example/audio.mp4"
+    playlist = (
+        "#EXTM3U\n"
+        f'#EXT-X-MAP:URI="{mp4_url}",BYTERANGE="{len(init)}@0"\n'
+        f'#EXT-X-KEY:METHOD=SAMPLE-AES,URI="{key_url}"\n'
+        f"#EXT-X-BYTERANGE:{len(fragment)}@{len(init)}\n{mp4_url}\n"
+    )
+    muxer = _Muxer(decrypt_succeeds=False, decrypt_file_succeeds=False)
+    responses = {
+        playlist_url: _Response(text=playlist),
+        key_url: _Response(content=b"ml1C_JjWlcjeDEo="),
+        mp4_url: _Response(content=init + fragment),
+    }
+
+    result, _ = _run(_downloader(responses, [], muxer=muxer), playlist_url, tmp_path / "Lesson")
+
+    assert result.status is HlsDownloadStatus.FAILED
+    assert muxer.decrypt_file_sources == [init + fragment.replace(b"saiz", b"free", 1)]
+    checkpoint = _checkpoint_path(tmp_path / "Lesson.mp4")
+    assert (checkpoint / "segments" / "000001.bin").read_bytes() == fragment
 
 
 def test_kinescope_ranges_send_exact_inclusive_http_headers(tmp_path):
@@ -382,7 +539,7 @@ def test_failed_kinescope_checkpoint_contains_no_key_or_signed_query(tmp_path):
 
 @pytest.mark.parametrize(
     "key",
-    [b"", b"x" * 15, b"x" * 17, b"\xff" * 16, b"<html>key unavailable</html>"],
+    [b"", b"x" * 15, b"x" * 17, b"<html>key unavailable</html>"],
 )
 def test_invalid_sample_aes_key_never_commits_segment(tmp_path, key):
     url = "https://cdn/list.m3u8"

@@ -6,10 +6,56 @@ import json
 import os
 import re
 import shutil
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 from getcourse_downloader.infrastructure.platform.paths import AppPaths
+
+
+def _mp4_boxes(data: bytes, start: int, end: int) -> Iterator[tuple[bytes, int, int, int]]:
+    position = start
+    while position + 8 <= end:
+        size = int.from_bytes(data[position : position + 4], "big")
+        header_size = 8
+        if size == 1:
+            if position + 16 > end:
+                return
+            size = int.from_bytes(data[position + 8 : position + 16], "big")
+            header_size = 16
+        elif size == 0:
+            size = end - position
+        if size < header_size or position + size > end:
+            return
+        yield data[position + 4 : position + 8], position, position + header_size, position + size
+        position += size
+
+
+def normalize_empty_saiz(data: bytes) -> bytes:
+    """Hide empty auxiliary-size boxes that FFmpeg rejects before reading cbcs samples."""
+
+    changed: bytearray | None = None
+    for kind, _, moof_content, moof_end in _mp4_boxes(data, 0, len(data)):
+        if kind != b"moof":
+            continue
+        for child_kind, _, traf_content, traf_end in _mp4_boxes(data, moof_content, moof_end):
+            if child_kind != b"traf":
+                continue
+            children = list(_mp4_boxes(data, traf_content, traf_end))
+            has_saio = any(box_kind == b"saio" for box_kind, *_ in children)
+            has_samples = any(
+                box_kind == b"senc"
+                and box_end - content >= 8
+                and int.from_bytes(data[content + 4 : content + 8], "big") > 0
+                for box_kind, _, content, box_end in children
+            )
+            if not (has_saio and has_samples):
+                continue
+            for box_kind, box_start, content, box_end in children:
+                if box_kind == b"saiz" and data[content:box_end] == b"\x00" * 9:
+                    if changed is None:
+                        changed = bytearray(data)
+                    changed[box_start + 4 : box_start + 8] = b"free"
+    return bytes(changed) if changed is not None else data
 
 
 def _supports_sample_aes(version_output: str) -> bool:
@@ -129,6 +175,34 @@ class FfmpegMuxer:
             redactions=(decryption_key_hex,),
         )
 
+    async def merge_audio_video(
+        self,
+        video: Path,
+        audio: Path,
+        destination: Path,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[bool, str]:
+        return await self._run_mux(
+            (
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                str(video),
+                "-i",
+                str(audio),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c",
+                "copy",
+                str(destination),
+            ),
+            is_cancelled=is_cancelled,
+        )
+
     async def decrypt_fragments(
         self,
         sources: Sequence[Path],
@@ -163,12 +237,12 @@ class FfmpegMuxer:
             if process.stdin is None:
                 return False, "ffmpeg stdin недоступен"
             for source_path in sources:
-                with source_path.open("rb") as source:
-                    while chunk := source.read(1024 * 1024):
-                        if is_cancelled and is_cancelled():
-                            return False, "cancelled"
-                        process.stdin.write(chunk)
-                        await process.stdin.drain()
+                data = normalize_empty_saiz(source_path.read_bytes())
+                for offset in range(0, len(data), 1024 * 1024):
+                    if is_cancelled and is_cancelled():
+                        return False, "cancelled"
+                    process.stdin.write(data[offset : offset + 1024 * 1024])
+                    await process.stdin.drain()
             process.stdin.close()
             wait_closed = getattr(process.stdin, "wait_closed", None)
             if wait_closed is not None:

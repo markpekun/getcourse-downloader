@@ -18,7 +18,7 @@ import aiohttp
 
 from getcourse_downloader.application.ports.download import EventHandler
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
-from getcourse_downloader.infrastructure.media.ffmpeg import FfmpegMuxer
+from getcourse_downloader.infrastructure.media.ffmpeg import FfmpegMuxer, normalize_empty_saiz
 from getcourse_downloader.infrastructure.storage.filenames import (
     existing_output_path,
     quality_suffixed_path,
@@ -77,6 +77,7 @@ class HlsVariant:
     url: str
     height: int = 0
     bandwidth: int = 0
+    audio_url: str = ""
 
 
 class HlsKeyError(ValueError):
@@ -184,8 +185,8 @@ def _parse_byte_range(value: str, *, implicit_offset: int | None) -> HlsByteRang
 def parse_media_resources(playlist: str, playlist_url: str) -> tuple[HlsMediaResource, ...]:
     """Return the exact init/media byte sequence represented by an HLS playlist."""
 
-    media: list[HlsMediaResource] = []
-    init: HlsMediaResource | None = None
+    resources: list[HlsMediaResource] = []
+    pending_init: HlsMediaResource | None = None
     pending_range: str | None = None
     next_offset_by_url: dict[str, int] = {}
     for raw_line in playlist.splitlines():
@@ -202,7 +203,7 @@ def parse_media_resources(playlist: str, playlist_url: str) -> tuple[HlsMediaRes
             byte_range = (
                 _parse_byte_range(value, implicit_offset=None) if value is not None else None
             )
-            init = HlsMediaResource(url, byte_range, "init")
+            pending_init = HlsMediaResource(url, byte_range, "init")
             continue
         if line.startswith("#EXT-X-BYTERANGE:"):
             pending_range = line.split(":", 1)[1]
@@ -220,22 +221,26 @@ def parse_media_resources(playlist: str, playlist_url: str) -> tuple[HlsMediaRes
             )
             next_offset_by_url[url] = byte_range.offset + byte_range.length
             pending_range = None
-        media.append(HlsMediaResource(url, byte_range, "media"))
+        if pending_init is not None:
+            init_parts = urlsplit(pending_init.url)
+            media_parts = urlsplit(url)
+            if not init_parts.query and (
+                init_parts.scheme,
+                init_parts.netloc,
+                init_parts.path,
+            ) == (
+                media_parts.scheme,
+                media_parts.netloc,
+                media_parts.path,
+            ):
+                pending_init = HlsMediaResource(url, pending_init.byte_range, "init")
+            resources.append(pending_init)
+            pending_init = None
+        resources.append(HlsMediaResource(url, byte_range, "media"))
 
     if pending_range is not None:
         raise HlsKeyError("HLS byte range has no media URI")
-    if init is None:
-        return tuple(media)
-    if media:
-        init_parts = urlsplit(init.url)
-        first_parts = urlsplit(media[0].url)
-        if not init_parts.query and (init_parts.scheme, init_parts.netloc, init_parts.path) == (
-            first_parts.scheme,
-            first_parts.netloc,
-            first_parts.path,
-        ):
-            init = HlsMediaResource(media[0].url, init.byte_range, "init")
-    return (init, *media)
+    return tuple(resources)
 
 
 def has_unsupported_hls_encryption(text: str) -> str | None:
@@ -260,24 +265,45 @@ def has_unsupported_hls_encryption(text: str) -> str | None:
 
 
 def parse_master_variants(text: str, master_url: str) -> tuple[HlsVariant, ...]:
+    audio_groups: dict[str, str] = {}
+    for raw_line in text.strip().splitlines():
+        line = raw_line.strip()
+        if not line.startswith("#EXT-X-MEDIA:"):
+            continue
+        try:
+            audio_attributes = _hls_attributes(line.split(":", 1)[1])
+        except HlsKeyError:
+            continue
+        if audio_attributes.get("TYPE", "").upper() != "AUDIO":
+            continue
+        group_id = audio_attributes.get("GROUP-ID")
+        uri = audio_attributes.get("URI")
+        if group_id and uri:
+            audio_groups[group_id] = urljoin(master_url, uri)
+
     variants: list[HlsVariant] = []
-    attributes: str | None = None
+    stream_attributes: str | None = None
     for raw_line in text.strip().splitlines():
         line = raw_line.strip()
         if line.startswith("#EXT-X-STREAM-INF:"):
-            attributes = line
-        elif line and not line.startswith("#") and attributes is not None:
+            stream_attributes = line
+        elif line and not line.startswith("#") and stream_attributes is not None:
             absolute_url = urljoin(master_url, line)
-            resolution = re.search(r"(?:[:,])RESOLUTION=\d+x(\d+)", attributes)
-            bandwidth = re.search(r"(?:[:,])BANDWIDTH=(\d+)", attributes)
+            resolution = re.search(r"(?:[:,])RESOLUTION=\d+x(\d+)", stream_attributes)
+            bandwidth = re.search(r"(?:[:,])BANDWIDTH=(\d+)", stream_attributes)
+            try:
+                audio_group = _hls_attributes(stream_attributes.split(":", 1)[1]).get("AUDIO", "")
+            except HlsKeyError:
+                audio_group = ""
             variants.append(
                 HlsVariant(
                     absolute_url,
                     int(resolution.group(1)) if resolution else extract_quality(absolute_url),
                     int(bandwidth.group(1)) if bandwidth else 0,
+                    audio_groups.get(audio_group, ""),
                 )
             )
-            attributes = None
+            stream_attributes = None
     return tuple(variants)
 
 
@@ -324,14 +350,20 @@ def select_quality_url(qualities: dict[int, str], quality: str) -> str | None:
 
 
 def select_stream_playlist_url(text: str, playlist_url: str, quality: str) -> str | None:
+    variant = select_stream_variant(text, playlist_url, quality)
+    return variant.url if variant is not None else None
+
+
+def select_stream_variant(text: str, playlist_url: str, quality: str) -> HlsVariant | None:
     if is_hls_master_playlist(text):
-        qualities = parse_master_playlist(text, playlist_url)
-        if qualities:
-            return select_quality_url(qualities, quality)
         variants = parse_master_variants(text, playlist_url)
-        return max(variants, key=lambda variant: variant.bandwidth).url if variants else None
+        qualities = {variant.height: variant.url for variant in variants if variant.height > 0}
+        if qualities:
+            selected_url = select_quality_url(qualities, quality)
+            return next((variant for variant in variants if variant.url == selected_url), None)
+        return max(variants, key=lambda variant: variant.bandwidth) if variants else None
     if is_hls_playlist(text):
-        return playlist_url
+        return HlsVariant(playlist_url)
     return None
 
 
@@ -502,6 +534,21 @@ class HlsDownloader:
                 return f"{height}p"
         return fallback
 
+    async def merge_audio_video(
+        self,
+        video: Path,
+        audio: Path,
+        destination: Path,
+        *,
+        is_cancelled: Callable[[], bool] | None = None,
+    ) -> tuple[bool, str]:
+        return await self._muxer.merge_audio_video(
+            video,
+            audio,
+            destination,
+            is_cancelled=is_cancelled,
+        )
+
     async def download(
         self,
         playlist_url: str,
@@ -571,7 +618,10 @@ class HlsDownloader:
         parts = urlsplit(playlist_url)
         request_referer = referer_url or lesson_url or f"{parts.scheme}://{parts.netloc}/"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+            ),
             "Referer": request_referer,
         }
         referer_parts = urlsplit(request_referer)
@@ -709,13 +759,9 @@ class HlsDownloader:
                 try:
                     async with session.get(key_declaration.uri) as response:
                         response.raise_for_status()
-                        key_data = (await response.read()).strip(b" \t\r\n")
+                        key_data = await response.read()
                     if len(key_data) != 16:
                         raise HlsKeyError("сервер ключа вернул не 16 байт")
-                    try:
-                        key_data.decode("ascii")
-                    except UnicodeDecodeError as error:
-                        raise HlsKeyError("сервер ключа вернул не ASCII") from error
                     decryption_key_hex = key_data.hex()
                 except HlsKeyError as error:
                     emit(
@@ -916,8 +962,7 @@ class HlsDownloader:
                 temporary_encrypted = checkpoint / "video.enc.mp4.tmp"
                 with temporary_encrypted.open("wb") as destination:
                     for segment_path in segment_paths:
-                        with segment_path.open("rb") as source:
-                            shutil.copyfileobj(source, destination, length=1024 * 1024)
+                        destination.write(normalize_empty_saiz(segment_path.read_bytes()))
                 os.replace(temporary_encrypted, encrypted_mp4)
                 success, error_message = await self._muxer.decrypt_file(
                     encrypted_mp4,

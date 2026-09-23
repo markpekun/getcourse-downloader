@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import threading
 import time
 from collections.abc import Iterable
@@ -36,6 +37,7 @@ from getcourse_downloader.infrastructure.media.hls import (
     parse_master_variants,
     parse_session_key,
     select_stream_playlist_url,
+    select_stream_variant,
 )
 from getcourse_downloader.infrastructure.storage.download_catalog import (
     DownloadedMedia,
@@ -76,6 +78,7 @@ class _Playlist:
     text: str
     referer_url: str = ""
     session_key: HlsKeyDeclaration | None = None
+    audio_url: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +178,11 @@ class PlaywrightDownloadGateway:
     @staticmethod
     def _output_exists(stem: Path) -> bool:
         return existing_output_path(stem) is not None
+
+    @staticmethod
+    def _preserve_video_without_audio(video: Path) -> None:
+        if video.is_file():
+            os.replace(video, video.with_name(f"{video.stem}.video-only.mp4"))
 
     @staticmethod
     def _output_stems(request: DownloadRequest) -> list[Path]:
@@ -683,6 +691,58 @@ class PlaywrightDownloadGateway:
                 download_results.append(result)
                 if result.status is HlsDownloadStatus.CANCELLED or self._cancelled.is_set():
                     return _LessonResult(_LessonStatus.CANCELLED)
+                if result.status is HlsDownloadStatus.FAILED or not playlist.audio_url:
+                    continue
+                if result.output_path is None:
+                    continue
+                audio_result = await self._hls.download(
+                    playlist.audio_url,
+                    output.with_name(f"{output.name}.audio"),
+                    item.lesson.title,
+                    emit,
+                    lesson_url=item.lesson.url,
+                    referer_url=playlist.referer_url,
+                    course_path=item.course_path,
+                    requested_quality=quality,
+                    video_index=video_index,
+                    video_total=len(selected),
+                    session_key=playlist.session_key,
+                    is_cancelled=self._cancelled.is_set,
+                )
+                if audio_result.status is HlsDownloadStatus.CANCELLED or self._cancelled.is_set():
+                    self._preserve_video_without_audio(result.output_path)
+                    return _LessonResult(_LessonStatus.CANCELLED)
+                if (
+                    audio_result.status is HlsDownloadStatus.FAILED
+                    or audio_result.output_path is None
+                ):
+                    self._preserve_video_without_audio(result.output_path)
+                    return _LessonResult(_LessonStatus.FAILED)
+                merged_output = result.output_path.with_name(
+                    f"{result.output_path.stem}.merged.mp4"
+                )
+                merged, error_message = await self._hls.merge_audio_video(
+                    result.output_path,
+                    audio_result.output_path,
+                    merged_output,
+                    is_cancelled=self._cancelled.is_set,
+                )
+                if not merged:
+                    self._preserve_video_without_audio(result.output_path)
+                    audio_result.output_path.unlink(missing_ok=True)
+                    emit(
+                        self._event(
+                            item,
+                            DownloadEventType.ERROR,
+                            f"Не удалось объединить видео и звук: {error_message}",
+                            stage="ffmpeg",
+                            level="error",
+                            error_code="FFMPEG_FAILED",
+                        )
+                    )
+                    return _LessonResult(_LessonStatus.FAILED)
+                os.replace(merged_output, result.output_path)
+                audio_result.output_path.unlink(missing_ok=True)
 
             statuses = [result.status for result in download_results]
             if any(status is HlsDownloadStatus.FAILED for status in statuses):
@@ -724,12 +784,18 @@ class PlaywrightDownloadGateway:
                 canonical_media_url(variant.url)
                 for variant in parse_master_variants(playlist.text, playlist.url)
             )
-            selected_url = select_stream_playlist_url(playlist.text, playlist.url, quality)
-            if selected_url:
-                key = canonical_media_url(selected_url)
+            selected_variant = select_stream_variant(playlist.text, playlist.url, quality)
+            if selected_variant:
+                key = canonical_media_url(selected_variant.url)
                 selected.setdefault(
                     key,
-                    _Playlist(selected_url, "", playlist.referer_url, session_key),
+                    _Playlist(
+                        selected_variant.url,
+                        "",
+                        playlist.referer_url,
+                        session_key,
+                        selected_variant.audio_url,
+                    ),
                 )
 
         for playlist in candidates:
