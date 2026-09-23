@@ -77,7 +77,7 @@ class _WindowsProcessJob:
         if os.name != "nt":
             return None
         try:
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
             kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
             kernel32.CreateJobObjectW.restype = wintypes.HANDLE
             kernel32.SetInformationJobObject.argtypes = [

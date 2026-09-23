@@ -130,7 +130,7 @@ jobs:
         with:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
-          body_path: docs/RELEASE_NOTES_v3.2.0-beta.1.md
+          body_path: docs/RELEASE_NOTES_v4.0.md
           files: |
             dist/GetCourseVideoDownloader-win-x64.zip
             dist/GetCourseVideoDownloader-win-x64.zip.sha256
