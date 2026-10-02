@@ -17,13 +17,25 @@ from playwright.async_api import async_playwright
 
 from getcourse_downloader.application.ports.download import EventHandler
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
-from getcourse_downloader.domain.models import DownloadRequest, DownloadSummary, SelectedLesson
+from getcourse_downloader.domain.models import (
+    DownloadRequest,
+    DownloadSummary,
+    MediaKind,
+    MediaSelection,
+    SelectedLesson,
+)
 from getcourse_downloader.infrastructure.browser.playwright import PlaywrightBrowserFactory
 from getcourse_downloader.infrastructure.getcourse.authentication import is_authentication_url
 from getcourse_downloader.infrastructure.getcourse.video_signals import (
     VIDEO_PLAYER_SELECTOR,
     extract_hls_urls,
     stream_manifest_kind,
+)
+from getcourse_downloader.infrastructure.media.audio import (
+    AudioSource,
+    DirectAudioDownloader,
+    DirectAudioDownloadStatus,
+    extract_audio_sources,
 )
 from getcourse_downloader.infrastructure.media.hls import (
     HlsDownloader,
@@ -46,6 +58,7 @@ from getcourse_downloader.infrastructure.storage.filenames import (
     collision_safe_stem,
     existing_output_path,
     safe_lesson_output_stem,
+    sanitize_filename,
 )
 
 PLAYLIST_WAIT_SECONDS = 30.0
@@ -93,17 +106,25 @@ class PlaywrightDownloadGateway:
         browsers: PlaywrightBrowserFactory,
         hls: HlsDownloader,
         catalog: JsonDownloadCatalog | None = None,
+        audio: DirectAudioDownloader | None = None,
     ) -> None:
         self._browsers = browsers
         self._hls = hls
         self._catalog = catalog
+        self._audio = audio or DirectAudioDownloader()
         self._cancelled = threading.Event()
         self._authentication_continued = threading.Event()
+        self._cancellation_lock = threading.Lock()
+        self._cancellation_loop: asyncio.AbstractEventLoop | None = None
+        self._cancellation_signal: asyncio.Event | None = None
 
     def run(self, request: DownloadRequest, on_event: EventHandler) -> DownloadSummary:
         try:
             return asyncio.run(self._run_async(request, on_event))
         finally:
+            with self._cancellation_lock:
+                self._cancellation_loop = None
+                self._cancellation_signal = None
             self._cancelled.clear()
             self._authentication_continued.clear()
 
@@ -113,6 +134,11 @@ class PlaywrightDownloadGateway:
     def cancel(self) -> None:
         self._cancelled.set()
         self._authentication_continued.set()
+        with self._cancellation_lock:
+            loop = self._cancellation_loop
+            signal = self._cancellation_signal
+        if loop is not None and signal is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(signal.set)
 
     def shutdown(self, timeout: float = 6.0) -> None:
         del timeout
@@ -129,6 +155,12 @@ class PlaywrightDownloadGateway:
         quality: str = "",
         error_code: str = "",
         source_host: str = "",
+        media_kind: MediaKind | None = None,
+        media_title: str = "",
+        media_index: int | None = None,
+        media_total: int | None = None,
+        current: int | None = None,
+        total: int | None = None,
     ) -> DownloadEvent:
         return DownloadEvent(
             event_type,
@@ -141,6 +173,12 @@ class PlaywrightDownloadGateway:
             level=level,
             error_code=error_code,
             source_host=source_host,
+            media_kind=media_kind.value if media_kind else "",
+            media_title=media_title,
+            media_index=media_index,
+            media_total=media_total,
+            current=current,
+            total=total,
         )
 
     @staticmethod
@@ -220,6 +258,13 @@ class PlaywrightDownloadGateway:
         return stems
 
     async def _run_async(self, request: DownloadRequest, emit: EventHandler) -> DownloadSummary:
+        cancellation_signal = asyncio.Event()
+        with self._cancellation_lock:
+            self._cancellation_loop = asyncio.get_running_loop()
+            self._cancellation_signal = cancellation_signal
+            already_cancelled = self._cancelled.is_set()
+        if already_cancelled:
+            cancellation_signal.set()
         downloaded = 0
         already_present = 0
         no_video = 0
@@ -240,7 +285,11 @@ class PlaywrightDownloadGateway:
                 if self._cancelled.is_set():
                     cancelled = len(request.lessons) - index
                     break
-                existing = await self._existing_result(item, output_stems[index])
+                existing = (
+                    await self._existing_result(item, output_stems[index])
+                    if request.media_selection == MediaSelection.video_only()
+                    else None
+                )
                 if existing is None:
                     pending.append(index)
                     continue
@@ -273,11 +322,12 @@ class PlaywrightDownloadGateway:
                     result = _LessonResult(_LessonStatus.FAILED)
                     for authentication_attempt in range(2):
                         try:
-                            result = await self._download_lesson(
+                            result = await self._download_selected_lesson(
                                 browser,
                                 item,
                                 output_stems[index],
                                 request.quality.value,
+                                request.media_selection,
                                 emit,
                             )
                             break
@@ -341,15 +391,32 @@ class PlaywrightDownloadGateway:
                             self._catalog.save(item.lesson.url, output_stems[index], result.media)
                     elif result.status is _LessonStatus.NO_VIDEO:
                         no_video += 1
+                        if request.media_selection == MediaSelection.audio_only():
+                            event_type = DownloadEventType.LESSON_NO_MEDIA
+                            message = f"На странице урока не найдено аудио: {item.lesson.title}"
+                            error_code = "AUDIO_NOT_FOUND"
+                        elif request.media_selection == MediaSelection.video_and_audio():
+                            event_type = DownloadEventType.LESSON_NO_MEDIA
+                            message = (
+                                "На странице урока не найдены выбранные материалы: "
+                                f"{item.lesson.title}"
+                            )
+                            error_code = "MEDIA_NOT_FOUND"
+                        else:
+                            event_type = DownloadEventType.LESSON_NO_VIDEO
+                            message = (
+                                "На странице урока не найден поддерживаемый видеоплеер: "
+                                f"{item.lesson.title}"
+                            )
+                            error_code = "VIDEO_NOT_FOUND"
                         emit(
                             self._event(
                                 item,
-                                DownloadEventType.LESSON_NO_VIDEO,
-                                "На странице урока не найден поддерживаемый видеоплеер: "
-                                f"{item.lesson.title}",
+                                event_type,
+                                message,
                                 stage="player",
                                 level="warning",
-                                error_code="VIDEO_NOT_FOUND",
+                                error_code=error_code,
                             )
                         )
                     elif result.status is _LessonStatus.CANCELLED:
@@ -474,6 +541,36 @@ class PlaywrightDownloadGateway:
         )
         return await self._browsers.launch(playwright, headless=True)
 
+    async def _download_selected_lesson(
+        self,
+        browser,
+        item: SelectedLesson,
+        output_stem: Path,
+        quality: str,
+        selection: MediaSelection,
+        emit: EventHandler,
+    ) -> _LessonResult:
+        results: list[_LessonResult] = []
+        if selection.includes(MediaKind.VIDEO):
+            results.append(await self._download_lesson(browser, item, output_stem, quality, emit))
+        if any(result.status is _LessonStatus.CANCELLED for result in results):
+            return _LessonResult(_LessonStatus.CANCELLED)
+        if selection.includes(MediaKind.AUDIO):
+            results.append(await self._download_audio_lesson(browser, item, output_stem, emit))
+        if any(result.status is _LessonStatus.CANCELLED for result in results):
+            return _LessonResult(_LessonStatus.CANCELLED)
+
+        media = tuple(media for result in results for media in result.media)
+        if self._catalog and media:
+            self._catalog.save(item.lesson.url, output_stem, media)
+        if any(result.status is _LessonStatus.FAILED for result in results):
+            return _LessonResult(_LessonStatus.FAILED, media)
+        if any(result.status is _LessonStatus.DOWNLOADED for result in results):
+            return _LessonResult(_LessonStatus.DOWNLOADED, media)
+        if results and all(result.status is _LessonStatus.SKIPPED for result in results):
+            return _LessonResult(_LessonStatus.SKIPPED, media)
+        return _LessonResult(_LessonStatus.NO_VIDEO)
+
     async def _download_lesson(
         self,
         browser,
@@ -529,6 +626,28 @@ class PlaywrightDownloadGateway:
 
         page.on("response", schedule_response)
 
+        async def collect_playlists() -> None:
+            nonlocal last_playlist_at
+            embedded = await self._read_embedded_playlists(page)
+            for playlist in embedded:
+                playlists.setdefault(playlist.url, playlist)
+            if embedded:
+                last_playlist_at = time.monotonic()
+            started_at = time.monotonic()
+            while time.monotonic() - started_at < PLAYLIST_WAIT_SECONDS:
+                if self._cancelled.is_set():
+                    return
+                if playlists and time.monotonic() - last_playlist_at >= PLAYLIST_QUIET_SECONDS:
+                    break
+                await asyncio.sleep(0.25)
+
+            if response_tasks:
+                await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
+
+            if not playlists:
+                for playlist in await self._read_embedded_playlists(page):
+                    playlists.setdefault(playlist.url, playlist)
+
         try:
             if not await self._open_page(
                 page,
@@ -542,25 +661,30 @@ class PlaywrightDownloadGateway:
                 raise _AuthenticationExpired
 
             player_present = await self._has_supported_player(page)
-            embedded = await self._read_embedded_playlists(page)
-            for playlist in embedded:
-                playlists.setdefault(playlist.url, playlist)
-            if embedded:
-                last_playlist_at = time.monotonic()
-            started_at = time.monotonic()
-            while time.monotonic() - started_at < PLAYLIST_WAIT_SECONDS:
+            await collect_playlists()
+            if self._cancelled.is_set():
+                return _LessonResult(_LessonStatus.CANCELLED)
+
+            player_present = player_present or await self._has_supported_player(page)
+            dash_observed = any(item.kind == "dash" for item in observed_manifests)
+            if not playlists and player_present and not dash_observed:
+                emit(
+                    self._event(
+                        item,
+                        DownloadEventType.LOG,
+                        "Видеопоток пока не получен, повторно открываю урок",
+                        stage="playlist_retry",
+                    )
+                )
+                if not await self._open_page(
+                    page, item.lesson.url, "страницу урока", emit, item=item
+                ):
+                    return _LessonResult(_LessonStatus.CANCELLED)
+                if await self._authentication_required(page):
+                    raise _AuthenticationExpired
+                await collect_playlists()
                 if self._cancelled.is_set():
                     return _LessonResult(_LessonStatus.CANCELLED)
-                if playlists and time.monotonic() - last_playlist_at >= PLAYLIST_QUIET_SECONDS:
-                    break
-                await asyncio.sleep(0.25)
-
-            if response_tasks:
-                await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
-
-            if not playlists:
-                for playlist in await self._read_embedded_playlists(page):
-                    playlists.setdefault(playlist.url, playlist)
 
             if not playlists:
                 player_present = player_present or await self._has_supported_player(page)
@@ -679,6 +803,7 @@ class PlaywrightDownloadGateway:
                     video_total=len(selected),
                     session_key=playlist.session_key,
                     is_cancelled=self._cancelled.is_set,
+                    cancellation_event=self._cancellation_signal,
                 )
                 download_results.append(result)
                 if result.status is HlsDownloadStatus.CANCELLED or self._cancelled.is_set():
@@ -702,6 +827,122 @@ class PlaywrightDownloadGateway:
                 await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
             with contextlib.suppress(PlaywrightError):
                 await page.close()
+
+    async def _download_audio_lesson(
+        self,
+        browser,
+        item: SelectedLesson,
+        output_stem: Path,
+        emit: EventHandler,
+    ) -> _LessonResult:
+        if self._catalog:
+            catalogued = self._catalog.find(item.lesson.url, output_stem, MediaKind.AUDIO)
+            if catalogued:
+                return _LessonResult(_LessonStatus.SKIPPED, catalogued)
+
+        page = await browser.new_page()
+        try:
+            if not await self._open_page(page, item.lesson.url, "страницу урока", emit, item=item):
+                return _LessonResult(_LessonStatus.CANCELLED)
+            if await self._authentication_required(page):
+                raise _AuthenticationExpired
+            sources = extract_audio_sources(await page.content(), page.url)
+            if not sources:
+                return _LessonResult(_LessonStatus.NO_VIDEO)
+
+            media: list[DownloadedMedia] = []
+            statuses: list[DirectAudioDownloadStatus] = []
+            for index, source in enumerate(sources, start=1):
+                if self._cancelled.is_set():
+                    return _LessonResult(_LessonStatus.CANCELLED)
+                output_path = self._audio_output_path(output_stem, source, index, len(sources))
+                emit(
+                    self._event(
+                        item,
+                        DownloadEventType.MEDIA_FOUND,
+                        "Найдено аудио "
+                        f"{index} из {len(sources)}: {source.title or f'аудиозапись {index}'}",
+                        stage="audio",
+                        media_kind=MediaKind.AUDIO,
+                        media_title=source.title,
+                        media_index=index,
+                        media_total=len(sources),
+                    )
+                )
+
+                def on_progress(
+                    current: int,
+                    total: int | None,
+                    current_source: AudioSource = source,
+                    current_index: int = index,
+                ) -> None:
+                    emit(
+                        self._event(
+                            item,
+                            DownloadEventType.PROGRESS,
+                            f"Скачивание аудио {current_index} из {len(sources)}",
+                            stage="audio",
+                            media_kind=MediaKind.AUDIO,
+                            media_title=current_source.title,
+                            media_index=current_index,
+                            media_total=len(sources),
+                            current=current,
+                            total=total,
+                        )
+                    )
+
+                result = await self._audio.download(
+                    source.url,
+                    output_path,
+                    is_cancelled=self._cancelled.is_set,
+                    cancellation_event=self._cancellation_signal,
+                    on_progress=on_progress,
+                )
+                statuses.append(result.status)
+                if result.status is DirectAudioDownloadStatus.CANCELLED:
+                    return _LessonResult(_LessonStatus.CANCELLED)
+                if result.status is DirectAudioDownloadStatus.FAILED:
+                    emit(
+                        self._event(
+                            item,
+                            DownloadEventType.ERROR,
+                            result.error_message or "Не удалось скачать аудиофайл",
+                            stage="audio",
+                            level="error",
+                            error_code=result.error_code or "AUDIO_DOWNLOAD_FAILED",
+                            media_kind=MediaKind.AUDIO,
+                            media_title=source.title,
+                            media_index=index,
+                            media_total=len(sources),
+                        )
+                    )
+                    continue
+                if result.output_path is not None:
+                    media.append(DownloadedMedia(result.output_path, kind=MediaKind.AUDIO))
+
+            if any(status is DirectAudioDownloadStatus.FAILED for status in statuses):
+                return _LessonResult(_LessonStatus.FAILED, tuple(media))
+            if all(status is DirectAudioDownloadStatus.ALREADY_PRESENT for status in statuses):
+                return _LessonResult(_LessonStatus.SKIPPED, tuple(media))
+            return _LessonResult(_LessonStatus.DOWNLOADED, tuple(media))
+        finally:
+            with contextlib.suppress(PlaywrightError):
+                await page.close()
+
+    @staticmethod
+    def _audio_output_path(
+        output_stem: Path,
+        source: AudioSource,
+        index: int,
+        total: int,
+    ) -> Path:
+        extension = Path(urlsplit(source.url).path).suffix.casefold()
+        if extension not in {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav"}:
+            extension = ".audio"
+        if total == 1:
+            return output_stem.with_suffix(extension)
+        label = sanitize_filename(source.title, fallback=f"audio_{index}", max_length=50)
+        return output_stem.with_name(f"{output_stem.name} — {label}").with_suffix(extension)
 
     @staticmethod
     def _select_playlist_urls(playlists: Iterable[_Playlist], quality: str) -> list[str]:

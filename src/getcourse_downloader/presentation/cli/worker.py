@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import sys
 import threading
-import time
 import traceback
 from collections.abc import Sequence
 from dataclasses import replace
@@ -59,9 +60,13 @@ class DiagnosticEventSink:
 
 
 class WorkerCommandListener:
-    def __init__(self, path: Path, gateway: PlaywrightDownloadGateway) -> None:
-        self._path = path
+    def __init__(
+        self,
+        gateway: PlaywrightDownloadGateway,
+        command_stream,
+    ) -> None:
         self._gateway = gateway
+        self._command_stream = command_stream
         self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._run, name="worker-commands", daemon=True)
 
@@ -70,32 +75,36 @@ class WorkerCommandListener:
 
     def stop(self) -> None:
         self._stopped.set()
+        if self._command_stream is not None:
+            with contextlib.suppress(OSError):
+                self._command_stream.close()
         self._thread.join(timeout=1)
 
     def _run(self) -> None:
         try:
-            with self._path.open("rb") as stream:
-                pending = b""
-                while not self._stopped.is_set():
-                    chunk = stream.readline()
-                    if not chunk:
-                        time.sleep(0.05)
-                        continue
-                    pending += chunk
-                    if not pending.endswith(b"\n"):
-                        continue
-                    line, pending = pending, b""
-                    try:
-                        payload = json.loads(line)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-                    command = payload.get("command") if isinstance(payload, dict) else None
-                    if command == "cancel":
-                        self._gateway.cancel()
-                    elif command == "continue_authentication":
-                        self._gateway.continue_authentication()
-        except OSError:
+            self._read_commands(self._command_stream)
+        except (OSError, ValueError):
             return
+
+    def _read_commands(self, stream) -> None:
+        pending = b""
+        while not self._stopped.is_set():
+            chunk = stream.readline()
+            if not chunk:
+                return
+            pending += chunk
+            if not pending.endswith(b"\n"):
+                continue
+            line, pending = pending, b""
+            try:
+                payload = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            command = payload.get("command") if isinstance(payload, dict) else None
+            if command == "cancel":
+                self._gateway.cancel()
+            elif command == "continue_authentication":
+                self._gateway.continue_authentication()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -134,7 +143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             HlsDownloader(FfmpegMuxer(paths)),
             JsonDownloadCatalog(paths.downloads_file),
         )
-        listener = WorkerCommandListener(Path(args.commands_file), gateway)
+        listener = WorkerCommandListener(gateway, sys.stdin.buffer)
         listener.start()
         summary = DownloadLessons(gateway).execute(request, sink)
         return 0 if summary.successful else 2

@@ -18,6 +18,10 @@ import aiohttp
 
 from getcourse_downloader.application.ports.download import EventHandler
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
+from getcourse_downloader.infrastructure.media.cancellation import (
+    MediaDownloadCancelled,
+    await_or_cancel,
+)
 from getcourse_downloader.infrastructure.media.ffmpeg import FfmpegMuxer
 from getcourse_downloader.infrastructure.storage.filenames import (
     existing_output_path,
@@ -517,6 +521,7 @@ class HlsDownloader:
         video_total: int = 1,
         session_key: HlsKeyDeclaration | None = None,
         is_cancelled: Callable[[], bool] | None = None,
+        cancellation_event: asyncio.Event | None = None,
     ) -> HlsDownloadResult:
         output_mp4 = output_without_suffix.parent / f"{output_without_suffix.name}.mp4"
         output_mp4.parent.mkdir(parents=True, exist_ok=True)
@@ -588,7 +593,9 @@ class HlsDownloader:
             try:
                 async with session.get(playlist_url) as response:
                     response.raise_for_status()
-                    playlist = await response.text()
+                    playlist = await await_or_cancel(response.text(), cancellation_event)
+            except MediaDownloadCancelled:
+                return HlsDownloadResult(HlsDownloadStatus.CANCELLED)
             except Exception as error:
                 error_code, summary = _download_error_details(error, playlist=True)
                 emit(
@@ -709,7 +716,9 @@ class HlsDownloader:
                 try:
                     async with session.get(key_declaration.uri) as response:
                         response.raise_for_status()
-                        key_data = (await response.read()).strip(b" \t\r\n")
+                        key_data = (
+                            await await_or_cancel(response.read(), cancellation_event)
+                        ).strip(b" \t\r\n")
                     if len(key_data) != 16:
                         raise HlsKeyError("сервер ключа вернул не 16 байт")
                     try:
@@ -717,6 +726,8 @@ class HlsDownloader:
                     except UnicodeDecodeError as error:
                         raise HlsKeyError("сервер ключа вернул не ASCII") from error
                     decryption_key_hex = key_data.hex()
+                except MediaDownloadCancelled:
+                    return HlsDownloadResult(HlsDownloadStatus.CANCELLED)
                 except HlsKeyError as error:
                     emit(
                         event(
@@ -750,7 +761,7 @@ class HlsDownloader:
             emit(
                 event(
                     DownloadEventType.VIDEO_FOUND,
-                    f"Видео найдено: {completed}/{total}",
+                    f"Видео {video_index} из {video_total} найдено: {completed}/{total} сегментов",
                     stage="segments",
                     current=completed,
                     total=total,
@@ -784,7 +795,9 @@ class HlsDownloader:
                                 request_headers = {"Range": f"bytes={start}-{end}"}
                             async with session.get(url, headers=request_headers) as response:
                                 response.raise_for_status()
-                                content = await response.read()
+                                content = await await_or_cancel(response.read(), cancellation_event)
+                            if is_cancelled and is_cancelled():
+                                return False
                             if resource.byte_range is not None:
                                 expected = resource.byte_range.length
                                 if len(content) != expected:
@@ -817,7 +830,9 @@ class HlsDownloader:
                                 emit(
                                     event(
                                         DownloadEventType.PROGRESS,
-                                        f"Сегменты: {completed}/{total}",
+                                        "Загрузка видео "
+                                        f"{video_index} из {video_total}: "
+                                        f"сегменты {completed}/{total}",
                                         stage="segments",
                                         current=completed,
                                         total=total,
@@ -833,7 +848,12 @@ class HlsDownloader:
                                     (index, error_code, summary, urlsplit(url).netloc)
                                 )
                                 return False
-                            await asyncio.sleep(2**attempt)
+                            try:
+                                await await_or_cancel(asyncio.sleep(2**attempt), cancellation_event)
+                            except MediaDownloadCancelled:
+                                return False
+                        except MediaDownloadCancelled:
+                            return False
                 return False
 
             results = await asyncio.gather(
@@ -867,6 +887,13 @@ class HlsDownloader:
                 )
 
             temporary_output = checkpoint / "output.part.mp4"
+            emit(
+                event(
+                    DownloadEventType.LOG,
+                    "Собираю MP4 из загруженных сегментов",
+                    stage="ffmpeg",
+                )
+            )
             if decryption_key_hex is not None:
                 success, error_message = await self._muxer.decrypt_fragments(
                     segment_paths,

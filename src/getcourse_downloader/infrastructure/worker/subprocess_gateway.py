@@ -124,15 +124,21 @@ class SubprocessDownloadGateway:
         entrypoint: list[str] | None = None,
         *,
         inactivity_timeout_seconds: float = 360.0,
+        cancel_grace_seconds: float = 3.0,
         diagnostics_directory: Path | None = None,
     ) -> None:
         self._entrypoint = entrypoint
         self._inactivity_timeout_seconds = inactivity_timeout_seconds
+        self._cancel_grace_seconds = max(0.0, cancel_grace_seconds)
         self._diagnostics_directory = diagnostics_directory
         self._process: subprocess.Popen[str] | None = None
         self._job: _WindowsProcessJob | None = None
         self._command_file: Path | None = None
+        self._save_path: Path | None = None
         self._cancel_requested = False
+        self._forced_cancelled = threading.Event()
+        self._forced_cancel_cleanup_done = threading.Event()
+        self._cancel_timer: threading.Timer | None = None
         self._lock = threading.Lock()
         self._done = threading.Event()
         self._done.set()
@@ -150,6 +156,10 @@ class SubprocessDownloadGateway:
 
     def run(self, request: DownloadRequest, on_event: EventHandler) -> DownloadSummary:
         self._done.clear()
+        with self._lock:
+            self._forced_cancelled.clear()
+            self._forced_cancel_cleanup_done.clear()
+            self._save_path = request.save_path
         request_file: Path | None = None
         event_file: Path | None = None
         command_file: Path | None = None
@@ -194,7 +204,7 @@ class SubprocessDownloadGateway:
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 text=True,
                 creationflags=flags,
                 env=environment,
@@ -206,6 +216,7 @@ class SubprocessDownloadGateway:
                 self._command_file = command_file
                 if self._cancel_requested:
                     self._write_command("cancel")
+                    self._arm_cancel_timeout()
 
             def consume(line: bytes) -> None:
                 nonlocal active_lesson_url, last_activity_at, summary
@@ -246,6 +257,12 @@ class SubprocessDownloadGateway:
                         failed=tuple(failed_titles),
                         cancelled=event.cancelled or 0,
                     )
+                    # Let the worker's command reader reach EOF before it closes
+                    # its buffered stdin during shutdown.
+                    with self._lock:
+                        if process.stdin is not None:
+                            with contextlib.suppress(OSError):
+                                process.stdin.close()
 
             with event_file.open("rb") as events_stream:
                 pending = b""
@@ -282,6 +299,9 @@ class SubprocessDownloadGateway:
 
             return_code = process.wait()
             if summary is None:
+                if self._forced_cancelled.is_set():
+                    self._forced_cancel_cleanup_done.wait(2)
+                    return self._cancelled_summary(request, on_event, outcomes, failed_titles)
                 raise DownloaderError(
                     f"Worker завершился без итогового события (код {return_code})"
                 )
@@ -291,16 +311,105 @@ class SubprocessDownloadGateway:
                 self._terminate_process(process, job)
             if job is not None:
                 job.close()
+            if process is not None and process.stdin is not None:
+                with contextlib.suppress(OSError):
+                    process.stdin.close()
             for path in (request_file, event_file, command_file):
                 if path is not None:
                     with contextlib.suppress(OSError):
                         path.unlink(missing_ok=True)
             with self._lock:
+                self._disarm_cancel_timeout()
                 self._process = None
                 self._job = None
                 self._command_file = None
+                self._save_path = None
                 self._cancel_requested = False
                 self._done.set()
+
+    @staticmethod
+    def _discard_interrupted_temporary_files(save_path: Path) -> None:
+        """Keep finished HLS segments, remove only an interrupted segment write."""
+        try:
+            root = save_path.resolve()
+            if not root.is_dir():
+                return
+            for checkpoint in root.rglob("*.gcd-part"):
+                if checkpoint.is_symlink() or not checkpoint.is_dir():
+                    continue
+                for temporary in checkpoint.rglob("*.tmp"):
+                    if temporary.is_file() or temporary.is_symlink():
+                        temporary.unlink(missing_ok=True)
+        except OSError:
+            return
+
+    def _arm_cancel_timeout(self) -> None:
+        """Start one hard-stop timer after the user has asked to cancel."""
+        if self._cancel_timer is not None or self._cancel_grace_seconds <= 0:
+            return
+        timer = threading.Timer(self._cancel_grace_seconds, self._force_cancel)
+        timer.daemon = True
+        self._cancel_timer = timer
+        timer.start()
+
+    def _disarm_cancel_timeout(self) -> None:
+        timer = self._cancel_timer
+        self._cancel_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _force_cancel(self) -> None:
+        with self._lock:
+            process = self._process
+            job = self._job
+            save_path = self._save_path
+            if process is None or process.poll() is not None:
+                return
+            self._forced_cancelled.set()
+        self._terminate_process(process, job)
+        try:
+            if save_path is not None:
+                self._discard_interrupted_temporary_files(save_path)
+        finally:
+            self._forced_cancel_cleanup_done.set()
+
+    @staticmethod
+    def _cancelled_summary(
+        request: DownloadRequest,
+        on_event: EventHandler,
+        outcomes: dict[str, DownloadEventType],
+        failed_titles: list[str],
+    ) -> DownloadSummary:
+        downloaded = sum(value is DownloadEventType.LESSON_COMPLETED for value in outcomes.values())
+        already_present = sum(
+            value is DownloadEventType.LESSON_SKIPPED for value in outcomes.values()
+        )
+        no_video = sum(value is DownloadEventType.LESSON_NO_VIDEO for value in outcomes.values())
+        processed = downloaded + already_present + no_video + len(failed_titles)
+        summary = DownloadSummary(
+            total=len(request.lessons),
+            downloaded=downloaded,
+            already_present=already_present,
+            no_video=no_video,
+            failed=tuple(failed_titles),
+            cancelled=max(0, len(request.lessons) - processed),
+        )
+        on_event(
+            DownloadEvent(
+                DownloadEventType.SUMMARY,
+                message="Загрузка остановлена пользователем",
+                stage="summary",
+                current=summary.processed,
+                total=summary.total,
+                downloaded=summary.downloaded,
+                already_present=summary.already_present,
+                no_video=summary.no_video,
+                failed_count=len(summary.failed),
+                cancelled=summary.cancelled,
+                level="warning",
+            )
+        )
+        return summary
 
     def _stalled_summary(
         self,
@@ -395,6 +504,8 @@ class SubprocessDownloadGateway:
             if command == "cancel":
                 self._cancel_requested = True
             self._write_command(command)
+            if command == "cancel":
+                self._arm_cancel_timeout()
 
     def _write_command(self, command: str) -> None:
         """Write a command while the caller holds the lifecycle lock."""
@@ -403,9 +514,18 @@ class SubprocessDownloadGateway:
         if path is None or process is None or process.poll() is not None:
             return
         try:
+            payload = json.dumps({"command": command}) + "\n"
             with path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps({"command": command}) + "\n")
+                stream.write(payload)
                 stream.flush()
+        except OSError:
+            pass
+        command_stream = process.stdin
+        if command_stream is None or command_stream.closed:
+            return
+        try:
+            command_stream.write(payload)
+            command_stream.flush()
         except OSError:
             return
 

@@ -46,6 +46,7 @@ class FfmpegMuxer:
         process = await asyncio.create_subprocess_exec(
             self.executable(),
             "-version",
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             creationflags=flags,
@@ -158,40 +159,63 @@ class FfmpegMuxer:
             stderr=asyncio.subprocess.PIPE,
             creationflags=flags,
         )
-        communicate: asyncio.Task[tuple[bytes, bytes]] | None = None
+        transfer: asyncio.Task[None] | None = None
+        errors: asyncio.Task[bytes] | None = None
         try:
-            if process.stdin is None:
-                return False, "ffmpeg stdin недоступен"
-            for source_path in sources:
-                with source_path.open("rb") as source:
-                    while chunk := source.read(1024 * 1024):
-                        if is_cancelled and is_cancelled():
-                            return False, "cancelled"
-                        process.stdin.write(chunk)
-                        await process.stdin.drain()
-            process.stdin.close()
-            wait_closed = getattr(process.stdin, "wait_closed", None)
-            if wait_closed is not None:
-                await wait_closed()
-            communicate = asyncio.create_task(process.communicate())
+            stdin = process.stdin
+            stderr_pipe = process.stderr
+            if stdin is None or stderr_pipe is None:
+                return False, "ffmpeg pipes недоступны"
+
+            async def read_errors() -> bytes:
+                tail = bytearray()
+                while chunk := await stderr_pipe.read(64 * 1024):
+                    tail.extend(chunk)
+                    if len(tail) > 4096:
+                        del tail[:-4096]
+                return bytes(tail)
+
+            async def feed_fragments() -> None:
+                for source_path in sources:
+                    with source_path.open("rb") as source:
+                        while chunk := source.read(1024 * 1024):
+                            stdin.write(chunk)
+                            await stdin.drain()
+                stdin.close()
+                wait_closed = getattr(stdin, "wait_closed", None)
+                if wait_closed is not None:
+                    await wait_closed()
+                await process.wait()
+
+            # Read stderr while stdin is fed: otherwise both pipes can block each other.
+            errors = asyncio.create_task(read_errors())
+            transfer = asyncio.create_task(feed_fragments())
             started_at = asyncio.get_running_loop().time()
-            while not communicate.done():
+            while not transfer.done():
                 if is_cancelled and is_cancelled():
                     return False, "cancelled"
                 if asyncio.get_running_loop().time() - started_at >= 300:
                     return False, "ffmpeg завис (таймаут 5 минут)"
                 await asyncio.sleep(0.1)
-            _, stderr = await communicate
+            await transfer
+            stderr = await errors
         except (BrokenPipeError, ConnectionResetError, OSError) as error:
             return False, str(error).replace(decryption_key_hex, "[redacted]")
         finally:
             if process.returncode is None:
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
-                if communicate is not None:
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await communicate
+            if transfer is not None:
+                transfer.cancel()
+                with contextlib.suppress(
+                    asyncio.CancelledError, BrokenPipeError, ConnectionResetError, OSError
+                ):
+                    await transfer
+            if process.returncode is None:
                 await process.wait()
+            if errors is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await errors
         if process.returncode != 0:
             return False, stderr.decode("utf-8", errors="replace")[-300:].replace(
                 decryption_key_hex, "[redacted]"
@@ -214,6 +238,9 @@ class FfmpegMuxer:
         process = await asyncio.create_subprocess_exec(
             self.executable(),
             *arguments,
+            # The worker's stdin carries UI commands and has a blocking reader.
+            # Media processes must not inherit that channel.
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
             creationflags=flags,
@@ -258,6 +285,7 @@ class FfmpegMuxer:
             "-of",
             "json",
             str(media),
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             creationflags=flags,

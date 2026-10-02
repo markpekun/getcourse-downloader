@@ -4,11 +4,21 @@ from pathlib import Path
 import pytest
 
 from getcourse_downloader.domain.events import DownloadEventType
-from getcourse_downloader.domain.models import DownloadRequest, Lesson, SelectedLesson, VideoQuality
+from getcourse_downloader.domain.models import (
+    DownloadRequest,
+    Lesson,
+    MediaSelection,
+    SelectedLesson,
+    VideoQuality,
+)
 from getcourse_downloader.infrastructure.getcourse import downloader as downloader_module
 from getcourse_downloader.infrastructure.getcourse.downloader import (
     PlaywrightDownloadGateway,
     _Playlist,
+)
+from getcourse_downloader.infrastructure.media.audio import (
+    DirectAudioDownloadResult,
+    DirectAudioDownloadStatus,
 )
 from getcourse_downloader.infrastructure.media.hls import HlsDownloadResult, HlsDownloadStatus
 
@@ -50,6 +60,9 @@ class _Page:
     async def close(self):
         return None
 
+    async def content(self):
+        return ""
+
 
 class _Browser:
     def __init__(self, page):
@@ -89,6 +102,17 @@ class _RecordingHls:
             HlsDownloadStatus.DOWNLOADED,
             output_path=Path(f"{output_stem}.mp4"),
         )
+
+
+class _SuccessfulAudio:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def download(self, source_url, output_path, **kwargs):
+        self.calls.append((source_url, output_path, kwargs))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"audio")
+        return DirectAudioDownloadResult(DirectAudioDownloadStatus.DOWNLOADED, output_path)
 
 
 class _KinescopeFrame:
@@ -190,6 +214,111 @@ def test_no_player_and_no_hls_is_no_video(monkeypatch, tmp_path):
     assert result.status.value == "no_video"
 
 
+def test_audio_lesson_downloads_direct_audio_without_player_activation(tmp_path):
+    class Page(_Page):
+        async def content(self):
+            return '<audio src="/files/day.mp3" title="Идеальный день"></audio>'
+
+    audio = _SuccessfulAudio()
+    gateway = PlaywrightDownloadGateway(None, _Hls(), audio=audio)  # type: ignore[arg-type]
+
+    result = asyncio.run(
+        gateway._download_audio_lesson(
+            _Browser(Page(player=False)),
+            _item(),
+            tmp_path / "Lesson",
+            lambda _: None,
+        )
+    )
+
+    assert result.status.value == "downloaded"
+    assert audio.calls[0][0] == "https://school/files/day.mp3"
+    assert audio.calls[0][1].suffix == ".mp3"
+
+
+def test_audio_only_request_runs_audio_pipeline_without_hls(monkeypatch, tmp_path):
+    class PlaywrightContext:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_):
+            return None
+
+    class Page(_Page):
+        async def content(self):
+            return '<audio src="/files/day.mp3" title="Идеальный день"></audio>'
+
+    audio = _SuccessfulAudio()
+    gateway = PlaywrightDownloadGateway(None, _Hls(), audio=audio)  # type: ignore[arg-type]
+    monkeypatch.setattr(downloader_module, "async_playwright", PlaywrightContext)
+
+    async def launch(*_args):
+        return _Browser(Page(player=False))
+
+    monkeypatch.setattr(gateway, "_launch_authenticated_context", launch)
+    summary = asyncio.run(
+        gateway._run_async(
+            DownloadRequest(
+                lessons=(_item(),),
+                quality=VideoQuality.AUTO,
+                save_path=tmp_path,
+                media_selection=MediaSelection.audio_only(),
+            ),
+            lambda _event: None,
+        )
+    )
+
+    assert summary.downloaded == 1
+    assert len(audio.calls) == 1
+
+
+def test_combined_request_runs_video_and_audio_pipelines(monkeypatch, tmp_path):
+    class PlaywrightContext:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_):
+            return None
+
+    class Page(_Page):
+        async def content(self):
+            return '<audio src="/files/day.mp3" title="Идеальный день"></audio>'
+
+    monkeypatch.setattr(downloader_module, "async_playwright", PlaywrightContext)
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+    hls = _SuccessfulHls()
+    audio = _SuccessfulAudio()
+    gateway = PlaywrightDownloadGateway(None, hls, audio=audio)  # type: ignore[arg-type]
+
+    async def launch(*_args):
+        return _Browser(
+            Page(
+                player=True,
+                playlist=(
+                    "https://cdn.example/video.m3u8",
+                    "#EXTM3U\n#EXTINF:5,\nsegment.ts\n",
+                ),
+            )
+        )
+
+    monkeypatch.setattr(gateway, "_launch_authenticated_context", launch)
+    summary = asyncio.run(
+        gateway._run_async(
+            DownloadRequest(
+                lessons=(_item(),),
+                quality=VideoQuality.AUTO,
+                save_path=tmp_path,
+                media_selection=MediaSelection.video_and_audio(),
+            ),
+            lambda _event: None,
+        )
+    )
+
+    assert summary.downloaded == 1
+    assert hls.calls == 1
+    assert len(audio.calls) == 1
+
+
 def test_no_video_event_explains_that_supported_player_is_missing(monkeypatch, tmp_path):
     class PlaywrightContext:
         async def __aenter__(self):
@@ -238,6 +367,35 @@ def test_player_without_hls_is_technical_failure(monkeypatch, tmp_path):
     assert result.status.value == "failed"
     assert events[-1].type is DownloadEventType.ERROR
     assert events[-1].lesson_url == "https://school/lesson/1"
+
+
+def test_player_recovers_when_hls_arrives_on_second_visit(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+    playlist = ("https://cdn.example/video.m3u8", "#EXTM3U\n#EXTINF:5,\nsegment.ts\n")
+
+    class SecondVisitPage(_Page):
+        visits = 0
+
+        async def goto(self, url, **kwargs):
+            self.visits += 1
+            if self.visits == 2:
+                self._playlist = playlist
+            await super().goto(url, **kwargs)
+
+    page = SecondVisitPage(player=True)
+    hls = _SuccessfulHls()
+    events = []
+
+    result = asyncio.run(
+        PlaywrightDownloadGateway(None, hls)._download_lesson(
+            _Browser(page), _item(), tmp_path / "Lesson", "auto", events.append
+        )
+    )
+
+    assert result.status.value == "downloaded"
+    assert page.visits == 2
+    assert hls.calls == 1
+    assert any(event.stage == "playlist_retry" for event in events)
 
 
 def test_player_with_dash_manifest_reports_sanitized_unsupported_stream(monkeypatch, tmp_path):

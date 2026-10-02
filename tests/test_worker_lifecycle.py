@@ -1,4 +1,5 @@
 import concurrent.futures
+import os
 import subprocess
 import sys
 import threading
@@ -164,41 +165,24 @@ time.sleep(30)
 
 
 def test_command_listener_preserves_cancel_split_between_writes(tmp_path):
-    command_file = tmp_path / "commands.jsonl"
-    command_file.write_text('{"command": "can', encoding="utf-8")
-    partial_read = threading.Event()
     cancelled = threading.Event()
 
     class Gateway:
         def cancel(self):
             cancelled.set()
 
-    class ObservedStream:
-        def __init__(self, stream):
-            self.stream = stream
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            self.stream.close()
-
-        def readline(self):
-            line = self.stream.readline()
-            if line:
-                partial_read.set()
-            return line
-
-    class ObservedPath:
-        def open(self, *args, **kwargs):
-            return ObservedStream(command_file.open(*args, **kwargs))
-
-    listener = WorkerCommandListener(ObservedPath(), Gateway())
-    listener.start()
+    reader_descriptor, writer_descriptor = os.pipe()
+    reader = os.fdopen(reader_descriptor, "rb", buffering=0)
+    writer = os.fdopen(writer_descriptor, "wb", buffering=0)
+    listener = WorkerCommandListener(Gateway(), reader)
     try:
-        assert partial_read.wait(2)
-        with command_file.open("a", encoding="utf-8") as stream:
-            stream.write('cel"}\n')
+        listener.start()
+        writer.write(b'{"command": "can')
+        writer.flush()
+        assert not cancelled.wait(0.1)
+        writer.write(b'cel"}\n')
+        writer.flush()
         assert cancelled.wait(2)
     finally:
+        writer.close()
         listener.stop()

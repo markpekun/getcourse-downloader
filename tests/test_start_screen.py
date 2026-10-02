@@ -15,6 +15,7 @@ def test_start_state_only_tracks_fast_discovery():
     assert state.discovery_visible is False
     assert state.total_parsed == 0
     assert not hasattr(state, "video_check_visible")
+    assert not hasattr(state, "media_selection")
 
 
 def test_successful_discovery_does_not_cancel_its_own_navigation_task():
@@ -28,6 +29,7 @@ def test_successful_discovery_does_not_cancel_its_own_navigation_task():
         screen._loading_task = None
         screen._dot_task = None
         screen._auth_event = asyncio.Event()
+        screen.state = StartViewState()
         screen.loader = SimpleNamespace(visible=True)
         task_handle: concurrent.futures.Future[None] = concurrent.futures.Future()
         screen._parse_task = task_handle

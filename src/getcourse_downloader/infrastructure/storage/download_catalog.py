@@ -6,11 +6,15 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from getcourse_downloader.domain.errors import InvalidDataError
+from getcourse_downloader.domain.models import MediaKind
+
 
 @dataclass(frozen=True, slots=True)
 class DownloadedMedia:
     path: Path
     quality: str = ""
+    kind: MediaKind = MediaKind.VIDEO
 
 
 class JsonDownloadCatalog:
@@ -25,15 +29,28 @@ class JsonDownloadCatalog:
 
     def _load(self) -> dict[str, object]:
         if not self._path.is_file():
-            return {"schema_version": 1, "records": {}}
+            return {"schema_version": 2, "records": {}}
         try:
             payload = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return {"schema_version": 1, "records": {}}
-        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
-            return {"schema_version": 1, "records": {}}
+            return {"schema_version": 2, "records": {}}
+        if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2}:
+            return {"schema_version": 2, "records": {}}
         if not isinstance(payload.get("records"), dict):
             payload["records"] = {}
+        if payload["schema_version"] == 1:
+            records = payload["records"]
+            assert isinstance(records, dict)
+            for raw_record in records.values():
+                if not isinstance(raw_record, dict):
+                    continue
+                raw_media = raw_record.get("media")
+                if not isinstance(raw_media, list):
+                    continue
+                for item in raw_media:
+                    if isinstance(item, dict):
+                        item.setdefault("kind", MediaKind.VIDEO.value)
+            payload["schema_version"] = 2
         return payload
 
     def _save(self, payload: dict[str, object]) -> None:
@@ -54,7 +71,12 @@ class JsonDownloadCatalog:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def find(self, lesson_url: str, output_stem: Path) -> tuple[DownloadedMedia, ...]:
+    def find(
+        self,
+        lesson_url: str,
+        output_stem: Path,
+        kind: MediaKind = MediaKind.VIDEO,
+    ) -> tuple[DownloadedMedia, ...]:
         payload = self._load()
         records = payload["records"]
         assert isinstance(records, dict)
@@ -66,6 +88,12 @@ class JsonDownloadCatalog:
         for raw_media in raw_record["media"]:
             if not isinstance(raw_media, dict) or not isinstance(raw_media.get("path"), str):
                 return ()
+            try:
+                media_kind = MediaKind.parse(raw_media.get("kind", MediaKind.VIDEO.value))
+            except InvalidDataError:
+                return ()
+            if media_kind is not kind:
+                continue
             path = Path(raw_media["path"])
             try:
                 if not path.is_file() or path.stat().st_size <= 0:
@@ -73,7 +101,9 @@ class JsonDownloadCatalog:
             except OSError:
                 return ()
             quality = raw_media.get("quality", "")
-            media.append(DownloadedMedia(path, quality if isinstance(quality, str) else ""))
+            media.append(
+                DownloadedMedia(path, quality if isinstance(quality, str) else "", media_kind)
+            )
         return tuple(media)
 
     def has_stem_conflict(self, lesson_url: str, output_stem: Path) -> bool:
@@ -106,11 +136,28 @@ class JsonDownloadCatalog:
         payload = self._load()
         records = payload["records"]
         assert isinstance(records, dict)
-        records[self._key(lesson_url, output_stem)] = {
+        key = self._key(lesson_url, output_stem)
+        existing_record = records.get(key)
+        existing_media = (
+            existing_record.get("media", []) if isinstance(existing_record, dict) else []
+        )
+        new_kinds = {item.kind.value for item in media}
+        preserved = [
+            item
+            for item in existing_media
+            if isinstance(item, dict) and item.get("kind", MediaKind.VIDEO.value) not in new_kinds
+        ]
+        records[key] = {
             "lesson_url": lesson_url,
             "output_stem": str(output_stem.resolve()),
-            "media": [
-                {"path": str(item.path.resolve()), "quality": item.quality} for item in media
+            "media": preserved
+            + [
+                {
+                    "path": str(item.path.resolve()),
+                    "quality": item.quality,
+                    "kind": item.kind.value,
+                }
+                for item in media
             ],
         }
         self._save(payload)

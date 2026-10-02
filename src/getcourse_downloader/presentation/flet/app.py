@@ -59,7 +59,10 @@ class App:
         if self._closing:
             return
         self._closing = True
-        await self._dispose_screen(wait=True)
+        # At this point Flet may already be tearing down its asyncio executor.
+        # Cancellation is enough; a blocking shutdown belongs to the guarded
+        # window-close path above, before the page is disconnected.
+        await self._dispose_screen()
 
     async def show_initial_screen(self) -> None:
         if self.container.courses.has_courses():

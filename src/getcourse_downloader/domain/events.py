@@ -16,9 +16,11 @@ class DownloadEventType(StrEnum):
     AUTHENTICATED = "authenticated"
     LESSON_STARTED = "lesson_started"
     VIDEO_FOUND = "video_found"
+    MEDIA_FOUND = "media_found"
     LESSON_COMPLETED = "lesson_completed"
     LESSON_SKIPPED = "lesson_skipped"
     LESSON_NO_VIDEO = "lesson_no_video"
+    LESSON_NO_MEDIA = "lesson_no_media"
     LESSON_FAILED = "lesson_failed"
     SUMMARY = "summary"
     ERROR = "error"
@@ -34,6 +36,10 @@ class DownloadEvent:
     course_path: tuple[str, ...] = ()
     video_index: int | None = None
     video_total: int | None = None
+    media_kind: str = ""
+    media_title: str = ""
+    media_index: int | None = None
+    media_total: int | None = None
     current: int | None = None
     total: int | None = None
     downloaded: int | None = None
@@ -81,6 +87,10 @@ class DownloadEvent:
             course_path=tuple(raw_course_path),
             video_index=optional_int("video_index"),
             video_total=optional_int("video_total"),
+            media_kind=str(data.get("media_kind", "")),
+            media_title=str(data.get("media_title", "")),
+            media_index=optional_int("media_index"),
+            media_total=optional_int("media_total"),
             current=optional_int("current"),
             total=optional_int("total"),
             downloaded=optional_int("downloaded"),

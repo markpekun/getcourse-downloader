@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -29,6 +29,62 @@ class VideoQuality(StrEnum):
             return cls(str(value or cls.AUTO))
         except ValueError as error:
             raise InvalidDataError(f"Неизвестное качество видео: {value!r}") from error
+
+
+class MediaKind(StrEnum):
+    VIDEO = "video"
+    AUDIO = "audio"
+
+    @classmethod
+    def parse(cls, value: object) -> MediaKind:
+        try:
+            return cls(str(value))
+        except ValueError as error:
+            raise InvalidDataError(f"Неизвестный тип медиа: {value!r}") from error
+
+
+@dataclass(frozen=True, slots=True)
+class MediaSelection:
+    """The media kinds a single download request is allowed to process."""
+
+    kinds: tuple[MediaKind, ...]
+
+    def __post_init__(self) -> None:
+        parsed = tuple(MediaKind.parse(kind) for kind in self.kinds)
+        if not parsed:
+            raise InvalidDataError("Хотя бы один тип медиа должен быть выбран")
+        if len(set(parsed)) != len(parsed):
+            raise InvalidDataError("Типы медиа не должны повторяться")
+        object.__setattr__(
+            self,
+            "kinds",
+            tuple(kind for kind in MediaKind if kind in parsed),
+        )
+
+    @classmethod
+    def video_only(cls) -> MediaSelection:
+        return cls((MediaKind.VIDEO,))
+
+    @classmethod
+    def audio_only(cls) -> MediaSelection:
+        return cls((MediaKind.AUDIO,))
+
+    @classmethod
+    def video_and_audio(cls) -> MediaSelection:
+        return cls((MediaKind.VIDEO, MediaKind.AUDIO))
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> MediaSelection:
+        raw_kinds = data.get("kinds")
+        if not isinstance(raw_kinds, list):
+            raise InvalidDataError("Поле 'kinds' должно быть списком")
+        return cls(tuple(MediaKind.parse(value) for value in raw_kinds))
+
+    def includes(self, kind: MediaKind) -> bool:
+        return kind in self.kinds
+
+    def to_dict(self) -> dict[str, list[str]]:
+        return {"kinds": [kind.value for kind in self.kinds]}
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +164,7 @@ class DownloadRequest:
     lessons: tuple[SelectedLesson, ...]
     quality: VideoQuality
     save_path: Path
+    media_selection: MediaSelection = field(default_factory=MediaSelection.video_only)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> DownloadRequest:
@@ -116,12 +173,20 @@ class DownloadRequest:
         raw_lessons = data.get("lessons")
         if not isinstance(raw_lessons, list):
             raise InvalidDataError("Поле 'lessons' должно быть списком")
+        raw_media_selection = data.get("media_selection")
+        if raw_media_selection is None:
+            media_selection = MediaSelection.video_only()
+        elif isinstance(raw_media_selection, dict):
+            media_selection = MediaSelection.from_dict(raw_media_selection)
+        else:
+            raise InvalidDataError("Поле 'media_selection' должно быть объектом")
         return cls(
             lessons=tuple(
                 SelectedLesson.from_dict(item) for item in raw_lessons if isinstance(item, dict)
             ),
             quality=VideoQuality.parse(data.get("quality")),
             save_path=Path(_required_text(data, "save_path")),
+            media_selection=media_selection,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -130,6 +195,7 @@ class DownloadRequest:
             "lessons": [item.to_dict() for item in self.lessons],
             "quality": self.quality.value,
             "save_path": str(self.save_path),
+            "media_selection": self.media_selection.to_dict(),
         }
 
 

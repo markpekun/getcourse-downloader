@@ -7,7 +7,13 @@ from types import SimpleNamespace
 import flet as ft
 
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
-from getcourse_downloader.domain.models import Course, DownloadSummary, Lesson, SelectedLesson
+from getcourse_downloader.domain.models import (
+    Course,
+    DownloadSummary,
+    Lesson,
+    MediaSelection,
+    SelectedLesson,
+)
 from getcourse_downloader.presentation.flet.screens.courses.components import (
     build_course_tree,
     build_download_lesson_row,
@@ -15,6 +21,8 @@ from getcourse_downloader.presentation.flet.screens.courses.components import (
     iter_course_lessons,
     selected_course_lessons,
 )
+from getcourse_downloader.presentation.flet.screens.courses.controller import CoursesController
+from getcourse_downloader.presentation.flet.screens.courses.state import CoursesViewState
 from getcourse_downloader.presentation.flet.screens.courses.view import CoursesScreen
 from getcourse_downloader.presentation.flet.theme import Color
 
@@ -200,6 +208,39 @@ def test_no_video_summary_is_presented_as_warning():
 
     assert captured["is_warning"] is True
     assert "Без видео: 1" in str(captured["message"])
+
+
+def test_courses_request_uses_default_combined_media_selection(tmp_path):
+    request = CoursesController.make_request(
+        [],
+        "auto",
+        str(tmp_path),
+    )
+
+    assert request.media_selection == MediaSelection.video_and_audio()
+
+
+def test_courses_state_defaults_to_combined_media_selection(tmp_path):
+    state = CoursesViewState(save_path=str(tmp_path))
+
+    assert state.media_selection == MediaSelection.video_and_audio()
+
+
+def test_header_media_selection_updates_request_state_and_refreshes_controls(tmp_path):
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen.state = CoursesViewState(save_path=str(tmp_path))
+    screen._media_selector = SimpleNamespace(content=None)
+    screen._build_media_selector_controls = lambda: "refreshed selector"
+    rebuilt = []
+    screen._build_side_panel = lambda: rebuilt.append(True)
+    screen.page = _FakePage()
+
+    screen._set_media_selection(MediaSelection.audio_only())
+
+    assert screen.state.media_selection == MediaSelection.audio_only()
+    assert screen._media_selector.content == "refreshed selector"
+    assert rebuilt == [True]
+    assert screen.page.updates == 1
 
 
 def test_stale_download_completion_does_not_replace_active_overlay():
@@ -404,7 +445,8 @@ def test_download_row_states_are_keyed_by_lesson_url():
             message="Упаковываю MP4 через FFmpeg…",
         )
     )
-    assert lesson_row.status_text.value == "Загрузка"
+    assert lesson_row.status_text.value == "Сборка MP4…"
+    assert lesson_row.progress.value is None
 
     screen._update_download_row(
         DownloadEvent(
@@ -428,6 +470,132 @@ def test_download_row_states_are_keyed_by_lesson_url():
     assert lesson_row.status_text.value == "Видео не найдено"
     assert lesson_row.status_text.color == Color.RED
     assert lesson_row.progress.visible is False
+
+
+def test_download_row_names_each_audio_file_within_a_lesson():
+    item = SelectedLesson(
+        course_path=("Курс",),
+        lesson=Lesson("Урок", "https://school.example/lesson/audio"),
+    )
+    lesson_row = build_download_lesson_row(item)
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen.page = _FakePage()
+    screen._download_rows = {item.lesson.url: lesson_row}
+
+    lesson_row.progress.value = 1.0
+    lesson_row.progress_text.value = "100%"
+
+    screen._update_download_row(
+        DownloadEvent(
+            DownloadEventType.MEDIA_FOUND,
+            lesson="Урок",
+            lesson_url=item.lesson.url,
+            media_kind="audio",
+            media_index=1,
+            media_total=3,
+        )
+    )
+
+    assert lesson_row.status_text.value == "1/3 Загрузка"
+    assert lesson_row.progress.value == 0
+    assert lesson_row.progress_text.value == "0%"
+
+    screen._update_download_row(
+        DownloadEvent(
+            DownloadEventType.PROGRESS,
+            lesson="Урок",
+            lesson_url=item.lesson.url,
+            media_kind="audio",
+            media_index=2,
+            media_total=3,
+            current=3,
+            total=4,
+        )
+    )
+
+    assert lesson_row.status_text.value == "2/3 Загрузка"
+    assert lesson_row.progress_text.value == "75%"
+
+
+def test_download_row_names_each_video_file_within_a_lesson():
+    item = SelectedLesson(
+        course_path=("Курс",),
+        lesson=Lesson("Урок", "https://school.example/lesson/video"),
+    )
+    lesson_row = build_download_lesson_row(item)
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen.page = _FakePage()
+    screen._download_rows = {item.lesson.url: lesson_row}
+
+    screen._update_download_row(
+        DownloadEvent(
+            DownloadEventType.VIDEO_FOUND,
+            lesson="Урок",
+            lesson_url=item.lesson.url,
+            video_index=1,
+            video_total=2,
+        )
+    )
+    assert lesson_row.status_text.value == "1/2 Загрузка"
+
+    screen._update_download_row(
+        DownloadEvent(
+            DownloadEventType.PROGRESS,
+            lesson="Урок",
+            lesson_url=item.lesson.url,
+            video_index=2,
+            video_total=2,
+            current=1,
+            total=2,
+        )
+    )
+    assert lesson_row.status_text.value == "2/2 Загрузка"
+
+
+def test_audio_only_lesson_status_says_checking_audio():
+    item = SelectedLesson(
+        course_path=("Курс",),
+        lesson=Lesson("Урок", "https://school.example/lesson/audio"),
+    )
+    lesson_row = build_download_lesson_row(item)
+    screen = CoursesScreen.__new__(CoursesScreen)
+    screen.page = _FakePage()
+    screen.state = SimpleNamespace(media_selection=MediaSelection.audio_only())
+    screen._download_rows = {item.lesson.url: lesson_row}
+
+    screen._update_download_row(
+        DownloadEvent(
+            DownloadEventType.LESSON_STARTED,
+            lesson="Урок",
+            lesson_url=item.lesson.url,
+        )
+    )
+
+    assert lesson_row.status_text.value == "Проверяем аудио…"
+
+
+def test_media_download_label_uses_compact_position_only_for_multiple_files():
+    assert (
+        CoursesScreen._media_download_label(
+            DownloadEvent(
+                DownloadEventType.PROGRESS,
+                media_kind="audio",
+                media_index=1,
+                media_total=1,
+            )
+        )
+        == "Загрузка"
+    )
+    assert (
+        CoursesScreen._media_download_label(
+            DownloadEvent(
+                DownloadEventType.PROGRESS,
+                video_index=1,
+                video_total=2,
+            )
+        )
+        == "1/2 Загрузка"
+    )
 
 
 def test_download_speed_is_formatted_for_header():

@@ -1,7 +1,10 @@
 import asyncio
 import contextlib
+import os
 import shutil
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -93,12 +96,14 @@ def test_decrypt_fragments_streams_sources_and_places_key_before_input(monkeypat
         async def wait_closed(self):
             return None
 
+    class Stderr:
+        async def read(self, _size):
+            return b""
+
     class Process:
         returncode = 0
         stdin = Stdin()
-
-        async def communicate(self):
-            return b"", b""
+        stderr = Stderr()
 
         async def wait(self):
             return 0
@@ -232,3 +237,108 @@ def test_task_cancellation_reaps_the_running_media_process(monkeypatch, tmp_path
         assert returncode is not None
 
     asyncio.run(scenario())
+
+
+def test_decrypt_fragments_drains_child_errors_while_streaming_input(monkeypatch, tmp_path):
+    async def scenario():
+        original_spawn = asyncio.create_subprocess_exec
+        processes = []
+
+        async def spawn(*_args, **kwargs):
+            process = await original_spawn(
+                sys.executable,
+                "-c",
+                "import sys; sys.stderr.buffer.write(b'e' * (8 * 1024 * 1024)); "
+                "sys.stderr.flush(); sys.stdin.buffer.read()",
+                **kwargs,
+            )
+            processes.append(process)
+            return process
+
+        source = tmp_path / "fragments.bin"
+        source.write_bytes(b"x" * (2 * 1024 * 1024))
+        muxer = FfmpegMuxer(_paths(tmp_path))
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(muxer, "executable", lambda: sys.executable)
+        try:
+            return await asyncio.wait_for(
+                muxer.decrypt_fragments(
+                    [source], tmp_path / "output.mp4", decryption_key_hex="00" * 16
+                ),
+                timeout=2,
+            )
+        finally:
+            for process in processes:
+                if process.returncode is None:
+                    process.kill()
+                await process.wait()
+
+    assert asyncio.run(scenario()) == (True, "")
+
+
+@pytest.mark.parametrize("operation", ["mux", "probe", "version"])
+def test_media_process_finishes_with_worker_command_pipe_still_open(tmp_path, operation):
+    """A media child must see EOF instead of sharing the worker's command input."""
+    worker = tmp_path / "media_worker.py"
+    report = tmp_path / "result.txt"
+    worker.write_text(
+        textwrap.dedent(
+            """
+            import asyncio
+            import os
+            import sys
+            import threading
+            from pathlib import Path
+            from getcourse_downloader.infrastructure.media.ffmpeg import FfmpegMuxer
+            from getcourse_downloader.infrastructure.platform.paths import AppPaths
+
+            root = Path(sys.argv[1])
+            operation = sys.argv[2]
+            threading.Thread(target=sys.stdin.buffer.readline, daemon=True).start()
+            original_spawn = asyncio.create_subprocess_exec
+
+            async def spawn(*args, **kwargs):
+                output = ('{"streams":[{"height":360}]}' if operation == 'probe'
+                          else 'ffmpeg version 6.1')
+                child = 'import sys; sys.stdin.buffer.read(); print(' + repr(output) + ')'
+                return await original_spawn(sys.executable, '-c', child, **kwargs)
+
+            async def run():
+                asyncio.create_subprocess_exec = spawn
+                muxer = FfmpegMuxer(AppPaths(root, root, root))
+                muxer.executable = lambda: sys.executable
+                muxer.probe_executable = lambda: sys.executable
+                if operation == 'mux':
+                    return await muxer.mux(root / 'source.ts', root / 'output.mp4')
+                if operation == 'probe':
+                    return await muxer.probe_height(root / 'output.mp4')
+                return await muxer.sample_aes_support()
+
+            result = asyncio.run(run())
+            (root / 'result.txt').write_text(repr(result), encoding='utf-8')
+            os._exit(0)
+            """
+        ),
+        encoding="utf-8",
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(worker), str(tmp_path), operation],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+    )
+    try:
+        process.wait(timeout=4)
+        assert process.returncode == 0
+        assert report.read_text(encoding="utf-8") == (
+            "360" if operation == "probe" else "(True, '')"
+        )
+    finally:
+        assert process.stdin is not None
+        process.stdin.close()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)

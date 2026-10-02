@@ -15,6 +15,7 @@ from getcourse_downloader.domain.models import (
     Course,
     DownloadRequest,
     DownloadSummary,
+    MediaSelection,
     SelectedLesson,
     Settings,
     VideoQuality,
@@ -55,12 +56,16 @@ class CoursesController:
 
     @staticmethod
     def make_request(
-        lessons: Sequence[SelectedLesson], quality: str, save_path: str
+        lessons: Sequence[SelectedLesson],
+        quality: str,
+        save_path: str,
+        media_selection: MediaSelection | None = None,
     ) -> DownloadRequest:
         return DownloadRequest(
             lessons=tuple(lessons),
             quality=VideoQuality.parse(quality),
             save_path=Path(save_path),
+            media_selection=media_selection or MediaSelection.video_and_audio(),
         )
 
     def start_download(

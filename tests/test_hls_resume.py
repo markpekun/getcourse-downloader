@@ -545,7 +545,9 @@ def test_fast_concat_assembles_mp4_without_intermediate_transport_stream(tmp_pat
     assert (tmp_path / "Lesson_720.mp4").read_bytes() == b"AB"
     assert len(muxer.concat_sources) == 1
     assert muxer.mux_sources == []
-    assert [event for event in events if event.type is DownloadEventType.LOG] == []
+    ffmpeg_logs = [event for event in events if event.type is DownloadEventType.LOG]
+    assert len(ffmpeg_logs) == 1
+    assert ffmpeg_logs[0].stage == "ffmpeg"
 
 
 def test_failed_fast_concat_falls_back_to_transport_stream_and_cleans_checkpoint(tmp_path):
@@ -563,7 +565,7 @@ def test_failed_fast_concat_falls_back_to_transport_stream_and_cleans_checkpoint
     assert (tmp_path / "Lesson_720.mp4").read_bytes() == b"segment"
     assert len(muxer.concat_sources) == 1
     assert len(muxer.mux_sources) == 1
-    assert [event for event in events if event.type is DownloadEventType.LOG] == []
+    assert [event.stage for event in events if event.type is DownloadEventType.LOG] == ["ffmpeg"]
     assert not _checkpoint_path(tmp_path / "Lesson.mp4").exists()
 
 
@@ -742,6 +744,49 @@ def test_cancel_preserves_segments_and_next_run_resumes(tmp_path):
     assert "https://cdn/a.ts?token=new" not in second_requests
     assert "https://cdn/b.ts?token=new" in second_requests
     assert not checkpoint.exists()
+
+
+def test_hls_download_stops_while_waiting_for_a_segment_response(tmp_path):
+    playlist_url = "https://cdn.example/media.m3u8"
+    segment_url = "https://cdn.example/segment.ts"
+
+    class _SlowResponse(_Response):
+        def __init__(self) -> None:
+            super().__init__()
+            self.waiting = asyncio.Event()
+
+        async def read(self) -> bytes:
+            self.waiting.set()
+            await asyncio.sleep(10)
+            return b"segment"
+
+    async def scenario():
+        cancelled = asyncio.Event()
+        response = _SlowResponse()
+        downloader = _downloader(
+            {
+                playlist_url: _Response(text="#EXTM3U\n#EXTINF:1,\nsegment.ts\n"),
+                segment_url: response,
+            },
+            [],
+        )
+        task = asyncio.create_task(
+            downloader.download(
+                playlist_url,
+                tmp_path / "Lesson",
+                "Урок",
+                lambda _: None,
+                is_cancelled=cancelled.is_set,
+                cancellation_event=cancelled,
+            )
+        )
+        await response.waiting.wait()
+        cancelled.set()
+        return await asyncio.wait_for(task, timeout=0.5)
+
+    result = asyncio.run(scenario())
+
+    assert result.status is HlsDownloadStatus.CANCELLED
 
 
 def test_canonical_media_url_ignores_query_and_fragment():

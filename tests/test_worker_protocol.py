@@ -65,6 +65,48 @@ def test_subprocess_gateway_rejects_worker_without_summary(tmp_path):
         gateway.run(request, lambda _: None)
 
 
+def test_summary_releases_worker_waiting_for_command_input(tmp_path):
+    worker = tmp_path / "finishing_worker.py"
+    marker = tmp_path / "listener_stopped.txt"
+    worker.write_text(
+        "import argparse,json,sys,time\n"
+        "from pathlib import Path\n"
+        "from getcourse_downloader.presentation.cli.worker import WorkerCommandListener\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--request-file')\n"
+        "p.add_argument('--events-file')\n"
+        "p.add_argument('--commands-file')\n"
+        "a=p.parse_args()\n"
+        "listener=WorkerCommandListener(None,sys.stdin.buffer)\n"
+        "listener.start()\n"
+        "time.sleep(0.1)\n"
+        "event={'protocol_version':2,'type':'summary','total':1,'downloaded':1}\n"
+        "with open(a.events_file,'a',encoding='utf-8') as f:\n"
+        "  f.write(json.dumps(event)+'\\n')\n"
+        "listener.stop()\n"
+        f"Path({str(marker)!r}).write_text('finished',encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    gateway = SubprocessDownloadGateway(
+        [sys.executable, str(worker)],
+        inactivity_timeout_seconds=5.0,
+        diagnostics_directory=tmp_path,
+    )
+    request = DownloadRequest(
+        (SelectedLesson(("Course",), Lesson("Lesson", "https://example.com")),),
+        VideoQuality.AUTO,
+        tmp_path,
+    )
+    events = []
+
+    summary = gateway.run(request, events.append)
+
+    assert summary.downloaded == 1, events
+    assert summary.successful
+    assert marker.is_file()
+    assert not any(event.type is DownloadEventType.ERROR for event in events)
+
+
 def test_subprocess_gateway_stops_worker_that_no_longer_reports_progress(tmp_path):
     worker = tmp_path / "stalled_worker.py"
     worker.write_text(
@@ -242,6 +284,99 @@ def test_subprocess_gateway_sends_cancel_and_receives_cancelled_summary(tmp_path
 
     assert summary.cancelled == 1
     assert summary.processed == 0
+
+
+def test_subprocess_gateway_delivers_cancel_through_the_worker_input_stream(tmp_path):
+    worker = tmp_path / "stdin_cancel_worker.py"
+    worker.write_text(
+        "import argparse,json,sys,time\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--request-file')\n"
+        "p.add_argument('--events-file')\n"
+        "p.add_argument('--commands-file')\n"
+        "a=p.parse_args()\n"
+        "def emit(data):\n"
+        "  with open(a.events_file,'a',encoding='utf-8') as f: f.write(json.dumps(data)+'\\n')\n"
+        "emit({'protocol_version':2,'type':'lesson_started','lesson':'Урок',"
+        "'lesson_url':'https://example.com'})\n"
+        "line=sys.stdin.readline()\n"
+        'if \'"command": "cancel"\' not in line: time.sleep(30)\n'
+        "emit({'protocol_version':2,'type':'summary','total':1,'downloaded':0,"
+        "'already_present':0,'no_video':0,'failed_count':0,'cancelled':1})\n",
+        encoding="utf-8",
+    )
+    gateway = SubprocessDownloadGateway([sys.executable, str(worker)])
+    request = DownloadRequest(
+        lessons=(SelectedLesson(("Курс",), Lesson("Урок", "https://example.com")),),
+        quality=VideoQuality.AUTO,
+        save_path=tmp_path,
+    )
+    started = threading.Event()
+
+    def on_event(event):
+        if event.type is DownloadEventType.LESSON_STARTED:
+            started.set()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(gateway.run, request, on_event)
+        try:
+            assert started.wait(5)
+            gateway.cancel()
+            summary = future.result(timeout=1)
+        finally:
+            gateway.shutdown(timeout=0)
+
+    assert summary.cancelled == 1
+
+
+def test_subprocess_gateway_force_stops_unresponsive_worker_and_keeps_completed_segments(tmp_path):
+    worker = tmp_path / "unresponsive_worker.py"
+    worker.write_text(
+        "import argparse,json,time\n"
+        "from pathlib import Path\n"
+        "p=argparse.ArgumentParser()\n"
+        "p.add_argument('--request-file')\n"
+        "p.add_argument('--events-file')\n"
+        "p.add_argument('--commands-file')\n"
+        "a=p.parse_args()\n"
+        "request=json.loads(Path(a.request_file).read_text(encoding='utf-8'))\n"
+        "segments=Path(request['save_path']) / '.Lesson.mp4.gcd-part' / 'segments'\n"
+        "segments.mkdir(parents=True)\n"
+        "(segments / '000000.bin').write_bytes(b'complete')\n"
+        "(segments / '000001.bin.tmp').write_bytes(b'incomplete')\n"
+        "event={'protocol_version':2,'type':'lesson_started','lesson':'Урок',"
+        "'lesson_url':'https://example.com'}\n"
+        "with open(a.events_file,'a',encoding='utf-8') as f: f.write(json.dumps(event)+'\\n')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    gateway = SubprocessDownloadGateway(
+        [sys.executable, str(worker)],
+        cancel_grace_seconds=0.2,
+    )
+    request = DownloadRequest(
+        lessons=(SelectedLesson(("Курс",), Lesson("Урок", "https://example.com")),),
+        quality=VideoQuality.AUTO,
+        save_path=tmp_path,
+    )
+    started = threading.Event()
+
+    def on_event(event):
+        if event.type is DownloadEventType.LESSON_STARTED:
+            started.set()
+
+    started_at = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(gateway.run, request, on_event)
+        assert started.wait(5)
+        gateway.cancel()
+        summary = future.result(timeout=3)
+
+    assert time.monotonic() - started_at < 2
+    assert summary.cancelled == 1
+    segments = tmp_path / ".Lesson.mp4.gcd-part" / "segments"
+    assert (segments / "000000.bin").read_bytes() == b"complete"
+    assert not (segments / "000001.bin.tmp").exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows process-tree shutdown")

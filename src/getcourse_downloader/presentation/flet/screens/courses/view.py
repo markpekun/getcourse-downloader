@@ -9,7 +9,13 @@ from pathlib import Path
 import flet as ft
 
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
-from getcourse_downloader.domain.models import Course, DownloadSummary, Lesson
+from getcourse_downloader.domain.models import (
+    Course,
+    DownloadSummary,
+    Lesson,
+    MediaKind,
+    MediaSelection,
+)
 from getcourse_downloader.presentation.flet.screens.courses.components import (
     DownloadLessonRow,
     build_course_tree,
@@ -114,6 +120,7 @@ class CoursesScreen:
             color=Color.TEXT_SECONDARY,
             weight=ft.FontWeight.W_500,
         )
+        self._media_selector = ft.Container(content=self._build_media_selector_controls())
         self.course_list = ft.Column(spacing=12, scroll=ft.ScrollMode.AUTO, expand=True)
         self._build_course_list()
 
@@ -440,6 +447,7 @@ class CoursesScreen:
                         content=ft.Row(
                             spacing=8,
                             controls=[
+                                self._media_selector,
                                 ft.Container(
                                     content=ft.Row(
                                         [
@@ -819,7 +827,7 @@ class CoursesScreen:
                             ),
                         ),
                         accent_button(
-                            "Скачать выбранное",
+                            "Скачать выбранные материалы",
                             on_click=self._start_download,
                             icon=ft.Icons.DOWNLOAD_ROUNDED,
                             height=48,
@@ -830,13 +838,63 @@ class CoursesScreen:
 
         self.side_content.controls = [
             _stat_card(),
-            _quality_card(),
+            *([_quality_card()] if self.state.media_selection.includes(MediaKind.VIDEO) else []),
             _save_path_card(),
             _actions_card(),
         ]
 
     def _on_quality_change(self, e):
         self.state.quality = e.control.value
+
+    def _build_media_selector_controls(self) -> ft.Row:
+        options = (
+            (MediaSelection.video_only(), "Видео", ft.Icons.VIDEOCAM_ROUNDED),
+            (MediaSelection.audio_only(), "Аудио", ft.Icons.AUDIOTRACK_ROUNDED),
+            (
+                MediaSelection.video_and_audio(),
+                "Видео и аудио",
+                ft.Icons.VIDEO_LIBRARY_ROUNDED,
+            ),
+        )
+        controls: list[ft.Control] = []
+        for selection, label, icon in options:
+            selected = selection == self.state.media_selection
+            controls.append(
+                ft.Container(
+                    content=ft.Row(
+                        spacing=4,
+                        tight=True,
+                        controls=[
+                            ft.Icon(
+                                icon,
+                                size=14,
+                                color=Color.GREEN if selected else Color.TEXT_MUTED,
+                            ),
+                            ft.Text(
+                                label,
+                                size=11,
+                                color=Color.TEXT if selected else Color.TEXT_SECONDARY,
+                                weight=ft.FontWeight.W_600 if selected else ft.FontWeight.W_400,
+                            ),
+                        ],
+                    ),
+                    padding=ft.Padding.symmetric(horizontal=9, vertical=5),
+                    border_radius=14,
+                    border=ft.Border.all(1.5, Color.GREEN if selected else Color.BORDER),
+                    bgcolor="rgba(16,185,129,0.12)" if selected else "rgba(255,255,255,0.02)",
+                    ink=True,
+                    on_click=lambda _event, value=selection: self._set_media_selection(value),
+                )
+            )
+        return ft.Row(spacing=5, tight=True, controls=controls)
+
+    def _set_media_selection(self, selection: MediaSelection) -> None:
+        if selection == self.state.media_selection:
+            return
+        self.state.media_selection = selection
+        self._media_selector.content = self._build_media_selector_controls()
+        self._build_side_panel()
+        self.page.update()
 
     async def _pick_directory(self, e):
         kwargs = {"dialog_title": "Выберите папку для сохранения видео"}
@@ -979,7 +1037,13 @@ class CoursesScreen:
 
     @staticmethod
     def _is_progress_line(text: str) -> bool:
-        return "Сегменты:" in text or "Сегментов:" in text
+        normalized = text.casefold()
+        return (
+            "сегменты:" in normalized
+            or "сегментов:" in normalized
+            or ("загрузка видео" in normalized and "сегмент" in normalized)
+            or "скачивание аудио" in normalized
+        )
 
     def _should_log(self, line: str) -> bool:
         stripped = line.lstrip()
@@ -993,6 +1057,8 @@ class CoursesScreen:
         check = line.lower()
         if "сегмент" in check and "нет" not in check:
             title = "Загрузка видео"
+        elif "скачивание аудио" in check:
+            title = "Загрузка аудио"
         elif "не получен" in check:
             title = "Плейлист не найден"
         elif "получение запроса" in check:
@@ -1177,6 +1243,7 @@ class CoursesScreen:
             lessons_to_download,
             self.state.quality,
             self.state.save_path,
+            self.state.media_selection,
         )
         self._controller.start_download(
             request,
@@ -1201,27 +1268,35 @@ class CoursesScreen:
         if event.type is DownloadEventType.AUTHENTICATED:
             self._switch_overlay_to_download()
         elif event.type is DownloadEventType.PROGRESS:
-            self._download_title.value = "Загрузка видео"
+            self._download_title.value = self._media_download_label(event)
             if event.speed_bps is not None:
                 self._speed_text.value = f"Средняя: {self._format_speed(event.speed_bps)}"
             self._update_last_log(event.message)
             self._update_download_row(event)
             return
         elif event.type is DownloadEventType.LESSON_STARTED:
-            self._download_title.value = "Проверяем видео"
+            self._download_title.value = self._lesson_check_label()
             self._speed_text.value = "Средняя: —"
             self._add_log(f"▶ {event.lesson}")
             self._update_download_row(event)
             if event.lesson_url:
                 self._follow_download_lesson(event.lesson_url)
             return
-        elif event.type is DownloadEventType.VIDEO_FOUND:
+        elif event.type in {DownloadEventType.VIDEO_FOUND, DownloadEventType.MEDIA_FOUND}:
+            self._download_title.value = self._media_download_label(event)
             self._speed_text.value = "Средняя: —"
+            self._update_last_log(event.message)
+            self._update_download_row(event)
+        elif event.type is DownloadEventType.LOG and event.stage == "ffmpeg":
+            self._download_title.value = "Сборка MP4"
+            self._speed_text.value = "Средняя: —"
+            self._update_last_log(event.message)
             self._update_download_row(event)
         elif event.type in {
             DownloadEventType.LESSON_COMPLETED,
             DownloadEventType.LESSON_SKIPPED,
             DownloadEventType.LESSON_NO_VIDEO,
+            DownloadEventType.LESSON_NO_MEDIA,
         }:
             self._update_download_row(event)
         elif event.type is DownloadEventType.LESSON_FAILED or event.type is DownloadEventType.ERROR:
@@ -1317,6 +1392,24 @@ class CoursesScreen:
             return f"{speed_bps / 1024:.0f} КБ/с"
         return f"{speed_bps:.0f} Б/с"
 
+    @staticmethod
+    def _media_download_label(event: DownloadEvent) -> str:
+        index = event.media_index if event.media_kind == "audio" else event.video_index
+        total = event.media_total if event.media_kind == "audio" else event.video_total
+        if index and total and total > 1:
+            return f"{index}/{total} Загрузка"
+        return "Загрузка"
+
+    def _lesson_check_label(self) -> str:
+        selection = getattr(
+            getattr(self, "state", None), "media_selection", MediaSelection.video_only()
+        )
+        if selection == MediaSelection.audio_only():
+            return "Проверяем аудио"
+        if selection == MediaSelection.video_only():
+            return "Проверяем видео"
+        return "Проверяем материалы"
+
     def _update_download_row(self, event: DownloadEvent) -> None:
         if not event.lesson_url:
             return
@@ -1325,23 +1418,40 @@ class CoursesScreen:
             return
 
         if event.type is DownloadEventType.LESSON_STARTED:
+            checking_audio = self._lesson_check_label() == "Проверяем аудио"
             row.status_holder.content = ft.Icon(
-                ft.Icons.VIDEO_FILE_ROUNDED,
+                ft.Icons.AUDIOTRACK_ROUNDED if checking_audio else ft.Icons.VIDEO_FILE_ROUNDED,
                 size=18,
                 color=Color.ACCENT_LIGHT,
             )
-            row.status_text.value = "Проверяем видео…"
+            row.status_text.value = f"{self._lesson_check_label()}…"
             row.status_text.color = Color.ACCENT_LIGHT
-        elif event.type is DownloadEventType.VIDEO_FOUND:
+        elif event.type in {DownloadEventType.VIDEO_FOUND, DownloadEventType.MEDIA_FOUND}:
             row.status_holder.content = ft.Icon(
-                ft.Icons.DOWNLOADING_ROUNDED,
+                (
+                    ft.Icons.AUDIOTRACK_ROUNDED
+                    if event.media_kind == "audio"
+                    else ft.Icons.DOWNLOADING_ROUNDED
+                ),
                 size=18,
                 color=Color.ACCENT_LIGHT,
             )
-            row.status_text.value = "Загрузка"
+            row.status_text.value = (
+                self._media_download_label(event)
+                if event.media_kind == "audio" or (event.video_index and event.video_total)
+                else "Загрузка"
+            )
             row.status_text.color = Color.ACCENT_LIGHT
+            row.progress.value = 0
+            row.progress_text.value = "0%"
             row.progress.visible = True
             row.progress_text.visible = True
+        elif event.type is DownloadEventType.LOG and event.stage == "ffmpeg":
+            row.status_text.value = "Сборка MP4…"
+            row.status_text.color = Color.ACCENT_LIGHT
+            row.progress.value = None
+            row.progress.visible = True
+            row.progress_text.visible = False
         elif event.type is DownloadEventType.PROGRESS:
             total = event.total or 0
             current = event.current or 0
@@ -1350,7 +1460,11 @@ class CoursesScreen:
             row.progress.visible = True
             row.progress_text.visible = True
             row.progress_text.value = f"{round(value * 100)}%"
-            row.status_text.value = "Загрузка"
+            row.status_text.value = (
+                self._media_download_label(event)
+                if event.media_kind == "audio" or (event.video_index and event.video_total)
+                else "Загрузка"
+            )
             row.status_text.color = Color.ACCENT_LIGHT
         elif event.type is DownloadEventType.LESSON_COMPLETED:
             row.status_holder.content = ft.Icon(
@@ -1374,13 +1488,19 @@ class CoursesScreen:
             row.status_text.color = Color.GREEN
             row.progress.visible = False
             row.progress_text.visible = False
-        elif event.type is DownloadEventType.LESSON_NO_VIDEO:
+        elif event.type in {DownloadEventType.LESSON_NO_VIDEO, DownloadEventType.LESSON_NO_MEDIA}:
             row.status_holder.content = ft.Icon(
                 ft.Icons.CANCEL_ROUNDED,
                 size=18,
                 color=Color.RED,
             )
-            row.status_text.value = "Видео не найдено"
+            row.status_text.value = (
+                "Аудио не найдено"
+                if event.error_code == "AUDIO_NOT_FOUND"
+                else "Материалы не найдены"
+                if event.type is DownloadEventType.LESSON_NO_MEDIA
+                else "Видео не найдено"
+            )
             row.status_text.color = Color.RED
             if event.diagnostic_report:
                 row.details_button.visible = True
@@ -1413,7 +1533,15 @@ class CoursesScreen:
         if summary.already_present:
             lines.append(f"Уже было на диске: {summary.already_present}")
         if summary.no_video:
-            lines.append(f"Без видео: {summary.no_video}")
+            selection = getattr(
+                getattr(self, "state", None), "media_selection", MediaSelection.video_only()
+            )
+            no_media_label = (
+                "Без видео"
+                if selection == MediaSelection.video_only()
+                else "Без подходящих материалов"
+            )
+            lines.append(f"{no_media_label}: {summary.no_video}")
         if summary.failed:
             lines.append(f"Ошибки: {len(summary.failed)}")
         if summary.cancelled:
@@ -1459,7 +1587,14 @@ class CoursesScreen:
         self.page.update()
 
     def _mark_unfinished_rows(self, text: str, color: str, icon: ft.IconData) -> None:
-        terminal_prefixes = ("Готово", "Уже скачано", "Видео не найдено", "Ошибка")
+        terminal_prefixes = (
+            "Готово",
+            "Уже скачано",
+            "Видео не найдено",
+            "Аудио не найдено",
+            "Материалы не найдены",
+            "Ошибка",
+        )
         for row in self._download_rows.values():
             if str(row.status_text.value).startswith(terminal_prefixes):
                 continue

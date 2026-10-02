@@ -6,6 +6,8 @@ from getcourse_downloader.domain.models import (
     Course,
     DownloadRequest,
     Lesson,
+    MediaKind,
+    MediaSelection,
     SelectedLesson,
     VideoQuality,
 )
@@ -41,6 +43,10 @@ def test_event_json_round_trip():
         course_path=("Курс", "Модуль"),
         video_index=1,
         video_total=2,
+        media_kind="audio",
+        media_title="Мантра",
+        media_index=1,
+        media_total=2,
         current=5,
         total=10,
         downloaded=1,
@@ -70,6 +76,47 @@ def test_download_request_schema_v2_round_trip(tmp_path):
 
     assert payload["schema_version"] == 2
     assert DownloadRequest.from_dict(payload) == request
+
+
+def test_media_selection_serializes_in_stable_kind_order():
+    selection = MediaSelection((MediaKind.AUDIO, MediaKind.VIDEO))
+
+    assert selection.kinds == (MediaKind.VIDEO, MediaKind.AUDIO)
+    assert selection.to_dict() == {"kinds": ["video", "audio"]}
+    assert MediaSelection.from_dict({"kinds": ["audio", "video"]}) == selection
+
+
+def test_media_selection_rejects_empty_or_unknown_kinds():
+    with pytest.raises(InvalidDataError, match="Хотя бы один"):
+        MediaSelection.from_dict({"kinds": []})
+
+    with pytest.raises(InvalidDataError, match="Неизвестный тип"):
+        MediaSelection.from_dict({"kinds": ["document"]})
+
+
+def test_download_request_defaults_legacy_payload_to_video_only(tmp_path):
+    payload = {
+        "schema_version": 2,
+        "lessons": [],
+        "quality": "auto",
+        "save_path": str(tmp_path),
+    }
+
+    request = DownloadRequest.from_dict(payload)
+
+    assert request.media_selection == MediaSelection.video_only()
+    assert request.to_dict()["media_selection"] == {"kinds": ["video"]}
+
+
+def test_download_request_round_trip_preserves_audio_selection(tmp_path):
+    request = DownloadRequest(
+        lessons=(),
+        quality=VideoQuality.AUTO,
+        save_path=tmp_path,
+        media_selection=MediaSelection.audio_only(),
+    )
+
+    assert DownloadRequest.from_dict(request.to_dict()) == request
 
 
 def test_unknown_quality_rejected():
