@@ -25,6 +25,7 @@ from getcourse_downloader.infrastructure.getcourse.authentication import is_auth
 
 MAX_STREAMS = 500
 DISCOVERY_CONCURRENCY = 4
+REDESIGNED_CONTENT_TIMEOUT_MS = 15_000
 
 _STREAM_REFERENCE_RE = re.compile(
     r"(?:(?:https?:)?//[^\"'<>\s\\]+)?/(?:pl/)?teach/control/stream/"
@@ -292,6 +293,7 @@ class GetCourseDiscoverer:
                     for child in snapshot.children:
                         await on_course_discovered(self._discovery_update(child))
             else:
+                await self._wait_for_redesigned_content(page)
                 seeds = await self._extract_stream_links(
                     page,
                     current_url,
@@ -520,6 +522,7 @@ class GetCourseDiscoverer:
     async def _read_loaded_stream(self, page: Page, stream: _StreamLink) -> _StreamSnapshot:
         if await _is_authentication_required(page):
             raise ExternalServiceError("Сессия GetCourse завершилась во время обхода курсов")
+        await self._wait_for_redesigned_content(page)
         title = await self._read_stream_title(page, stream)
         lessons = tuple(await self._read_lessons(page, page.url))
         children = tuple(
@@ -561,7 +564,44 @@ class GetCourseDiscoverer:
         )
 
     @staticmethod
+    async def _wait_for_redesigned_content(page: Page) -> None:
+        selector = ".gc-redesigned .loader-skeleton"
+        if await page.query_selector(selector) is None:
+            return
+        try:
+            await page.wait_for_selector(
+                selector, state="hidden", timeout=REDESIGNED_CONTENT_TIMEOUT_MS
+            )
+        except PlaywrightTimeoutError as error:
+            raise ExternalServiceError(
+                "Список модулей или уроков не загрузился. Повторите попытку.",
+                code="CONTENT_LOAD_TIMEOUT",
+                technical_details=(
+                    "GetCourse loading indicator remained visible for "
+                    f"{REDESIGNED_CONTENT_TIMEOUT_MS} ms"
+                ),
+            ) from error
+
+    @staticmethod
+    async def _read_link_cards(
+        page: Page, selector: str, title_selector: str
+    ) -> list[tuple[str, str]]:
+        links: list[tuple[str, str]] = []
+        for card in await page.query_selector_all(selector):
+            href = await card.get_attribute("href")
+            if not href:
+                continue
+            heading = await card.query_selector(title_selector)
+            if heading is None:
+                continue
+            title = clean_title(await heading.inner_text())
+            if title:
+                links.append((title, href))
+        return links
+
+    @classmethod
     async def _extract_stream_links(
+        cls,
         page: Page,
         base_url: str,
         *,
@@ -579,6 +619,16 @@ class GetCourseDiscoverer:
             hint = title if title != "Без названия" else None
             indexes[url] = len(ordered)
             ordered.append(_StreamLink(url=url, title=hint))
+
+        cards = await cls._read_link_cards(
+            page, ".training-list-wrapper a.card-link", ".training-card__header"
+        )
+        for title, href in cards:
+            url = normalize_stream_url(base_url, href)
+            if not url or url in indexes:
+                continue
+            indexes[url] = len(ordered)
+            ordered.append(_StreamLink(url=url, title=title))
 
         if allow_fallback and not ordered:
             content = await page.content()
@@ -612,8 +662,8 @@ class GetCourseDiscoverer:
         identifier = stream.url.rstrip("/").rsplit("/", maxsplit=1)[-1]
         return f"Курс {identifier}"
 
-    @staticmethod
-    async def _read_lessons(page: Page, base_url: str) -> list[Lesson]:
+    @classmethod
+    async def _read_lessons(cls, page: Page, base_url: str) -> list[Lesson]:
         elements = await page.query_selector_all("ul.lesson-list li")
         lessons: list[Lesson] = []
         seen: set[str] = set()
@@ -621,6 +671,16 @@ class GetCourseDiscoverer:
             title, href = parse_lesson_item(await element.inner_html())
             url = normalize_lesson_url(base_url, href)
             if not url or title == "Без названия" or url in seen:
+                continue
+            seen.add(url)
+            lessons.append(Lesson(title=title, url=url))
+
+        cards = await cls._read_link_cards(
+            page, ".LessonList-container a.card-link", ".lesson-card_heading"
+        )
+        for title, href in cards:
+            url = normalize_lesson_url(base_url, href)
+            if not url or url in seen:
                 continue
             seen.add(url)
             lessons.append(Lesson(title=title, url=url))

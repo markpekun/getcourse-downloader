@@ -24,3 +24,8 @@ dist/
 docs
 .cache/
 debug-sample-aes/
+
+# Local assistant instructions and supplied attachments
+/.agents/
+/.codex-remote-attachments/
+/AGENTS.md

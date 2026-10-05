@@ -1,12 +1,25 @@
 import asyncio
 import os
 import sys
+from collections.abc import Iterator
 
 import pytest
 
 from getcourse_downloader.domain.errors import ExternalServiceError
 from getcourse_downloader.infrastructure.browser.playwright import PlaywrightBrowserFactory
 from getcourse_downloader.infrastructure.platform.paths import AppPaths
+
+
+@pytest.fixture(autouse=True)
+def _restore_browser_path() -> Iterator[None]:
+    original = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+        else:
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = original
 
 
 def _paths(tmp_path) -> AppPaths:
