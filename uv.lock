@@ -629,7 +629,7 @@ wheels = [
 
 [[package]]
 name = "getcourse-downloader"
-version = "4.0"
+version = "4.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
