@@ -51,3 +51,13 @@ flowchart LR
 - HLS master playlist задаёт варианты качества, а не уроки. Неполный набор сегментов не является успешным видео; итоговый файл появляется только после успешной обработки (`infrastructure/media/hls.py`, `tests/test_hls_resume.py`).
 - Runtime-данные и профиль находятся в пользовательском каталоге `AppPaths`, а не рядом с EXE. Диагностика удаляет query-параметры URL (`infrastructure/platform/paths.py`, `infrastructure/diagnostics/reports.py`). Секреты, содержимое профиля и подписанные URL не переносить в документацию или память.
 - Для изменений discovery/auth смотреть `tests/test_parse_courses.py`, `test_discover_courses.py`, `test_discovery_errors.py`, `test_playwright_browser_factory.py`, `test_redesigned_discovery.py`; последние используют отдельный локальный Firefox, безопасные HTML-образцы и блокируют внешние запросы. Для загрузки/worker — `test_downloader_outcomes.py`, `test_hls_resume.py`, `test_worker_lifecycle.py`, `test_worker_protocol.py`; для UI — `test_start_screen.py`, `test_courses_controller.py`, `test_screens.py`. Команды проверок описаны в `README.md`. Результаты локальных тестов не подтверждают живой GetCourse и Windows-сборку.
+
+## Очистка списка курсов и авторизации
+
+Очистка списка курсов и очистка авторизации — отдельные действия с подтверждением
+из `courses/confirmations.py`. Первая удаляет только дерево через репозиторий;
+вторая останавливает собственный worker и вызывает `BrowserAuthorizationResetter`.
+`BrowserProfileResetter` очищает выделенный профиль из `AppPaths.session` в отдельном
+потоке под блокировкой владения. Занятый профиль не очищается; ссылки на внешние
+каталоги не обходятся. Настройки, список курсов и скачанные видео сохраняются при
+очистке авторизации. Во время загрузки, отмены или очистки эти действия недоступны.

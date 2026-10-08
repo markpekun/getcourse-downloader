@@ -8,6 +8,7 @@ from pathlib import Path
 
 import flet as ft
 
+from getcourse_downloader.domain.errors import DownloaderError
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.domain.models import Course, DownloadSummary, Lesson
 from getcourse_downloader.presentation.flet.screens.courses.completion import CompletionFlow
@@ -17,6 +18,10 @@ from getcourse_downloader.presentation.flet.screens.courses.components import (
     build_download_lesson_row,
     iter_course_lessons,
     selected_course_lessons,
+)
+from getcourse_downloader.presentation.flet.screens.courses.confirmations import (
+    ClearTarget,
+    build_clear_confirmation,
 )
 from getcourse_downloader.presentation.flet.screens.courses.controller import CoursesController
 from getcourse_downloader.presentation.flet.screens.courses.state import (
@@ -61,6 +66,7 @@ class CoursesScreen:
         self._controller = controller
         self._on_navigate_start = on_navigate_start
         self.state = CoursesViewState(save_path=controller.load_save_path())
+        self._confirmation_dialog: ft.AlertDialog | None = None
         self._download_scroll_task: concurrent.futures.Future[None] | None = None
         self._download_follow_resume_task: concurrent.futures.Future[None] | None = None
         self._download_follow_paused = False
@@ -405,6 +411,22 @@ class CoursesScreen:
 
     def _build_header(self) -> ft.Container:
         total_lessons = sum(course.lesson_count for course in self.data)
+        self._clear_courses_button = ft.IconButton(
+            icon=ft.Icons.PLAYLIST_REMOVE_ROUNDED,
+            icon_color=Color.RED,
+            icon_size=20,
+            bgcolor="rgba(239,68,68,0.10)",
+            tooltip="Очистить список курсов и уроков",
+            on_click=self._delete_courses,
+        )
+        self._clear_authorization_button = ft.IconButton(
+            icon=ft.Icons.COOKIE_OUTLINED,
+            icon_color=Color.YELLOW,
+            icon_size=20,
+            bgcolor="rgba(245,158,11,0.10)",
+            tooltip="Очистить авторизацию (cookies)",
+            on_click=self._clear_authorization,
+        )
         return ft.Container(
             padding=ft.Padding.symmetric(horizontal=32, vertical=16),
             content=ft.Row(
@@ -466,53 +488,8 @@ class CoursesScreen:
                                         "(обновляется раз в 3 секунды)"
                                     ),
                                 ),
-                                ft.Container(
-                                    content=ft.Icon(
-                                        ft.Icons.DELETE_ROUNDED,
-                                        size=20,
-                                        color=Color.RED,
-                                    ),
-                                    padding=ft.Padding.symmetric(horizontal=8, vertical=4),
-                                    border_radius=6,
-                                    bgcolor="rgba(239,68,68,0.12)",
-                                    ink=True,
-                                    on_click=self._delete_courses,
-                                    tooltip="Удалить курсы и начать заново",
-                                ),
-                                ft.Container(
-                                    content=ft.Row(
-                                        [
-                                            ft.Icon(
-                                                ft.Icons.FOLDER_OPEN_ROUNDED,
-                                                size=14,
-                                                color=Color.ACCENT_LIGHT,
-                                            ),
-                                            ft.Text(
-                                                str(len(self.data)),
-                                                size=13,
-                                                weight=ft.FontWeight.W_600,
-                                                color=Color.ACCENT_LIGHT,
-                                            ),
-                                        ],
-                                        spacing=4,
-                                    ),
-                                    padding=ft.Padding.symmetric(horizontal=8, vertical=4),
-                                    border_radius=6,
-                                    bgcolor="rgba(124,58,237,0.12)",
-                                ),
-                                ft.Container(
-                                    content=ft.Icon(
-                                        ft.Icons.TELEGRAM,
-                                        size=19,
-                                        color="#2AABEE",
-                                    ),
-                                    padding=ft.Padding.all(7),
-                                    border_radius=8,
-                                    bgcolor="rgba(42,171,238,0.10)",
-                                    ink=True,
-                                    tooltip="Написать в поддержку",
-                                    on_click=self._open_contact,
-                                ),
+                                self._clear_courses_button,
+                                self._clear_authorization_button,
                             ],
                         ),
                     ),
@@ -857,9 +834,83 @@ class CoursesScreen:
             self._build_side_panel()
             self.page.update()
 
-    async def _delete_courses(self, e):
-        self._controller.delete_courses()
-        await self._on_navigate_start()
+    def _delete_courses(self, e=None) -> None:
+        self._request_clear("courses")
+
+    def _clear_authorization(self, e=None) -> None:
+        self._request_clear("authorization")
+
+    def _clear_is_blocked(self) -> bool:
+        return self.state.downloading or self.state.cancelling or self.state.clearing
+
+    def _refresh_clear_actions(self) -> None:
+        for name in ("_clear_courses_button", "_clear_authorization_button"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.disabled = self._clear_is_blocked()
+
+    def _request_clear(self, target: ClearTarget) -> None:
+        if self._confirmation_dialog is not None:
+            return
+        if self._clear_is_blocked():
+            self._show_snack("Дождитесь завершения текущей операции", is_error=True)
+            return
+
+        async def confirm(_event):
+            await self._confirm_clear(target)
+
+        self._confirmation_dialog = build_clear_confirmation(
+            target,
+            on_confirm=confirm,
+            on_cancel=self._close_clear_confirmation,
+            on_dismiss=self._on_clear_confirmation_dismissed,
+        )
+        self.page.show_dialog(self._confirmation_dialog)
+
+    def _close_clear_confirmation(self, _event=None) -> None:
+        if self._confirmation_dialog is not None:
+            self.page.pop_dialog()
+            self._confirmation_dialog = None
+
+    def _on_clear_confirmation_dismissed(self, _event=None) -> None:
+        if _event is None or _event.control is self._confirmation_dialog:
+            self._confirmation_dialog = None
+
+    async def _confirm_clear(self, target: ClearTarget) -> None:
+        if self._confirmation_dialog is None:
+            return
+        self._close_clear_confirmation()
+        if self._clear_is_blocked():
+            self._show_snack("Дождитесь завершения текущей операции", is_error=True)
+            return
+        self.state.clearing = True
+        self._refresh_clear_actions()
+        self.page.update()
+        succeeded = False
+        try:
+            if target == "courses":
+                await asyncio.to_thread(self._controller.delete_courses)
+            else:
+                await self._controller.clear_authorization()
+            succeeded = True
+        except DownloaderError as error:
+            self._show_snack(str(error), is_error=True)
+        except OSError:
+            self._show_snack(
+                "Не удалось выполнить очистку. Проверьте права доступа и повторите попытку.",
+                is_error=True,
+            )
+        finally:
+            self.state.clearing = False
+            self._refresh_clear_actions()
+            self.page.update()
+        if succeeded:
+            if target == "courses":
+                await self._on_navigate_start()
+            else:
+                self._show_snack(
+                    "Авторизация очищена. При следующем открытии курса войдите заново."
+                )
 
     def _update_selected_count(self, e=None):
         self.selected_label.value = str(len(self.state.selected_lesson_urls))
@@ -1134,14 +1185,14 @@ class CoursesScreen:
         self._controller.continue_authentication()
 
     def _start_download(self, e):
+        if self._clear_is_blocked():
+            return
         lessons_to_download = selected_course_lessons(
             self.data,
             self.state.selected_lesson_urls,
         )
         if not lessons_to_download:
             self._show_snack("Нет выбранных уроков", is_error=True)
-            return
-        if self.state.downloading:
             return
 
         if not Path(self.state.save_path).is_dir():
@@ -1151,6 +1202,7 @@ class CoursesScreen:
 
         self.state.downloading = True
         self.state.cancelling = False
+        self._refresh_clear_actions()
         self._active_download_id += 1
         run_id = self._active_download_id
         self._reset_download_follow()
@@ -1461,6 +1513,7 @@ class CoursesScreen:
             return
         self.state.downloading = False
         self.state.cancelling = False
+        self._refresh_clear_actions()
         self._reset_download_follow()
         self._cancel_btn.disabled = False
         self._cancel_btn.content = "Отмена"
@@ -1588,7 +1641,7 @@ class CoursesScreen:
         icon = ft.Icons.ERROR_OUTLINE if is_error else ft.Icons.CHECK_CIRCLE_OUTLINE
         icon_color = Color.RED if is_error else Color.GREEN
 
-        self.page.snack_bar = ft.SnackBar(
+        snack_bar = ft.SnackBar(
             content=ft.Row(
                 [
                     ft.Icon(icon, color=icon_color, size=18),
@@ -1603,5 +1656,4 @@ class CoursesScreen:
             behavior=ft.SnackBarBehavior.FLOATING,
             elevation=8,
         )
-        self.page.snack_bar.open = True
-        self.page.update()
+        self.page.show_dialog(snack_bar)
