@@ -99,19 +99,26 @@ def quality_suffixed_path(stem: Path, quality: str) -> Path:
     return stem.with_name(f"{stem.name}{suffix}.mp4")
 
 
-def existing_output_path(stem: Path) -> Path | None:
-    """Find a legacy or quality-suffixed completed MP4 for one output stem."""
+def existing_output_paths(stem: Path) -> tuple[Path, ...]:
+    """List nonempty completed MP4s, excluding partial and audio-only outputs."""
 
     legacy = stem.with_name(f"{stem.name}.mp4")
     try:
-        if legacy.is_file() and legacy.stat().st_size > 0:
-            return legacy
+        candidates = [legacy] if legacy.is_file() and legacy.stat().st_size > 0 else []
         pattern = re.compile(rf"^{re.escape(stem.name)}_(\d{{3,4}})\.mp4$", re.IGNORECASE)
-        candidates = sorted(
-            path
-            for path in stem.parent.iterdir()
-            if path.is_file() and pattern.fullmatch(path.name) and path.stat().st_size > 0
+        candidates.extend(
+            sorted(
+                path
+                for path in stem.parent.iterdir()
+                if path.is_file() and pattern.fullmatch(path.name) and path.stat().st_size > 0
+            )
         )
     except OSError:
-        return None
-    return candidates[0] if candidates else None
+        return ()
+    return tuple(candidates)
+
+
+def existing_output_path(stem: Path) -> Path | None:
+    """Find any completed version when its quality does not matter."""
+
+    return next(iter(existing_output_paths(stem)), None)

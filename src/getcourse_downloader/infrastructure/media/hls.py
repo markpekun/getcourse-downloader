@@ -20,7 +20,7 @@ from getcourse_downloader.application.ports.download import EventHandler
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.infrastructure.media.ffmpeg import FfmpegMuxer, normalize_empty_saiz
 from getcourse_downloader.infrastructure.storage.filenames import (
-    existing_output_path,
+    existing_output_paths,
     quality_suffixed_path,
 )
 
@@ -459,13 +459,14 @@ def _prepare_checkpoint(
     segment_encryption: list[dict[str, str | int] | None] | None = None,
     resource_ranges: list[HlsByteRange | None] | None = None,
     resource_roles: list[str] | None = None,
+    selected_height: int = 0,
 ) -> tuple[Path, list[Path], int]:
     checkpoint = _checkpoint_path(output_mp4)
     manifest_path = checkpoint / "manifest.json"
     canonical_segments = [canonical_media_url(url) for url in segment_urls]
     ranges = resource_ranges or [None] * len(segment_urls)
     roles = resource_roles or ["media"] * len(segment_urls)
-    expected_manifest = {
+    expected_manifest: dict[str, Any] = {
         "schema_version": 3,
         "lesson_url": lesson_url,
         "requested_quality": requested_quality,
@@ -481,6 +482,8 @@ def _prepare_checkpoint(
         ],
         "segment_encryption": segment_encryption or [None] * len(segment_urls),
     }
+    if selected_height > 0:
+        expected_manifest["selected_height"] = selected_height
 
     current_manifest: object = None
     if manifest_path.is_file():
@@ -534,6 +537,23 @@ class HlsDownloader:
                 return f"{height}p"
         return fallback
 
+    async def find_existing_output(self, stem: Path, height: int) -> HlsDownloadResult | None:
+        """Reuse only a completed version matching a known target resolution."""
+
+        if height <= 0:
+            return None
+        for path in existing_output_paths(stem):
+            suffix = (
+                path.stem[len(stem.name) + 1 :] if path.stem.startswith(f"{stem.name}_") else ""
+            )
+            fallback = f"{suffix}p" if suffix.isdigit() else ""
+            quality = await self.probe_quality(path, fallback)
+            if quality == f"{height}p":
+                return HlsDownloadResult(
+                    HlsDownloadStatus.ALREADY_PRESENT, output_path=path, quality=quality
+                )
+        return None
+
     async def merge_audio_video(
         self,
         video: Path,
@@ -560,6 +580,7 @@ class HlsDownloader:
         referer_url: str = "",
         course_path: tuple[str, ...] = (),
         requested_quality: str = "auto",
+        selected_height: int = 0,
         video_index: int = 1,
         video_total: int = 1,
         session_key: HlsKeyDeclaration | None = None,
@@ -567,21 +588,13 @@ class HlsDownloader:
     ) -> HlsDownloadResult:
         output_mp4 = output_without_suffix.parent / f"{output_without_suffix.name}.mp4"
         output_mp4.parent.mkdir(parents=True, exist_ok=True)
-        existing_output = existing_output_path(output_without_suffix)
+        resolved_height = selected_height or extract_quality(playlist_url)
+        existing_output = await self.find_existing_output(output_without_suffix, resolved_height)
         if existing_output is not None:
             checkpoint = _checkpoint_path(output_mp4)
             if checkpoint.exists():
                 _reset_checkpoint(checkpoint, output_mp4)
-            fallback = (
-                f"{extract_quality(playlist_url)}p"
-                if extract_quality(playlist_url)
-                else (f"{requested_quality}p" if requested_quality.isdigit() else "")
-            )
-            return HlsDownloadResult(
-                HlsDownloadStatus.ALREADY_PRESENT,
-                output_path=existing_output,
-                quality=await self.probe_quality(existing_output, fallback),
-            )
+            return existing_output
 
         if is_cancelled and is_cancelled():
             return HlsDownloadResult(HlsDownloadStatus.CANCELLED)
@@ -744,6 +757,7 @@ class HlsDownloader:
                 output_mp4,
                 lesson_url=lesson_url,
                 requested_quality=requested_quality,
+                selected_height=resolved_height,
                 playlist_url=playlist_url,
                 segment_urls=segment_urls,
                 segment_encryption=[
@@ -994,8 +1008,8 @@ class HlsDownloader:
                     total_segments=total,
                 )
             fallback = (
-                f"{extract_quality(playlist_url)}p"
-                if extract_quality(playlist_url)
+                f"{resolved_height}p"
+                if resolved_height
                 else (f"{requested_quality}p" if requested_quality.isdigit() else "")
             )
             quality = await self.probe_quality(temporary_output, fallback)
