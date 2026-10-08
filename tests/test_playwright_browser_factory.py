@@ -6,7 +6,10 @@ from collections.abc import Iterator
 import pytest
 
 from getcourse_downloader.domain.errors import ExternalServiceError
-from getcourse_downloader.infrastructure.browser.playwright import PlaywrightBrowserFactory
+from getcourse_downloader.infrastructure.browser.playwright import (
+    PlaywrightBrowserFactory,
+    _ProfileLease,
+)
 from getcourse_downloader.infrastructure.platform.paths import AppPaths
 
 
@@ -123,3 +126,69 @@ def test_cancelled_browser_launch_releases_profile(tmp_path):
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(PlaywrightBrowserFactory(paths).launch(Playwright(), headless=True))
     assert not (paths.session / ".gcd-profile-owner").exists()
+
+
+def test_launch_waits_for_previous_profile_owner_to_close(tmp_path):
+    paths = _paths(tmp_path)
+    factory = PlaywrightBrowserFactory(paths)
+    previous = _ProfileLease(paths.session)
+    previous.acquire()
+
+    class Context:
+        def on(self, event, callback):
+            self.close_callback = callback
+
+    context = Context()
+
+    class Firefox:
+        async def launch_persistent_context(self, *_args, **_kwargs):
+            return context
+
+    class Playwright:
+        firefox = Firefox()
+
+    async def run():
+        async def close_previous():
+            await asyncio.sleep(0.05)
+            previous.release()
+
+        closing = asyncio.create_task(close_previous())
+        try:
+            assert await factory.launch(Playwright(), headless=True) is context
+            context.close_callback()
+        finally:
+            await closing
+            previous.release()
+
+    asyncio.run(run())
+
+
+def test_launch_retries_a_profile_that_firefox_is_still_closing(tmp_path):
+    paths = _paths(tmp_path)
+    factory = PlaywrightBrowserFactory(paths)
+
+    from playwright.async_api import Error as PlaywrightError
+
+    class Context:
+        def on(self, event, callback):
+            self.close_callback = callback
+
+    context = Context()
+
+    class Firefox:
+        attempts = 0
+
+        async def launch_persistent_context(self, *_args, **_kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise PlaywrightError("profile is already in use")
+            return context
+
+    class Playwright:
+        firefox = Firefox()
+
+    assert asyncio.run(factory.launch(Playwright(), headless=True)) is context
+    context.close_callback()
+    lease = _ProfileLease(paths.session)
+    lease.acquire()
+    lease.release()

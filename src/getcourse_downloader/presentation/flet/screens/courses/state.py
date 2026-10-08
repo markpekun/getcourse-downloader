@@ -1,4 +1,25 @@
 from dataclasses import dataclass, field
+from enum import StrEnum
+
+
+class CompletionStep(StrEnum):
+    RESULT = "result"
+    SUPPORT = "support"
+    INSTRUCTIONS = "instructions"
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionResult:
+    message: str
+    is_error: bool = False
+    is_warning: bool = False
+    cancelled: bool = False
+
+
+@dataclass(slots=True)
+class CompletionViewState:
+    result: CompletionResult
+    step: CompletionStep = CompletionStep.RESULT
 
 
 @dataclass(slots=True)
