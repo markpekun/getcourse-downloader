@@ -1,6 +1,5 @@
 # Архитектура GetCourseVideoDownloader
 
-Статус этой карты: **подтверждено кодом** текущего checkout (02.10.2026). Обнаружение карточек новой разметки проверено локально на сохранённом HTML и тестах в Firefox. Проверки с реальным курсом, авторизацией и собранным EXE здесь не проводились. **Цель владельца:** получить доступные уроки курса и скачать их видео без ручного открытия каждого урока.
 
 ```mermaid
 flowchart LR
@@ -45,19 +44,3 @@ flowchart LR
 - **Подтверждено кодом:** браузер использует постоянный профиль, а HLS скачивается отдельной `aiohttp`-сессией с `User-Agent`, `Referer`, `Origin`; явная передача cookies браузера в неё не найдена. Доступные браузеру, но требующие cookies/CDN-условий сегменты могут не загрузиться — это **гипотеза**, требующая проверки на реальном курсе.
 - **Требует проверки на реальном курсе:** вход и повторный вход, полнота списка уроков, HLS разных плееров/CDN, итоговые MP4, отмена и продолжение после сбоя. `build.ps1` описывает упаковку Firefox/FFmpeg, worker smoke, ZIP, SHA-256 и SBOM; готовый EXE здесь не запускался.
 
-## Инварианты и проверки
-
-- Domain/application не импортируют Flet, Playwright и infrastructure (`tests/test_architecture.py`). `DownloadRequest` и события — типизированный контракт между GUI и worker (`domain/models.py`, `domain/events.py`, `tests/test_worker_protocol.py`). Текст UI не служит протоколом.
-- HLS master playlist задаёт варианты качества, а не уроки. Неполный набор сегментов не является успешным видео; итоговый файл появляется только после успешной обработки (`infrastructure/media/hls.py`, `tests/test_hls_resume.py`).
-- Runtime-данные и профиль находятся в пользовательском каталоге `AppPaths`, а не рядом с EXE. Диагностика удаляет query-параметры URL (`infrastructure/platform/paths.py`, `infrastructure/diagnostics/reports.py`). Секреты, содержимое профиля и подписанные URL не переносить в документацию или память.
-- Для изменений discovery/auth смотреть `tests/test_parse_courses.py`, `test_discover_courses.py`, `test_discovery_errors.py`, `test_playwright_browser_factory.py`, `test_redesigned_discovery.py`; последние используют отдельный локальный Firefox, безопасные HTML-образцы и блокируют внешние запросы. Для загрузки/worker — `test_downloader_outcomes.py`, `test_hls_resume.py`, `test_worker_lifecycle.py`, `test_worker_protocol.py`; для UI — `test_start_screen.py`, `test_courses_controller.py`, `test_screens.py`. Команды проверок описаны в `README.md`. Результаты локальных тестов не подтверждают живой GetCourse и Windows-сборку.
-
-## Очистка списка курсов и авторизации
-
-Очистка списка курсов и очистка авторизации — отдельные действия с подтверждением
-из `courses/confirmations.py`. Первая удаляет только дерево через репозиторий;
-вторая останавливает собственный worker и вызывает `BrowserAuthorizationResetter`.
-`BrowserProfileResetter` очищает выделенный профиль из `AppPaths.session` в отдельном
-потоке под блокировкой владения. Занятый профиль не очищается; ссылки на внешние
-каталоги не обходятся. Настройки, список курсов и скачанные видео сохраняются при
-очистке авторизации. Во время загрузки, отмены или очистки эти действия недоступны.
