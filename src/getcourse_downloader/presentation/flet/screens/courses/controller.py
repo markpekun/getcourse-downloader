@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from getcourse_downloader.application.ports.browser import BrowserAuthorizationResetter
 from getcourse_downloader.application.ports.repositories import (
     CourseRepository,
     SettingsRepository,
 )
 from getcourse_downloader.application.use_cases.download_lessons import DownloadLessons
-from getcourse_downloader.domain.errors import InvalidDataError
+from getcourse_downloader.domain.errors import DownloadConfigurationError, InvalidDataError
 from getcourse_downloader.domain.events import DownloadEvent
 from getcourse_downloader.domain.models import (
     Course,
@@ -30,10 +32,12 @@ class CoursesController:
         courses: CourseRepository,
         settings: SettingsRepository,
         download_lessons: DownloadLessons,
+        authorization: BrowserAuthorizationResetter | None = None,
     ) -> None:
         self._courses = courses
         self._settings = settings
         self._download_lessons = download_lessons
+        self._authorization = authorization
 
     def load_courses(self) -> list[Course]:
         return self._courses.load()
@@ -43,6 +47,12 @@ class CoursesController:
 
     def delete_courses(self) -> None:
         self._courses.delete()
+
+    async def clear_authorization(self) -> None:
+        if self._authorization is None:
+            raise DownloadConfigurationError("Очистка авторизации недоступна в этом запуске")
+        await asyncio.to_thread(self._download_lessons.shutdown)
+        await self._authorization.clear()
 
     def load_save_path(self) -> str:
         try:

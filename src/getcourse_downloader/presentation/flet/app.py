@@ -76,6 +76,7 @@ class App:
             self.container.courses,
             self.container.settings,
             self.container.download_lessons,
+            self.container.authorization,
         )
         self._screen = CoursesScreen(self.page, controller, self.show_start)
         self.page.add(self._screen.view)

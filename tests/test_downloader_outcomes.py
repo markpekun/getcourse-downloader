@@ -10,7 +10,15 @@ from getcourse_downloader.infrastructure.getcourse.downloader import (
     PlaywrightDownloadGateway,
     _Playlist,
 )
-from getcourse_downloader.infrastructure.media.hls import HlsDownloadResult, HlsDownloadStatus
+from getcourse_downloader.infrastructure.media.hls import (
+    HlsDownloader,
+    HlsDownloadResult,
+    HlsDownloadStatus,
+)
+from getcourse_downloader.infrastructure.storage.download_catalog import (
+    DownloadedMedia,
+    JsonDownloadCatalog,
+)
 
 
 class _Page:
@@ -63,6 +71,12 @@ class _Browser:
 
 
 class _Hls:
+    async def probe_quality(self, _media, fallback=""):
+        return fallback
+
+    async def find_existing_output(self, stem, height):
+        return await HlsDownloader.find_existing_output(self, stem, height)
+
     async def download(self, *_, **__):
         raise AssertionError("HLS downloader should not be called")
 
@@ -691,6 +705,106 @@ def test_existing_output_is_detected_before_opening_lesson(tmp_path):
     (stem / "video_1.mp4").write_bytes(b"one")
     (stem / "video_2.mp4").write_bytes(b"two")
     assert not PlaywrightDownloadGateway._output_exists(stem)
+
+
+@pytest.mark.parametrize("requested", ["480", "720", "1080", "auto"])
+def test_other_quality_in_catalog_does_not_skip_requested_lesson(tmp_path, requested):
+    stem = tmp_path / "Lesson"
+    video = tmp_path / "Lesson_360.mp4"
+    video.write_bytes(b"completed 360p")
+    catalog = JsonDownloadCatalog(tmp_path / "downloads.json")
+    catalog.save(_item().lesson.url, stem, (DownloadedMedia(video, "360p"),))
+    gateway = PlaywrightDownloadGateway(None, _Hls(), catalog)
+
+    assert asyncio.run(gateway._existing_result(_item(), stem, requested)) is None
+
+
+def test_auto_does_not_trust_even_highest_previously_saved_quality(tmp_path):
+    stem = tmp_path / "Lesson"
+    video = tmp_path / "Lesson_1080.mp4"
+    video.write_bytes(b"completed 1080p")
+    catalog = JsonDownloadCatalog(tmp_path / "downloads.json")
+    catalog.save(_item().lesson.url, stem, (DownloadedMedia(video, "1080p"),))
+    gateway = PlaywrightDownloadGateway(None, _Hls(), catalog)
+
+    assert asyncio.run(gateway._existing_result(_item(), stem, "auto")) is None
+
+
+def test_same_explicit_quality_is_skipped_from_catalog(tmp_path):
+    stem = tmp_path / "Lesson"
+    video = tmp_path / "Lesson_480.mp4"
+    video.write_bytes(b"completed 480p")
+    catalog = JsonDownloadCatalog(tmp_path / "downloads.json")
+    catalog.save(_item().lesson.url, stem, (DownloadedMedia(video, "480p"),))
+    gateway = PlaywrightDownloadGateway(None, _Hls(), catalog)
+
+    result = asyncio.run(gateway._existing_result(_item(), stem, "480"))
+
+    assert result.status.value == "skipped"
+    assert result.media == (DownloadedMedia(video, "480p"),)
+
+
+def test_requested_version_on_disk_is_found_when_catalog_describes_another_quality(tmp_path):
+    stem = tmp_path / "Lesson"
+    old = tmp_path / "Lesson_360.mp4"
+    wanted = tmp_path / "Lesson_480.mp4"
+    old.write_bytes(b"old version")
+    wanted.write_bytes(b"wanted version")
+    catalog = JsonDownloadCatalog(tmp_path / "downloads.json")
+    catalog.save(_item().lesson.url, stem, (DownloadedMedia(old, "360p"),))
+    gateway = PlaywrightDownloadGateway(None, _Hls(), catalog)
+
+    result = asyncio.run(gateway._existing_result(_item(), stem, "480"))
+
+    assert result.status.value == "skipped"
+    assert result.media == (DownloadedMedia(wanted, "480p"),)
+    assert old.read_bytes() == b"old version"
+
+
+def test_one_matching_video_does_not_mark_entire_multi_video_lesson_complete(tmp_path):
+    stem = tmp_path / "Lesson"
+    stem.mkdir()
+    first = stem / "video_1_480.mp4"
+    second = stem / "video_2_360.mp4"
+    first.write_bytes(b"first 480p")
+    second.write_bytes(b"second 360p")
+    catalog = JsonDownloadCatalog(tmp_path / "downloads.json")
+    catalog.save(
+        _item().lesson.url,
+        stem,
+        (DownloadedMedia(first, "480p"), DownloadedMedia(second, "360p")),
+    )
+    gateway = PlaywrightDownloadGateway(None, _Hls(), catalog)
+
+    assert asyncio.run(gateway._existing_result(_item(), stem, "480")) is None
+
+
+def test_auto_opens_lesson_and_passes_discovered_height_for_opaque_variant_url(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+    hls = _RecordingHls()
+    gateway = PlaywrightDownloadGateway(None, hls)
+    page = _Page(
+        player=True,
+        playlist=(
+            "https://cdn.example/master.m3u8",
+            "#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=640x360\nlow.m3u8\n"
+            "#EXT-X-STREAM-INF:RESOLUTION=1920x1080\nhigh.m3u8\n",
+        ),
+    )
+    (tmp_path / "Lesson_360.mp4").write_bytes(b"lower quality")
+
+    result = asyncio.run(
+        gateway._download_lesson(
+            _Browser(page), _item(), tmp_path / "Lesson", "auto", lambda _: None
+        )
+    )
+
+    assert page.url == _item().lesson.url
+    assert result.status.value == "downloaded"
+    assert hls.calls[0][0] == "https://cdn.example/high.m3u8"
+    assert hls.calls[0][1]["selected_height"] == 1080
 
 
 def test_path_too_long_is_rejected(tmp_path):

@@ -8,8 +8,10 @@ from pathlib import Path
 
 import flet as ft
 
+from getcourse_downloader.domain.errors import DownloaderError
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.domain.models import Course, DownloadSummary, Lesson
+from getcourse_downloader.presentation.flet.screens.courses.completion import CompletionFlow
 from getcourse_downloader.presentation.flet.screens.courses.components import (
     DownloadLessonRow,
     build_course_tree,
@@ -17,8 +19,16 @@ from getcourse_downloader.presentation.flet.screens.courses.components import (
     iter_course_lessons,
     selected_course_lessons,
 )
+from getcourse_downloader.presentation.flet.screens.courses.confirmations import (
+    ClearTarget,
+    build_clear_confirmation,
+)
 from getcourse_downloader.presentation.flet.screens.courses.controller import CoursesController
-from getcourse_downloader.presentation.flet.screens.courses.state import CoursesViewState
+from getcourse_downloader.presentation.flet.screens.courses.state import (
+    CompletionResult,
+    CompletionStep,
+    CoursesViewState,
+)
 from getcourse_downloader.presentation.flet.theme import (
     Color,
     Gradient,
@@ -29,6 +39,7 @@ from getcourse_downloader.presentation.flet.theme import (
 )
 
 _GITHUB_URL = "https://github.com/markpekun/getcourse-downloader"
+_CONTACT_URL = "https://t.me/No_Resp_404"
 _DOWNLOAD_FOLLOW_PAUSE_SECONDS = 10.0
 
 
@@ -55,11 +66,12 @@ class CoursesScreen:
         self._controller = controller
         self._on_navigate_start = on_navigate_start
         self.state = CoursesViewState(save_path=controller.load_save_path())
+        self._confirmation_dialog: ft.AlertDialog | None = None
         self._download_scroll_task: concurrent.futures.Future[None] | None = None
         self._download_follow_resume_task: concurrent.futures.Future[None] | None = None
         self._download_follow_paused = False
         self._active_lesson_url: str | None = None
-        self._open_task: asyncio.Task | None = None
+        self._completion_flow: CompletionFlow | None = None
         self._diagnostic_reports: dict[str, Path] = {}
         self._diagnostic_reports_by_title: dict[str, Path] = {}
         self._diagnostic_open = False
@@ -242,6 +254,7 @@ class CoursesScreen:
             animate_offset=ft.Animation(350, ft.AnimationCurve.EASE_OUT),
             animate=ft.Animation(300, ft.AnimationCurve.EASE_OUT),
             content=ft.Column(
+                tight=True,
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                 spacing=12,
                 controls=[
@@ -261,18 +274,17 @@ class CoursesScreen:
 
         self.overlay = ft.Container(
             expand=True,
-            bgcolor="rgba(0,0,0,0.7)",
+            left=0,
+            right=0,
+            top=0,
+            bottom=0,
+            bgcolor=ft.Colors.with_opacity(0.7, ft.Colors.BLACK),
             visible=False,
-            content=ft.Row(
+            content=ft.Container(
                 expand=True,
-                alignment=ft.MainAxisAlignment.CENTER,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[
-                    ft.Column(
-                        alignment=ft.MainAxisAlignment.CENTER,
-                        controls=[self._overlay_card],
-                    ),
-                ],
+                padding=16,
+                alignment=ft.Alignment.CENTER,
+                content=self._overlay_card,
             ),
         )
 
@@ -399,6 +411,22 @@ class CoursesScreen:
 
     def _build_header(self) -> ft.Container:
         total_lessons = sum(course.lesson_count for course in self.data)
+        self._clear_courses_button = ft.IconButton(
+            icon=ft.Icons.PLAYLIST_REMOVE_ROUNDED,
+            icon_color=Color.RED,
+            icon_size=20,
+            bgcolor="rgba(239,68,68,0.10)",
+            tooltip="Очистить список курсов и уроков",
+            on_click=self._delete_courses,
+        )
+        self._clear_authorization_button = ft.IconButton(
+            icon=ft.Icons.COOKIE_OUTLINED,
+            icon_color=Color.YELLOW,
+            icon_size=20,
+            bgcolor="rgba(245,158,11,0.10)",
+            tooltip="Очистить авторизацию (cookies)",
+            on_click=self._clear_authorization,
+        )
         return ft.Container(
             padding=ft.Padding.symmetric(horizontal=32, vertical=16),
             content=ft.Row(
@@ -460,55 +488,8 @@ class CoursesScreen:
                                         "(обновляется раз в 3 секунды)"
                                     ),
                                 ),
-                                ft.Container(
-                                    content=ft.Icon(
-                                        ft.Icons.DELETE_ROUNDED,
-                                        size=20,
-                                        color=Color.RED,
-                                    ),
-                                    padding=ft.Padding.symmetric(horizontal=8, vertical=4),
-                                    border_radius=6,
-                                    bgcolor="rgba(239,68,68,0.12)",
-                                    ink=True,
-                                    on_click=self._delete_courses,
-                                    tooltip="Удалить курсы и начать заново",
-                                ),
-                                ft.Container(
-                                    content=ft.Row(
-                                        [
-                                            ft.Icon(
-                                                ft.Icons.FOLDER_OPEN_ROUNDED,
-                                                size=14,
-                                                color=Color.ACCENT_LIGHT,
-                                            ),
-                                            ft.Text(
-                                                str(len(self.data)),
-                                                size=13,
-                                                weight=ft.FontWeight.W_600,
-                                                color=Color.ACCENT_LIGHT,
-                                            ),
-                                        ],
-                                        spacing=4,
-                                    ),
-                                    padding=ft.Padding.symmetric(horizontal=8, vertical=4),
-                                    border_radius=6,
-                                    bgcolor="rgba(124,58,237,0.12)",
-                                ),
-                                ft.Container(
-                                    content=ft.Icon(
-                                        ft.Icons.TELEGRAM,
-                                        size=19,
-                                        color="#2AABEE",
-                                    ),
-                                    padding=ft.Padding.all(7),
-                                    border_radius=8,
-                                    bgcolor="rgba(42,171,238,0.10)",
-                                    ink=True,
-                                    tooltip="Написать в поддержку",
-                                    on_click=lambda _: asyncio.create_task(
-                                        self.page.launch_url("https://t.me/No_Resp_404")
-                                    ),
-                                ),
+                                self._clear_courses_button,
+                                self._clear_authorization_button,
                             ],
                         ),
                     ),
@@ -853,9 +834,83 @@ class CoursesScreen:
             self._build_side_panel()
             self.page.update()
 
-    async def _delete_courses(self, e):
-        self._controller.delete_courses()
-        await self._on_navigate_start()
+    def _delete_courses(self, e=None) -> None:
+        self._request_clear("courses")
+
+    def _clear_authorization(self, e=None) -> None:
+        self._request_clear("authorization")
+
+    def _clear_is_blocked(self) -> bool:
+        return self.state.downloading or self.state.cancelling or self.state.clearing
+
+    def _refresh_clear_actions(self) -> None:
+        for name in ("_clear_courses_button", "_clear_authorization_button"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.disabled = self._clear_is_blocked()
+
+    def _request_clear(self, target: ClearTarget) -> None:
+        if self._confirmation_dialog is not None:
+            return
+        if self._clear_is_blocked():
+            self._show_snack("Дождитесь завершения текущей операции", is_error=True)
+            return
+
+        async def confirm(_event):
+            await self._confirm_clear(target)
+
+        self._confirmation_dialog = build_clear_confirmation(
+            target,
+            on_confirm=confirm,
+            on_cancel=self._close_clear_confirmation,
+            on_dismiss=self._on_clear_confirmation_dismissed,
+        )
+        self.page.show_dialog(self._confirmation_dialog)
+
+    def _close_clear_confirmation(self, _event=None) -> None:
+        if self._confirmation_dialog is not None:
+            self.page.pop_dialog()
+            self._confirmation_dialog = None
+
+    def _on_clear_confirmation_dismissed(self, _event=None) -> None:
+        if _event is None or _event.control is self._confirmation_dialog:
+            self._confirmation_dialog = None
+
+    async def _confirm_clear(self, target: ClearTarget) -> None:
+        if self._confirmation_dialog is None:
+            return
+        self._close_clear_confirmation()
+        if self._clear_is_blocked():
+            self._show_snack("Дождитесь завершения текущей операции", is_error=True)
+            return
+        self.state.clearing = True
+        self._refresh_clear_actions()
+        self.page.update()
+        succeeded = False
+        try:
+            if target == "courses":
+                await asyncio.to_thread(self._controller.delete_courses)
+            else:
+                await self._controller.clear_authorization()
+            succeeded = True
+        except DownloaderError as error:
+            self._show_snack(str(error), is_error=True)
+        except OSError:
+            self._show_snack(
+                "Не удалось выполнить очистку. Проверьте права доступа и повторите попытку.",
+                is_error=True,
+            )
+        finally:
+            self.state.clearing = False
+            self._refresh_clear_actions()
+            self.page.update()
+        if succeeded:
+            if target == "courses":
+                await self._on_navigate_start()
+            else:
+                self._show_snack(
+                    "Авторизация очищена. При следующем открытии курса войдите заново."
+                )
 
     def _update_selected_count(self, e=None):
         self.selected_label.value = str(len(self.state.selected_lesson_urls))
@@ -1050,6 +1105,9 @@ class CoursesScreen:
         self.page.update()
 
     def _switch_overlay_to_download(self):
+        self._completion_flow = None
+        self._overlay_card.width = 600
+        self._overlay_card.height = None
         self._diagnostic_open = False
         self._diagnostic_previous_content = None
         if self._auth_overlay_task is not None:
@@ -1058,6 +1116,7 @@ class CoursesScreen:
 
         self._download_title.value = "Подготовка"
         self._overlay_card.content = ft.Column(
+            tight=True,
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             spacing=12,
             controls=[
@@ -1080,6 +1139,7 @@ class CoursesScreen:
         self._continue_btn.visible = False
         self._auth_status.value = "Требуется авторизация"
         self._overlay_card.content = ft.Column(
+            tight=True,
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             spacing=8,
             controls=[
@@ -1125,14 +1185,14 @@ class CoursesScreen:
         self._controller.continue_authentication()
 
     def _start_download(self, e):
+        if self._clear_is_blocked():
+            return
         lessons_to_download = selected_course_lessons(
             self.data,
             self.state.selected_lesson_urls,
         )
         if not lessons_to_download:
             self._show_snack("Нет выбранных уроков", is_error=True)
-            return
-        if self.state.downloading:
             return
 
         if not Path(self.state.save_path).is_dir():
@@ -1142,6 +1202,7 @@ class CoursesScreen:
 
         self.state.downloading = True
         self.state.cancelling = False
+        self._refresh_clear_actions()
         self._active_download_id += 1
         run_id = self._active_download_id
         self._reset_download_follow()
@@ -1260,8 +1321,14 @@ class CoursesScreen:
         if not getattr(self, "_diagnostic_open", False):
             self._diagnostic_previous_content = self._overlay_card.content
             self._diagnostic_previous_visible = self.overlay.visible
+            self._diagnostic_previous_height = self._overlay_card.height
             self._diagnostic_open = True
+        in_completion = getattr(self, "_completion_flow", None) is not None
+        if in_completion:
+            self._overlay_card.height = 620
         self._overlay_card.content = ft.Column(
+            expand=in_completion,
+            tight=not in_completion,
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             spacing=12,
             controls=[
@@ -1275,8 +1342,9 @@ class CoursesScreen:
                     text_align=ft.TextAlign.CENTER,
                 ),
                 ft.Container(
-                    width=520,
-                    height=360,
+                    width=None if in_completion else 520,
+                    height=None if in_completion else 360,
+                    expand=in_completion,
                     padding=ft.Padding.all(12),
                     border_radius=10,
                     bgcolor="rgba(0,0,0,0.3)",
@@ -1304,6 +1372,7 @@ class CoursesScreen:
         if not self._diagnostic_open:
             return
         self._overlay_card.content = self._diagnostic_previous_content
+        self._overlay_card.height = getattr(self, "_diagnostic_previous_height", None)
         self.overlay.visible = self._diagnostic_previous_visible
         self._diagnostic_open = False
         self._diagnostic_previous_content = None
@@ -1423,8 +1492,11 @@ class CoursesScreen:
         failed = [f"✗ {title}" for title in summary.failed]
         self._finish_download(
             message,
+            is_error=bool(summary.failed)
+            and not (summary.downloaded or summary.already_present or summary.cancelled),
             is_warning=bool(summary.no_video or summary.failed or summary.cancelled),
             failed=failed,
+            cancelled=bool(summary.cancelled),
         )
 
     def _finish_download(
@@ -1435,18 +1507,20 @@ class CoursesScreen:
         failed: list[str] | None = None,
         *,
         run_id: int | None = None,
+        cancelled: bool = False,
     ):
         if run_id is not None and run_id != self._active_download_id:
             return
         self.state.downloading = False
         self.state.cancelling = False
+        self._refresh_clear_actions()
         self._reset_download_follow()
         self._cancel_btn.disabled = False
         self._cancel_btn.content = "Отмена"
         self._speed_text.value = "Средняя: —"
         if is_error:
             self._mark_unfinished_rows("Ошибка", Color.YELLOW, ft.Icons.ERROR_ROUNDED)
-        self._show_completion_overlay(message, is_error, is_warning, failed)
+        self._show_completion_overlay(message, is_error, is_warning, failed, cancelled=cancelled)
 
     def _cancel_download(self, _event=None) -> None:
         if not self.state.downloading or self.state.cancelling:
@@ -1483,127 +1557,21 @@ class CoursesScreen:
         is_error: bool = False,
         is_warning: bool = False,
         failed: list[str] | None = None,
-    ):
+        *,
+        cancelled: bool = False,
+    ) -> None:
         self._diagnostic_open = False
         self._diagnostic_previous_content = None
-        if is_error:
-            icon_name, icon_color, title = ft.Icons.ERROR_ROUNDED, Color.RED, "Ошибка"
-        elif is_warning:
-            icon_name, icon_color, title = (
-                ft.Icons.WARNING_AMBER_ROUNDED,
-                Color.YELLOW,
-                "Завершено с предупреждениями",
-            )
-        else:
-            icon_name, icon_color, title = (
-                ft.Icons.CHECK_CIRCLE_ROUNDED,
-                Color.GREEN,
-                "Загружено",
-            )
-
-        close_button = ft.IconButton(
-            icon=ft.Icons.CLOSE,
-            icon_size=20,
-            icon_color=Color.TEXT_SECONDARY,
-            padding=8,
-            hover_color="rgba(255,77,79,0.12)",
-            splash_color="rgba(255,77,79,0.18)",
-            mouse_cursor=ft.MouseCursor.CLICK,
-            on_click=self._close_completion_overlay,
-        )
-        close_container = ft.Container(
-            content=close_button,
-            border_radius=10,
-            bgcolor="rgba(255,255,255,0.0)",
-            scale=1.0,
-            animate_scale=ft.Animation(200, ft.AnimationCurve.EASE_OUT),
-            animate=ft.Animation(200, ft.AnimationCurve.EASE_OUT),
-        )
-
-        def _on_close_hover(e):
-            if e.data == "true":
-                close_button.icon_color = "#ff4d4f"
-                close_container.scale = 1.1
-                close_container.bgcolor = "rgba(255,77,79,0.12)"
-                close_container.shadow = ft.BoxShadow(
-                    blur_radius=24,
-                    color="rgba(255,77,79,0.45)",
-                    offset=ft.Offset(0, 0),
-                )
-            else:
-                close_button.icon_color = Color.TEXT_SECONDARY
-                close_container.scale = 1.0
-                close_container.bgcolor = "rgba(255,255,255,0.0)"
-                close_container.shadow = None
-            self.page.update()
-
-        close_container.on_hover = _on_close_hover
-
-        controls: list[ft.Control] = [
-            ft.Container(
-                margin=ft.Margin.only(right=-5, top=-5),
-                content=ft.Row(
-                    alignment=ft.MainAxisAlignment.END,
-                    controls=[close_container],
-                ),
-            ),
-            ft.Container(height=12),
-            ft.Container(
-                width=64,
-                height=64,
-                border_radius=32,
-                bgcolor=ft.Colors.with_opacity(0.15, icon_color),
-                content=ft.Icon(icon_name, size=36, color=icon_color),
-            ),
-            ft.Container(height=18),
-            ft.Text(
-                title,
-                size=22,
-                weight=ft.FontWeight.W_700,
-                color=Color.TEXT,
-                text_align=ft.TextAlign.CENTER,
-            ),
-            ft.Container(height=8),
-        ]
-        if failed:
-            controls.append(
-                ft.Text(
-                    message,
-                    size=14,
-                    color=Color.TEXT_SECONDARY,
-                    text_align=ft.TextAlign.CENTER,
-                ),
-            )
-            controls.append(ft.Container(height=10))
-            controls.append(self._build_failed_lessons(failed))
-        else:
-            controls.append(
-                ft.Text(
-                    message,
-                    size=14,
-                    color=Color.TEXT_SECONDARY,
-                    text_align=ft.TextAlign.CENTER,
-                ),
-            )
-
-        if not is_error:
-            controls.append(ft.Container(height=18))
-            controls.append(
-                ft.Container(
-                    height=1,
-                    width=380,
-                    bgcolor="rgba(255,255,255,0.07)",
-                ),
-            )
-            controls.append(ft.Container(height=20))
-            controls.extend(self._build_support_block())
-
-        controls.append(ft.Container(height=8))
-
-        self._overlay_card.content = ft.Column(
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            spacing=0,
-            controls=controls,
+        self._overlay_card.opacity = 1
+        self._overlay_card.offset = ft.Offset(0, 0)
+        self._completion_flow = CompletionFlow(
+            CompletionResult(message, is_error, is_warning, cancelled),
+            self._overlay_card,
+            on_change=self.page.update,
+            on_close=self._close_completion_overlay,
+            on_github=self._open_github,
+            on_contact=self._open_contact,
+            failed_details=self._build_failed_lessons(failed) if failed else None,
         )
         self.overlay.visible = True
         self.page.update()
@@ -1630,7 +1598,13 @@ class CoursesScreen:
                         spacing=8,
                         controls=[
                             ft.Icon(ft.Icons.CLOSE_ROUNDED, size=14, color=Color.RED),
-                            ft.Text(title, size=13, color=Color.TEXT_SECONDARY, selectable=False),
+                            ft.Text(
+                                title,
+                                size=13,
+                                color=Color.TEXT_SECONDARY,
+                                selectable=False,
+                                expand=True,
+                            ),
                             ft.Text(
                                 "Подробнее" if report is not None else "",
                                 size=11,
@@ -1641,8 +1615,7 @@ class CoursesScreen:
                 )
             )
         return ft.Container(
-            width=420,
-            height=180,
+            height=min(180, 48 * len(failed)),
             border_radius=10,
             bgcolor="rgba(0,0,0,0.3)",
             border=ft.Border.all(1, "rgba(255,255,255,0.06)"),
@@ -1650,40 +1623,16 @@ class CoursesScreen:
             content=ft.Column(spacing=4, scroll=ft.ScrollMode.AUTO, controls=rows),
         )
 
-    def _open_github(self, e=None):
-        self._open_task = asyncio.create_task(self.page.launch_url(_GITHUB_URL))
+    async def _open_github(self, _event=None) -> None:
+        await self.page.launch_url(_GITHUB_URL)
 
-    def _build_support_block(self) -> list[ft.Control]:
-        return [
-            ft.Column(
-                spacing=0,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                controls=[
-                    ft.Text(
-                        spans=[
-                            ft.TextSpan(
-                                text="⭐ ",
-                                on_click=self._open_github,
-                            ),
-                            ft.TextSpan(
-                                text="Star on GitHub",
-                                style=ft.TextStyle(
-                                    size=14,
-                                    color=Color.ACCENT_LIGHT,
-                                    weight=ft.FontWeight.W_600,
-                                ),
-                                on_click=self._open_github,
-                            ),
-                        ],
-                        size=14,
-                        color=Color.TEXT_SECONDARY,
-                        text_align=ft.TextAlign.CENTER,
-                    ),
-                ],
-            )
-        ]
+    async def _open_contact(self, _event=None) -> None:
+        await self.page.launch_url(_CONTACT_URL)
 
-    def _close_completion_overlay(self, e=None):
+    def _close_completion_overlay(self, _event=None) -> None:
+        flow = getattr(self, "_completion_flow", None)
+        if flow is not None and flow.state.step is CompletionStep.RESULT:
+            return
         self.overlay.visible = False
         self.page.update()
 
@@ -1692,7 +1641,7 @@ class CoursesScreen:
         icon = ft.Icons.ERROR_OUTLINE if is_error else ft.Icons.CHECK_CIRCLE_OUTLINE
         icon_color = Color.RED if is_error else Color.GREEN
 
-        self.page.snack_bar = ft.SnackBar(
+        snack_bar = ft.SnackBar(
             content=ft.Row(
                 [
                     ft.Icon(icon, color=icon_color, size=18),
@@ -1707,5 +1656,4 @@ class CoursesScreen:
             behavior=ft.SnackBarBehavior.FLOATING,
             elevation=8,
         )
-        self.page.snack_bar.open = True
-        self.page.update()
+        self.page.show_dialog(snack_bar)

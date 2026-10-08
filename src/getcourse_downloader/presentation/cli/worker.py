@@ -11,7 +11,7 @@ from pathlib import Path
 
 from getcourse_downloader import __version__
 from getcourse_downloader.application.use_cases.download_lessons import DownloadLessons
-from getcourse_downloader.domain.errors import InvalidDataError
+from getcourse_downloader.domain.errors import DownloaderError, InvalidDataError
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.domain.models import DownloadRequest
 from getcourse_downloader.infrastructure.browser.playwright import PlaywrightBrowserFactory
@@ -139,6 +139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary = DownloadLessons(gateway).execute(request, sink)
         return 0 if summary.successful else 2
     except Exception as error:
+        error_code = error.code if isinstance(error, DownloaderError) else "DOWNLOAD_FAILED"
         try:
             with paths.worker_log_file.open("a", encoding="utf-8") as stream:
                 stream.write(traceback.format_exc())
@@ -152,6 +153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     message=str(error),
                     stage="worker",
                     level="error",
+                    error_code=error_code,
                 )
             )
             if request is not None:
@@ -165,6 +167,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             lesson_url=item.lesson.url,
                             course_path=item.course_path,
                             level="error",
+                            error_code=error_code,
                         )
                     )
                 sink(

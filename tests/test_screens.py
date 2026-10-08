@@ -19,6 +19,15 @@ from getcourse_downloader.presentation.flet.screens.courses.view import CoursesS
 from getcourse_downloader.presentation.flet.theme import Color
 
 
+def _walk_controls(control):
+    yield control
+    content = getattr(control, "content", None)
+    if isinstance(content, ft.Control):
+        yield from _walk_controls(content)
+    for child in getattr(control, "controls", []):
+        yield from _walk_controls(child)
+
+
 def test_log_color_segments():
     assert CoursesScreen._log_color("Сегменты: 5/10") == "#F59E0B"
 
@@ -155,24 +164,6 @@ def test_update_download_title_ignores_unrelated():
     assert cs._download_title.value == "Подготовка"
 
 
-def test_build_support_block_github_star_clickable():
-    cs = CoursesScreen.__new__(CoursesScreen)
-    block = cs._build_support_block()
-    assert len(block) == 1
-    column = block[0]
-    assert isinstance(column, ft.Column)
-    text = column.controls[0]
-    assert isinstance(text, ft.Text)
-    spans = text.spans
-    assert len(spans) == 2
-    assert spans[0].text == "⭐ "
-    link = spans[1]
-    assert link.text == "Star on GitHub"
-    assert link.style.decoration != ft.TextDecoration.UNDERLINE
-    assert link.style.color == Color.ACCENT_LIGHT
-    assert all(span.on_click is not None for span in spans)
-
-
 def test_build_failed_lessons_scrollable():
     cs = CoursesScreen.__new__(CoursesScreen)
     container = cs._build_failed_lessons([f"✗ Урок {i}" for i in range(1, 12)])
@@ -187,7 +178,7 @@ def test_no_video_summary_is_presented_as_warning():
     screen = CoursesScreen.__new__(CoursesScreen)
     captured: dict[str, object] = {}
 
-    def finish(message, is_error=False, is_warning=False, failed=None):
+    def finish(message, is_error=False, is_warning=False, failed=None, **_kwargs):
         captured.update(
             message=message,
             is_error=is_error,
@@ -545,7 +536,7 @@ def test_completion_overlay_never_offers_a_general_diagnostic_report():
 
     buttons = [
         control
-        for control in screen._overlay_card.content.controls
+        for control in _walk_controls(screen._overlay_card.content)
         if isinstance(control, ft.OutlinedButton)
     ]
     assert not any(button.content == "Открыть общий отчёт" for button in buttons)
@@ -554,7 +545,7 @@ def test_completion_overlay_never_offers_a_general_diagnostic_report():
     screen._show_completion_overlay("Загрузка с ошибкой", is_error=True)
     buttons = [
         control
-        for control in screen._overlay_card.content.controls
+        for control in _walk_controls(screen._overlay_card.content)
         if isinstance(control, ft.OutlinedButton)
     ]
     assert not any(button.content == "Открыть общий отчёт" for button in buttons)

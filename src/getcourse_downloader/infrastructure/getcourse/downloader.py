@@ -79,6 +79,7 @@ class _Playlist:
     referer_url: str = ""
     session_key: HlsKeyDeclaration | None = None
     audio_url: str = ""
+    height: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,22 +156,22 @@ class PlaywrightDownloadGateway:
         self,
         item: SelectedLesson,
         output_stem: Path,
+        quality: str,
     ) -> _LessonResult | None:
+        # Auto needs a fresh playlist: a local version cannot prove the maximum.
+        if not quality.isdigit():
+            return None
         if self._catalog:
             catalogued = self._catalog.find(item.lesson.url, output_stem)
-            if catalogued:
+            if catalogued and all(media.quality == f"{quality}p" for media in catalogued):
                 return _LessonResult(_LessonStatus.SKIPPED, catalogued)
 
-        direct = existing_output_path(output_stem)
-        try:
-            exists = direct is not None
-        except OSError:
-            exists = False
-        if not exists:
+        if existing_output_path(output_stem) is None:
             return None
-        assert direct is not None
-        quality = await self._hls.probe_quality(direct)
-        media = (DownloadedMedia(direct, quality),)
+        existing = await self._hls.find_existing_output(output_stem, int(quality))
+        if existing is None or existing.output_path is None:
+            return None
+        media = (DownloadedMedia(existing.output_path, existing.quality),)
         if self._catalog:
             self._catalog.save(item.lesson.url, output_stem, media)
         return _LessonResult(_LessonStatus.SKIPPED, media)
@@ -248,7 +249,9 @@ class PlaywrightDownloadGateway:
                 if self._cancelled.is_set():
                     cancelled = len(request.lessons) - index
                     break
-                existing = await self._existing_result(item, output_stems[index])
+                existing = await self._existing_result(
+                    item, output_stems[index], request.quality.value
+                )
                 if existing is None:
                     pending.append(index)
                     continue
@@ -490,7 +493,7 @@ class PlaywrightDownloadGateway:
         quality: str,
         emit: EventHandler,
     ) -> _LessonResult:
-        existing = await self._existing_result(item, output_stem)
+        existing = await self._existing_result(item, output_stem, quality)
         if existing is not None:
             return existing
 
@@ -683,6 +686,7 @@ class PlaywrightDownloadGateway:
                     referer_url=playlist.referer_url,
                     course_path=item.course_path,
                     requested_quality=quality,
+                    selected_height=playlist.height,
                     video_index=video_index,
                     video_total=len(selected),
                     session_key=playlist.session_key,
@@ -691,7 +695,14 @@ class PlaywrightDownloadGateway:
                 download_results.append(result)
                 if result.status is HlsDownloadStatus.CANCELLED or self._cancelled.is_set():
                     return _LessonResult(_LessonStatus.CANCELLED)
-                if result.status is HlsDownloadStatus.FAILED or not playlist.audio_url:
+                if (
+                    result.status
+                    in {
+                        HlsDownloadStatus.FAILED,
+                        HlsDownloadStatus.ALREADY_PRESENT,
+                    }
+                    or not playlist.audio_url
+                ):
                     continue
                 if result.output_path is None:
                     continue
@@ -795,6 +806,7 @@ class PlaywrightDownloadGateway:
                         playlist.referer_url,
                         session_key,
                         selected_variant.audio_url,
+                        selected_variant.height,
                     ),
                 )
 

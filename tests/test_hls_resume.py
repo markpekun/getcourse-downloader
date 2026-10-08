@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
@@ -249,7 +250,7 @@ def _downloader(responses, requests, *, muxer=None) -> HlsDownloader:
     )
 
 
-def _run(downloader: HlsDownloader, playlist_url: str, stem: Path):
+def _run(downloader: HlsDownloader, playlist_url: str, stem: Path, **kwargs):
     events = []
     result = asyncio.run(
         downloader.download(
@@ -259,6 +260,7 @@ def _run(downloader: HlsDownloader, playlist_url: str, stem: Path):
             events.append,
             lesson_url="https://school/lesson/1",
             course_path=("Курс",),
+            **kwargs,
         )
     )
     return result, events
@@ -584,7 +586,9 @@ def test_existing_nonempty_mp4_is_skipped_but_zero_file_is_incomplete(tmp_path):
     output = tmp_path / "Lesson.mp4"
     output.write_bytes(b"done")
     requests: list[str] = []
-    result, _ = _run(_downloader({}, requests), "https://cdn/master.m3u8", stem)
+    result, _ = _run(
+        _downloader({}, requests), "https://cdn/master.m3u8", stem, selected_height=720
+    )
     assert result.status is HlsDownloadStatus.ALREADY_PRESENT
     assert requests == []
 
@@ -598,6 +602,157 @@ def test_existing_nonempty_mp4_is_skipped_but_zero_file_is_incomplete(tmp_path):
     assert result.status is HlsDownloadStatus.DOWNLOADED
     assert output.read_bytes() == b""
     assert (tmp_path / "Lesson_720.mp4").read_bytes() == b"segment"
+
+
+@pytest.mark.parametrize("target", [480, 720, 1080])
+def test_other_saved_quality_does_not_block_selected_stream(tmp_path, target):
+    class QualityMuxer(_Muxer):
+        async def probe_height(self, media):
+            return 360 if media.name == "Lesson_360.mp4" else target
+
+    old = tmp_path / "Lesson_360.mp4"
+    old.write_bytes(b"old 360p video")
+    requests = []
+    url = "https://cdn.example/selected.m3u8"
+    responses = {
+        url: _Response(text="#EXTM3U\n#EXTINF:1,\nsegment.ts\n"),
+        "https://cdn.example/segment.ts": _Response(content=b"new video"),
+    }
+    result, _ = _run(
+        _downloader(responses, requests, muxer=QualityMuxer()),
+        url,
+        tmp_path / "Lesson",
+        requested_quality=str(target),
+        selected_height=target,
+    )
+
+    assert result.status is HlsDownloadStatus.DOWNLOADED
+    assert result.quality == f"{target}p"
+    assert result.output_path.read_bytes() == b"new video"
+    assert old.read_bytes() == b"old 360p video"
+    assert requests == [url, "https://cdn.example/segment.ts"]
+
+
+def test_selected_quality_is_found_among_several_saved_versions(tmp_path):
+    class QualityMuxer(_Muxer):
+        async def probe_height(self, media):
+            return int(media.stem.rsplit("_", 1)[1])
+
+    for height in (360, 720, 1080):
+        (tmp_path / f"Lesson_{height}.mp4").write_bytes(b"complete")
+    requests = []
+    result, _ = _run(
+        _downloader({}, requests, muxer=QualityMuxer()),
+        "https://cdn.example/opaque.m3u8",
+        tmp_path / "Lesson",
+        requested_quality="auto",
+        selected_height=1080,
+    )
+
+    assert result.status is HlsDownloadStatus.ALREADY_PRESENT
+    assert result.output_path == tmp_path / "Lesson_1080.mp4"
+    assert result.quality == "1080p"
+    assert requests == []
+
+
+def test_unknown_auto_quality_does_not_skip_an_arbitrary_existing_file(tmp_path):
+    old = tmp_path / "Lesson_360.mp4"
+    old.write_bytes(b"old video")
+    url = "https://cdn.example/opaque.m3u8"
+    requests = []
+    responses = {
+        url: _Response(text="#EXTM3U\n#EXTINF:1,\nsegment.ts\n"),
+        "https://cdn.example/segment.ts": _Response(content=b"new video"),
+    }
+
+    result, _ = _run(_downloader(responses, requests), url, tmp_path / "Lesson")
+
+    assert result.status is HlsDownloadStatus.DOWNLOADED
+    assert old.read_bytes() == b"old video"
+    assert requests == [url, "https://cdn.example/segment.ts"]
+
+
+@pytest.mark.parametrize(
+    ("stored", "maximum", "separate_audio"),
+    [(360, 1080, False), (1080, 1080, False), (1080, 720, False), (1080, 1080, True)],
+)
+def test_auto_checks_lesson_master_then_reuses_only_matching_maximum(
+    monkeypatch, tmp_path, stored, maximum, separate_audio
+):
+    from getcourse_downloader.domain.models import Lesson, SelectedLesson
+    from getcourse_downloader.infrastructure.getcourse import downloader as gateway_module
+    from getcourse_downloader.infrastructure.getcourse.downloader import PlaywrightDownloadGateway
+
+    class QualityMuxer(_Muxer):
+        async def probe_height(self, media):
+            return stored if media.name == f"Lesson_{stored}.mp4" else maximum
+
+    audio = '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="voice",URI="audio.m3u8"\n' if separate_audio else ""
+    audio_attribute = ',AUDIO="voice"' if separate_audio else ""
+    master = (
+        f"#EXTM3U\n{audio}#EXT-X-STREAM-INF:RESOLUTION=640x360\nlow.m3u8\n"
+        f"#EXT-X-STREAM-INF:RESOLUTION=1920x{maximum}{audio_attribute}\nhigh.m3u8\n"
+    )
+
+    class Page:
+        url = "about:blank"
+
+        def on(self, _event, handler):
+            self.handler = handler
+
+        async def goto(self, url, **_kwargs):
+            self.url = url
+
+            async def text():
+                return master
+
+            self.handler(SimpleNamespace(url="https://cdn.example/master.m3u8", text=text))
+
+        async def query_selector(self, _selector):
+            return object()
+
+        async def wait_for_load_state(self, *_args, **_kwargs):
+            pass
+
+        async def wait_for_timeout(self, _milliseconds):
+            pass
+
+        async def close(self):
+            pass
+
+    page = Page()
+
+    class Browser:
+        async def new_page(self):
+            return page
+
+    monkeypatch.setattr(gateway_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+    requests = []
+    responses = {
+        "https://cdn.example/high.m3u8": _Response(text="#EXTM3U\n#EXTINF:1,\nsegment.ts\n"),
+        "https://cdn.example/segment.ts": _Response(content=b"new maximum video"),
+    }
+    gateway = PlaywrightDownloadGateway(
+        None, _downloader(responses, requests, muxer=QualityMuxer())
+    )
+    old = tmp_path / f"Lesson_{stored}.mp4"
+    old.write_bytes(b"old completed version")
+    item = SelectedLesson(("Course",), Lesson("Lesson", "https://school.example/lesson/1"))
+
+    result = asyncio.run(
+        gateway._download_lesson(Browser(), item, tmp_path / "Lesson", "auto", lambda _: None)
+    )
+
+    assert page.url == item.lesson.url
+    assert result.media[0].quality == f"{maximum}p"
+    assert result.media[0].path == tmp_path / f"Lesson_{maximum}.mp4"
+    assert old.read_bytes() == b"old completed version"
+    if stored == maximum:
+        assert result.status.value == "skipped"
+        assert requests == []
+    else:
+        assert result.status.value == "downloaded"
+        assert requests == ["https://cdn.example/high.m3u8", "https://cdn.example/segment.ts"]
 
 
 def test_resume_reuses_segments_when_only_query_tokens_change(tmp_path):
@@ -631,6 +786,63 @@ def test_resume_reuses_segments_when_only_query_tokens_change(tmp_path):
     assert events[0].current == 1
     assert (tmp_path / "Lesson_720.mp4").read_bytes() == b"AB"
     assert not checkpoint.exists()
+
+
+@pytest.mark.parametrize("next_height", [360, 1080])
+def test_auto_resume_reuses_segments_only_when_resolved_height_stays_the_same(
+    tmp_path, next_height
+):
+    class QualityMuxer(_Muxer):
+        async def probe_height(self, _media):
+            return next_height
+
+    stem = tmp_path / "Lesson"
+    playlist = "#EXTM3U\n#EXTINF:1,\na.ts\n#EXTINF:1,\nb.ts\n"
+    first_events = []
+    first_requests = []
+    first = _downloader(
+        {
+            "https://cdn.example/media.m3u8?token=old": _Response(text=playlist),
+            "https://cdn.example/a.ts": _Response(content=b"A360"),
+        },
+        first_requests,
+    )
+    result = asyncio.run(
+        first.download(
+            "https://cdn.example/media.m3u8?token=old",
+            stem,
+            "Lesson",
+            first_events.append,
+            lesson_url="https://school/lesson/1",
+            selected_height=360,
+            is_cancelled=lambda: any(
+                event.type is DownloadEventType.PROGRESS and event.current == 1
+                for event in first_events
+            ),
+        )
+    )
+    assert result.status is HlsDownloadStatus.CANCELLED
+
+    requests = []
+    result, _ = _run(
+        _downloader(
+            {
+                "https://cdn.example/media.m3u8?token=new": _Response(text=playlist),
+                "https://cdn.example/a.ts": _Response(content=f"A{next_height}".encode()),
+                "https://cdn.example/b.ts": _Response(content=f"B{next_height}".encode()),
+            },
+            requests,
+            muxer=QualityMuxer(),
+        ),
+        "https://cdn.example/media.m3u8?token=new",
+        stem,
+        selected_height=next_height,
+    )
+
+    assert result.status is HlsDownloadStatus.DOWNLOADED
+    assert result.resumed_segments == (1 if next_height == 360 else 0)
+    assert result.output_path.read_bytes() == f"A{next_height}B{next_height}".encode()
+    assert ("https://cdn.example/a.ts" in requests) == (next_height != 360)
 
 
 def test_incompatible_segment_list_resets_only_checkpoint(tmp_path):

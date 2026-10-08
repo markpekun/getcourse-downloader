@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from getcourse_downloader.application.use_cases.discover_courses import DiscoverCourses
 from getcourse_downloader.application.use_cases.download_lessons import DownloadLessons
 from getcourse_downloader.infrastructure.browser.playwright import PlaywrightBrowserFactory
+from getcourse_downloader.infrastructure.browser.profile_reset import BrowserProfileResetter
 from getcourse_downloader.infrastructure.getcourse.discovery import GetCourseDiscoverer
 from getcourse_downloader.infrastructure.platform.paths import AppPaths
 from getcourse_downloader.infrastructure.storage.json_repositories import (
@@ -23,6 +24,7 @@ class AppContainer:
     settings: JsonSettingsRepository
     discover_courses: DiscoverCourses
     download_lessons: DownloadLessons
+    authorization: BrowserProfileResetter
 
 
 def build_container() -> AppContainer:
@@ -35,6 +37,7 @@ def build_container() -> AppContainer:
         paths=paths,
         courses=courses,
         settings=settings,
+        authorization=BrowserProfileResetter(paths),
         discover_courses=DiscoverCourses(GetCourseDiscoverer(browsers), courses),
         download_lessons=DownloadLessons(
             SubprocessDownloadGateway(diagnostics_directory=paths.data)

@@ -1,83 +1,18 @@
 from __future__ import annotations
 
-import ctypes
+import asyncio
 import os
 import time
-from ctypes import wintypes
-from pathlib import Path
 
 from playwright.async_api import BrowserContext, Playwright
 from playwright.async_api import Error as PlaywrightError
 
 from getcourse_downloader.domain.errors import ExternalServiceError
+from getcourse_downloader.infrastructure.browser.profile_lease import (
+    _process_exists as _process_exists,
+)
+from getcourse_downloader.infrastructure.browser.profile_lease import _ProfileLease
 from getcourse_downloader.infrastructure.platform.paths import AppPaths, is_frozen
-
-
-def _process_exists(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name != "nt":
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        return True
-    windll = getattr(ctypes, "windll", None)
-    if windll is None:
-        return False
-    kernel32 = windll.kernel32
-    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    process = kernel32.OpenProcess(0x1000, False, pid)
-    if not process:
-        return False
-    kernel32.CloseHandle(process)
-    return True
-
-
-class _ProfileLease:
-    def __init__(self, profile: Path) -> None:
-        self._path = profile / ".gcd-profile-owner"
-        self._released = False
-
-    def acquire(self) -> None:
-        for _ in range(2):
-            try:
-                descriptor = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                try:
-                    owner = int(self._path.read_text(encoding="ascii").strip())
-                except (OSError, ValueError):
-                    owner = 0
-                # A competing process may have created the file but not written its PID yet.
-                try:
-                    initializing = owner == 0 and time.time() - self._path.stat().st_mtime < 5
-                except FileNotFoundError:
-                    continue
-                if initializing or _process_exists(owner):
-                    raise ExternalServiceError(
-                        "Профиль браузера уже используется другой копией приложения. "
-                        "Закройте её и повторите загрузку.",
-                        code="BROWSER_PROFILE_BUSY",
-                    ) from None
-                self._path.unlink(missing_ok=True)
-                continue
-            with os.fdopen(descriptor, "w", encoding="ascii") as stream:
-                stream.write(str(os.getpid()))
-            return
-        raise ExternalServiceError("Не удалось получить доступ к профилю браузера")
-
-    def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
-        try:
-            if self._path.read_text(encoding="ascii").strip() == str(os.getpid()):
-                self._path.unlink(missing_ok=True)
-        except OSError:
-            return
 
 
 class PlaywrightBrowserFactory:
@@ -104,12 +39,48 @@ class PlaywrightBrowserFactory:
                 code="BROWSER_RESOURCES_MISSING",
             )
         lease = _ProfileLease(self._paths.session)
-        lease.acquire()
         try:
-            context = await playwright.firefox.launch_persistent_context(
-                self.profile_path,
-                headless=headless,
-            )
+            deadline = time.monotonic() + 6
+            while True:
+                try:
+                    lease.acquire()
+                    break
+                except ExternalServiceError as error:
+                    if error.code != "BROWSER_PROFILE_BUSY" or time.monotonic() >= deadline:
+                        raise
+                    await asyncio.sleep(0.1)
+            deadline = time.monotonic() + 6
+            while True:
+                try:
+                    context = await playwright.firefox.launch_persistent_context(
+                        self.profile_path,
+                        headless=headless,
+                    )
+                    break
+                except PlaywrightError as error:
+                    message = str(error).casefold()
+                    profile_busy = any(
+                        text in message
+                        for text in (
+                            "already running",
+                            "profile is already in use",
+                            "profile is in use",
+                            "parent.lock",
+                            "failed to lock",
+                        )
+                    )
+                    if not profile_busy:
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise ExternalServiceError(
+                            "Встроенный Firefox ещё использует профиль. "
+                            "Закройте другое окно приложения и повторите загрузку.",
+                            code="BROWSER_PROFILE_BUSY",
+                            technical_details=str(error),
+                        ) from error
+                    await asyncio.sleep(0.1)
+            context.on("close", lambda *_: lease.release())
+            return context
         except PlaywrightError as error:
             lease.release()
             message = str(error).casefold()
@@ -129,5 +100,3 @@ class PlaywrightBrowserFactory:
         except BaseException:
             lease.release()
             raise
-        context.on("close", lambda *_: lease.release())
-        return context
