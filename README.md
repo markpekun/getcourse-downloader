@@ -244,5 +244,5 @@ Playwright / HLS / FFmpeg / JSON adapters
 
 ## 📄 Лицензия
 
-MIT. Вопросы: Telegram [@No_Resp_404](https://t.me/No_Resp_404)
+MIT. Вопросы: Telegram [@No_Resp_404](https://t.me/respons_404)
 
