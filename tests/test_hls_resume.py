@@ -1120,6 +1120,42 @@ def test_canonical_media_url_ignores_query_and_fragment():
     )
 
 
+def test_canonical_media_url_ignores_rotating_pathsig_but_keeps_video_and_track_identity():
+    first = "https://cdn.example/media.m3u8?pathsig=first&r=video-one&st=video"
+    renewed = "https://cdn.example/media.m3u8?st=video&r=video-one&PathSig=renewed"
+    other_video = "https://cdn.example/media.m3u8?pathsig=first&r=video-two&st=video"
+    audio = "https://cdn.example/media.m3u8?pathsig=first&r=video-one&st=audio"
+
+    assert canonical_media_url(first) == canonical_media_url(renewed)
+    assert canonical_media_url(first) != canonical_media_url(other_video)
+    assert canonical_media_url(first) != canonical_media_url(audio)
+
+
+def test_resume_reuses_segments_when_only_pathsig_changes(tmp_path):
+    output = tmp_path / "Lesson.mp4"
+    arguments = {
+        "lesson_url": "https://school/lesson/1",
+        "requested_quality": "360",
+    }
+    _, paths, _ = _prepare_checkpoint(
+        output,
+        **arguments,
+        playlist_url="https://cdn/media.m3u8?r=one&pathsig=old",
+        segment_urls=["https://cdn/segment.m4s?r=one&pathsig=old"],
+    )
+    paths[0].write_bytes(b"completed segment")
+
+    _, renewed_paths, resumed = _prepare_checkpoint(
+        output,
+        **arguments,
+        playlist_url="https://cdn/media.m3u8?r=one&pathsig=new",
+        segment_urls=["https://cdn/segment.m4s?r=one&pathsig=new"],
+    )
+
+    assert resumed == 1
+    assert renewed_paths[0].read_bytes() == b"completed segment"
+
+
 def test_resume_does_not_reuse_segments_for_a_different_query_media_identity(tmp_path):
     output = tmp_path / "Lesson.mp4"
     arguments = {

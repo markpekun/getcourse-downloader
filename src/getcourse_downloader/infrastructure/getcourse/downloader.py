@@ -30,7 +30,6 @@ from getcourse_downloader.infrastructure.media.hls import (
     HlsDownloader,
     HlsDownloadStatus,
     HlsKeyDeclaration,
-    canonical_media_url,
     has_unsupported_hls_encryption,
     is_hls_master_playlist,
     is_hls_playlist,
@@ -39,6 +38,7 @@ from getcourse_downloader.infrastructure.media.hls import (
     select_stream_playlist_url,
     select_stream_variant,
 )
+from getcourse_downloader.infrastructure.media.playlist_identity import playlist_identity
 from getcourse_downloader.infrastructure.storage.download_catalog import (
     DownloadedMedia,
     JsonDownloadCatalog,
@@ -785,19 +785,19 @@ class PlaywrightDownloadGateway:
     def _select_playlists(playlists: Iterable[_Playlist], quality: str) -> list[_Playlist]:
         candidates = tuple(playlists)
         selected: dict[str, _Playlist] = {}
-        master_variant_keys: set[str] = set()
+        master_rendition_keys: set[str] = set()
 
         for playlist in candidates:
             if not is_hls_master_playlist(playlist.text):
                 continue
             session_key = parse_session_key(playlist.text, playlist.url)
-            master_variant_keys.update(
-                canonical_media_url(variant.url)
-                for variant in parse_master_variants(playlist.text, playlist.url)
-            )
+            for variant in parse_master_variants(playlist.text, playlist.url):
+                master_rendition_keys.add(playlist_identity(variant.url))
+                if variant.audio_url:
+                    master_rendition_keys.add(playlist_identity(variant.audio_url))
             selected_variant = select_stream_variant(playlist.text, playlist.url, quality)
             if selected_variant:
-                key = canonical_media_url(selected_variant.url)
+                key = playlist_identity(selected_variant.url)
                 selected.setdefault(
                     key,
                     _Playlist(
@@ -813,13 +813,13 @@ class PlaywrightDownloadGateway:
         for playlist in candidates:
             if is_hls_master_playlist(playlist.text):
                 continue
-            key = canonical_media_url(playlist.url)
-            if key in master_variant_keys:
+            key = playlist_identity(playlist.url)
+            if key in master_rendition_keys:
                 continue
             selected_url = select_stream_playlist_url(playlist.text, playlist.url, quality)
             if selected_url:
                 selected.setdefault(
-                    canonical_media_url(selected_url),
+                    playlist_identity(selected_url),
                     _Playlist(selected_url, "", playlist.referer_url),
                 )
         return [selected[key] for key in sorted(selected)]

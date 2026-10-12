@@ -40,6 +40,7 @@ _VOLATILE_QUERY_PARAMETERS = {
     "jwt",
     "kcd",
     "key-pair-id",
+    "pathsig",
     "policy",
     "sig",
     "sign",
@@ -431,6 +432,16 @@ def _write_json_atomic(path: Path, payload: object) -> None:
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _write_binary_stream(path: Path, segment_paths: list[Path]) -> None:
+    """Keep an MP4 init box and its dependent fragments in a single input stream."""
+    temporary = path.with_name(f"{path.name}.tmp")
+    with temporary.open("wb") as destination:
+        for segment_path in segment_paths:
+            with segment_path.open("rb") as source:
+                shutil.copyfileobj(source, destination, length=1024 * 1024)
     os.replace(temporary, path)
 
 
@@ -927,11 +938,20 @@ class HlsDownloader:
                 )
 
             temporary_output = checkpoint / "output.part.mp4"
+            fragmented_mp4 = any(resource.role == "init" for resource in resources)
             if decryption_key_hex is not None:
                 success, error_message = await self._muxer.decrypt_fragments(
                     segment_paths,
                     temporary_output,
                     decryption_key_hex=decryption_key_hex,
+                    is_cancelled=is_cancelled,
+                )
+            elif fragmented_mp4:
+                fragmented_input = checkpoint / "video.fmp4"
+                _write_binary_stream(fragmented_input, segment_paths)
+                success, error_message = await self._muxer.mux(
+                    fragmented_input,
+                    temporary_output,
                     is_cancelled=is_cancelled,
                 )
             else:
@@ -948,14 +968,9 @@ class HlsDownloader:
                     resumed_segments=resumed,
                     total_segments=total,
                 )
-            if not success and decryption_key_hex is None:
+            if not success and decryption_key_hex is None and not fragmented_mp4:
                 transport_stream = checkpoint / "video.ts"
-                temporary_transport = checkpoint / "video.ts.tmp"
-                with temporary_transport.open("wb") as destination:
-                    for segment_path in segment_paths:
-                        with segment_path.open("rb") as source:
-                            shutil.copyfileobj(source, destination, length=1024 * 1024)
-                os.replace(temporary_transport, transport_stream)
+                _write_binary_stream(transport_stream, segment_paths)
                 if is_cancelled and is_cancelled():
                     return HlsDownloadResult(
                         HlsDownloadStatus.CANCELLED,

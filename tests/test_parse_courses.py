@@ -45,6 +45,28 @@ def test_parse_lesson_item_from_fixture():
     assert href == "/teach/control/lesson/view/id/456"
 
 
+@pytest.mark.parametrize("anchor_attributes", ["", 'href=""'])
+def test_parse_scheduled_lesson_uses_nested_title_link(anchor_attributes):
+    html = (
+        '<li class="user-state-not_reached" data-lesson-id="457">'
+        f'<a class="user-state-bg item-a" {anchor_attributes}>'
+        '<div class="info"><table><tr><td><div class="vmiddle">'
+        '<div class="lesson-date">Откроется позже</div>'
+        '<div class="link title" href="/teach/control/lesson/view/id/457">'
+        'Урок <strong>2</strong><span class="lesson-list__video-watched"></span>'
+        "</div></div></td></tr></table></div></a></li>"
+    )
+    assert parse_lesson_item(html) == ("Урок 2", "/teach/control/lesson/view/id/457")
+
+
+def test_parse_lesson_without_link_does_not_invent_url_from_lesson_id():
+    html = (
+        '<li data-lesson-id="458"><a class="item-a">'
+        '<div class="link title">Без ссылки</div></a></li>'
+    )
+    assert parse_lesson_item(html) == ("Без ссылки", "#")
+
+
 def test_parse_course_row_with_status_word():
     html = (
         '<tr class="training-row">'
@@ -236,6 +258,49 @@ def _page_from_fixture(name: str) -> dict[str, Any]:
         "stream_rows": re.findall(r"<tr\b.*?</tr>", html, flags=re.DOTALL),
         "lessons": re.findall(r"<li\b.*?</li>", html, flags=re.DOTALL),
     }
+
+
+def test_nested_discovery_includes_scheduled_lessons_in_tree_and_progress():
+    base = "https://school.example"
+    root_url = f"{base}/teach/control/stream/view/id/100"
+    module_url = f"{base}/teach/control/stream/view/id/101"
+    pages = {
+        root_url: {
+            "title": "Курс",
+            "stream_rows": [_stream_row_html(101, "Модуль")],
+            "lessons": [_lesson_html(3001, "Введение")],
+        },
+        module_url: _page_from_fixture("scheduled_lesson_list.html"),
+    }
+    discoverer = GetCourseDiscoverer(browser_factory=None)  # type: ignore[arg-type]
+    browser = _FakeBrowser(pages)
+    page: Any = browser.landing_page(root_url)
+    counts: dict[str, int | None] = {}
+
+    async def on_course(update) -> None:
+        counts[update.url] = update.lesson_count
+
+    courses = asyncio.run(
+        discoverer._parse_page(
+            browser,  # type: ignore[arg-type]
+            page,
+            root_url,
+            on_course_discovered=on_course,
+        )
+    )
+    assert courses[0].lesson_count == 4
+    module = courses[0].children[0]
+    assert [lesson.title for lesson in module.lessons] == [
+        "Открытый урок",
+        "Следующий урок",
+        "Будущий урок",
+    ]
+    assert [lesson.url for lesson in module.lessons] == [
+        f"{base}/teach/control/lesson/view/id/3101",
+        f"{base}/teach/control/lesson/view/id/3102",
+        f"{base}/teach/control/lesson/view/id/3103",
+    ]
+    assert counts == {root_url: 4, module_url: 3}
 
 
 def test_recursive_discovery_keeps_tree_order_and_ignores_stream_page_fallback():

@@ -61,6 +61,8 @@ def test_mux_concat_uses_ffmpeg_concat_demuxer(monkeypatch, tmp_path):
 
     assert (success, message) == (True, "")
     assert captured[1:] == [
+        "-abort_on",
+        "empty_output",
         "-y",
         "-f",
         "concat",
@@ -232,6 +234,8 @@ def test_decrypt_file_uses_local_input_and_copy(monkeypatch, tmp_path):
 
     assert (success, message) == (True, "")
     assert captured[1:] == [
+        "-abort_on",
+        "empty_output",
         "-y",
         "-v",
         "error",

@@ -132,6 +132,29 @@ def test_redesigned_module_cards_provide_titles_without_url_fallback():
     _run_in_firefox(check)
 
 
+def test_legacy_nested_list_includes_scheduled_lessons_without_anchor_href():
+    async def check(context: BrowserContext) -> None:
+        await _serve_pages(context, {MODULE_URL: _fixture("scheduled_lesson_list.html")})
+        page = await context.new_page()
+        await page.goto(MODULE_URL, wait_until="domcontentloaded")
+        discoverer = GetCourseDiscoverer(browser_factory=None)  # type: ignore[arg-type]
+        courses = await discoverer._parse_page(context, page, MODULE_URL)
+
+        assert courses[0].lesson_count == 3
+        assert [lesson.title for lesson in courses[0].lessons] == [
+            "Открытый урок",
+            "Следующий урок",
+            "Будущий урок",
+        ]
+        assert [lesson.url for lesson in courses[0].lessons] == [
+            f"{ORIGIN}/teach/control/lesson/view/id/3101",
+            f"{ORIGIN}/teach/control/lesson/view/id/3102",
+            f"{ORIGIN}/teach/control/lesson/view/id/3103",
+        ]
+
+    _run_in_firefox(check)
+
+
 def test_direct_redesigned_module_does_not_follow_parent_breadcrumbs():
     async def check(context: BrowserContext) -> None:
         visited = await _serve_pages(context, {MODULE_URL: _fixture("redesigned_module.html")})

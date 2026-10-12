@@ -215,6 +215,8 @@ class FfmpegMuxer:
         flags = getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         process = await asyncio.create_subprocess_exec(
             self.executable(),
+            "-abort_on",
+            "empty_output",
             "-y",
             "-v",
             "error",
@@ -287,6 +289,8 @@ class FfmpegMuxer:
         flags = getattr(__import__("subprocess"), "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         process = await asyncio.create_subprocess_exec(
             self.executable(),
+            "-abort_on",
+            "empty_output",
             *arguments,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from getcourse_downloader.infrastructure.media.hls import (
     HlsDownloader,
     HlsDownloadResult,
     HlsDownloadStatus,
+    parse_master_variants,
 )
 from getcourse_downloader.infrastructure.storage.download_catalog import (
     DownloadedMedia,
@@ -559,6 +561,165 @@ def test_master_and_captured_variant_are_deduplicated_by_canonical_url():
 
     assert len(selected) == 1
     assert selected[0] == "https://cdn.example/video.m3u8?token=one"
+
+
+def test_master_audio_rendition_is_not_selected_as_an_independent_video():
+    master = _Playlist(
+        "https://cdn.example/master.m3u8",
+        "#EXTM3U\n"
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="voice",URI="audio.m3u8?token=master"\n'
+        '#EXT-X-STREAM-INF:RESOLUTION=640x360,AUDIO="voice"\nvideo.m3u8\n',
+    )
+    audio = _Playlist(
+        "https://cdn.example/audio.m3u8?token=captured",
+        "#EXTM3U\n#EXTINF:1,\na.m4s\n",
+    )
+    video = _Playlist("https://cdn.example/video.m3u8", "#EXTM3U\n#EXTINF:1,\nv.m4s\n")
+    unrelated = _Playlist("https://cdn.example/other.m3u8", "#EXTM3U\n#EXTINF:1,\nother.ts\n")
+
+    selected = PlaywrightDownloadGateway._select_playlists(
+        (audio, master, video, unrelated), "auto"
+    )
+    assert [playlist.url for playlist in selected] == [
+        "https://cdn.example/other.m3u8",
+        "https://cdn.example/video.m3u8",
+    ]
+    assert selected[1].audio_url == "https://cdn.example/audio.m3u8?token=master"
+
+
+def _three_videos_with_renewed_signatures() -> list[_Playlist]:
+    playlists = []
+    for video_id in ("first", "second", "third"):
+        for signature in ("initial", "renewed"):
+            prefix = f"https://cdn.example/media.m3u8?r={video_id}&pathsig={signature}"
+            playlists.append(
+                _Playlist(
+                    f"https://cdn.example/playlist.m3u8?r={video_id}&pathsig={signature}",
+                    "#EXTM3U\n"
+                    f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="voice",URI="{prefix}&st=audio"\n'
+                    '#EXT-X-STREAM-INF:RESOLUTION=640x360,AUDIO="voice"\n'
+                    f"{prefix}&st=video&quality=360\n"
+                    '#EXT-X-STREAM-INF:RESOLUTION=1280x720,AUDIO="voice"\n'
+                    f"{prefix}&st=video&quality=720\n",
+                )
+            )
+        for track in ("st=audio", "st=video&quality=360", "st=video&quality=720"):
+            playlists.append(
+                _Playlist(
+                    f"https://cdn.example/media.m3u8?r={video_id}&pathsig=captured&{track}",
+                    "#EXTM3U\n#EXTINF:1,\nsegment.m4s\n",
+                )
+            )
+    return playlists
+
+
+def _vimeo_alternate_cdns() -> list[_Playlist]:
+    # Reproduces observed Vimeo structure using fixed synthetic identifiers and credentials.
+    path = Path(__file__).parent / "fixtures" / "vimeo_alternate_cdns.json"
+    return [_Playlist(**item) for item in json.loads(path.read_text(encoding="utf-8"))]
+
+
+@pytest.mark.parametrize("quality,height", [("360", 360), ("720", 720), ("auto", 720)])
+def test_vimeo_alternate_cdns_and_delivery_routes_select_three_videos(quality, height):
+    selected = PlaywrightDownloadGateway._select_playlists(_vimeo_alternate_cdns(), quality)
+
+    assert len(selected) == 3
+    assert all(playlist.height == height and playlist.audio_url for playlist in selected)
+    assert len({playlist.url.split("/psid=")[0].rsplit("/", 1)[-1] for playlist in selected}) == 3
+
+
+def test_vimeo_captured_audio_and_other_quality_do_not_add_extra_videos():
+    masters = _vimeo_alternate_cdns()
+    variants = parse_master_variants(masters[0].text, masters[0].url)
+    captured = [
+        _Playlist(
+            url.replace("vod-adaptive-ak.vimeocdn.com", "other.vimeocdn.com"),
+            "#EXTM3U\n#EXTINF:1,\nsegment.m4s\n",
+        )
+        for variant in variants
+        for url in (variant.url, variant.audio_url)
+        if url
+    ]
+
+    selected = PlaywrightDownloadGateway._select_playlists([*captured, *masters], "360")
+
+    assert len(selected) == 3
+    assert all(playlist.height == 360 and playlist.audio_url for playlist in selected)
+
+
+def test_vimeo_deduplication_preserves_a_fourth_distinct_video():
+    masters = _vimeo_alternate_cdns()
+    first = masters[0]
+    asset = first.url.split("/psid=")[0].rsplit("/", 1)[-1]
+    another_asset = "44444444-4444-4444-8444-444444444444"
+    fourth = _Playlist(
+        first.url.replace(asset, another_asset), first.text.replace(asset, another_asset)
+    )
+
+    assert len(PlaywrightDownloadGateway._select_playlists([*masters, fourth], "360")) == 4
+
+
+def test_three_players_with_renewed_pathsig_select_exactly_three_videos():
+    selected = PlaywrightDownloadGateway._select_playlists(
+        _three_videos_with_renewed_signatures(), "360"
+    )
+    assert len(selected) == 3
+    assert all(playlist.height == 360 and playlist.audio_url for playlist in selected)
+    assert {playlist.url.split("r=", 1)[1].split("&", 1)[0] for playlist in selected} == {
+        "first",
+        "second",
+        "third",
+    }
+
+
+@pytest.mark.parametrize(
+    "playlists_factory", [_three_videos_with_renewed_signatures, _vimeo_alternate_cdns]
+)
+def test_lesson_download_does_not_repeat_three_videos_after_signature_renewal(
+    monkeypatch, tmp_path, playlists_factory
+):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+
+    class RepeatedPlaylistPage(_Page):
+        async def goto(self, url, **_):
+            self.url = url
+
+            class Response:
+                def __init__(self, playlist):
+                    self.url = playlist.url
+                    self._text = playlist.text
+
+                async def text(self):
+                    return self._text
+
+            for playlist in playlists_factory():
+                for handler in self._handlers:
+                    handler(Response(playlist))
+
+    class FileHls(_AudioRecordingHls):
+        async def download(self, playlist_url, output_stem, *_args, **kwargs):
+            result = await super().download(playlist_url, output_stem, **kwargs)
+            result.output_path.parent.mkdir(parents=True, exist_ok=True)
+            result.output_path.write_bytes(b"local media")
+            return result
+
+    hls = FileHls()
+    gateway = PlaywrightDownloadGateway(None, hls)  # type: ignore[arg-type]
+    result = asyncio.run(
+        gateway._download_lesson(
+            _Browser(RepeatedPlaylistPage(player=True)),
+            _item(),
+            tmp_path / "Lesson",
+            "360",
+            lambda _: None,
+        )
+    )
+
+    assert result.status.value == "downloaded"
+    assert len(result.media) == 3
+    assert len(hls.merges) == 3
+    assert len(hls.calls) == 6  # One video and one companion audio per player.
+    assert len(list((tmp_path / "Lesson").glob("video_*.mp4"))) == 3
 
 
 def test_master_suppresses_all_captured_lower_quality_variants():

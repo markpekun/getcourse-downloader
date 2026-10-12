@@ -79,6 +79,7 @@ class _FragmentParser(HTMLParser):
         self._collecting = False
         self._parts: list[str] = []
         self.href: str | None = None
+        self.matched_href: str | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr_map = dict(attrs)
@@ -86,6 +87,8 @@ class _FragmentParser(HTMLParser):
             self.href = attr_map.get("href")
         classes = set((attr_map.get("class") or "").split())
         if tag == self._tag and self._class_names.issubset(classes):
+            if self.matched_href is None:
+                self.matched_href = attr_map.get("href")
             self._collecting = True
             self._depth = 1
         elif self._collecting:
@@ -112,9 +115,10 @@ def parse_course_row(html: str) -> tuple[str, str]:
 
 
 def parse_lesson_item(html: str) -> tuple[str, str]:
+    """Read legacy lessons, including scheduled items with href only on the title."""
     parser = _FragmentParser("div", "link title")
     parser.feed(html)
-    return clean_title(parser.text() or "Без названия"), parser.href or "#"
+    return clean_title(parser.text() or "Без названия"), parser.href or parser.matched_href or "#"
 
 
 def _canonical_content_url(base_url: str, candidate: str, kind: str) -> str | None:
