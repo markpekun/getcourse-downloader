@@ -139,7 +139,9 @@ class _ProfileLease:
                         owner = 0
                     if self._path.stat().st_mtime_ns != recorded.st_mtime_ns:
                         continue
-                    initializing = owner == 0 and 0 <= time.time() - recorded.st_mtime < 5
+                    # Filesystem timestamps can be slightly ahead of the wall clock.
+                    # An owner that is still being written must remain protected.
+                    initializing = owner == 0 and time.time() - recorded.st_mtime < 5
                     if initializing or self._legacy_owner_is_live(owner, recorded.st_mtime_ns):
                         raise _busy_error()
                     self._path.unlink(missing_ok=True)

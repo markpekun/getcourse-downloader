@@ -6,6 +6,7 @@ import time
 import pytest
 
 from getcourse_downloader.domain.errors import ExternalServiceError
+from getcourse_downloader.infrastructure.browser import profile_lease
 from getcourse_downloader.infrastructure.browser.playwright import _ProfileLease
 
 
@@ -36,6 +37,33 @@ def test_profile_lease_does_not_steal_lock_before_owner_pid_is_written(tmp_path)
     with pytest.raises(ExternalServiceError):
         _ProfileLease(tmp_path).acquire()
     assert owner.read_bytes() == b""
+
+
+@pytest.mark.parametrize("age", [-0.001, 0.0, 4.99])
+def test_profile_lease_preserves_initializing_owner_with_clock_skew(tmp_path, monkeypatch, age):
+    owner = tmp_path / ".gcd-profile-owner"
+    owner.write_bytes(b"")
+    now = owner.stat().st_mtime + age
+    monkeypatch.setattr(profile_lease.time, "time", lambda: now)
+
+    with pytest.raises(ExternalServiceError) as captured:
+        _ProfileLease(tmp_path).acquire()
+
+    assert captured.value.code == "BROWSER_PROFILE_BUSY"
+    assert owner.read_bytes() == b""
+
+
+def test_profile_lease_recovers_abandoned_empty_owner_after_grace_period(tmp_path, monkeypatch):
+    owner = tmp_path / ".gcd-profile-owner"
+    owner.write_bytes(b"")
+    now = owner.stat().st_mtime + 5.01
+    monkeypatch.setattr(profile_lease.time, "time", lambda: now)
+    lease = _ProfileLease(tmp_path)
+    try:
+        lease.acquire()
+        assert owner.read_text(encoding="ascii") == str(os.getpid())
+    finally:
+        lease.release()
 
 
 def test_failed_acquisition_cannot_release_another_lease(tmp_path):
