@@ -1564,6 +1564,17 @@ class CoursesScreen:
         self._diagnostic_previous_content = None
         self._overlay_card.opacity = 1
         self._overlay_card.offset = ft.Offset(0, 0)
+        detail_titles = list(
+            dict.fromkeys(
+                [
+                    *(
+                        line[1:].strip() if line.startswith("✗") else line
+                        for line in (failed or [])
+                    ),
+                    *getattr(self, "_diagnostic_reports_by_title", {}),
+                ]
+            )
+        )
         self._completion_flow = CompletionFlow(
             CompletionResult(message, is_error, is_warning, cancelled),
             self._overlay_card,
@@ -1571,7 +1582,7 @@ class CoursesScreen:
             on_close=self._close_completion_overlay,
             on_github=self._open_github,
             on_contact=self._open_contact,
-            failed_details=self._build_failed_lessons(failed) if failed else None,
+            failed_details=self._build_failed_lessons(detail_titles) if detail_titles else None,
         )
         self.overlay.visible = True
         self.page.update()
@@ -1615,12 +1626,18 @@ class CoursesScreen:
                 )
             )
         return ft.Container(
-            height=min(180, 48 * len(failed)),
+            expand=True,
             border_radius=10,
             bgcolor="rgba(0,0,0,0.3)",
             border=ft.Border.all(1, "rgba(255,255,255,0.06)"),
             padding=ft.Padding.all(12),
-            content=ft.Column(spacing=4, scroll=ft.ScrollMode.AUTO, controls=rows),
+            content=ft.ListView(
+                key="completion-lessons",
+                spacing=4,
+                controls=rows,
+                expand=True,
+                scroll=ft.Scrollbar(thumb_visibility=True, thickness=4, interactive=True),
+            ),
         )
 
     async def _open_github(self, _event=None) -> None:
@@ -1630,8 +1647,10 @@ class CoursesScreen:
         await self.page.launch_url(_CONTACT_URL)
 
     def _close_completion_overlay(self, _event=None) -> None:
+        if self.state.downloading or self.state.cancelling:
+            return
         flow = getattr(self, "_completion_flow", None)
-        if flow is not None and flow.state.step is CompletionStep.RESULT:
+        if flow is None or flow.state.step in {CompletionStep.RESULT, CompletionStep.DETAILS}:
             return
         self.overlay.visible = False
         self.page.update()

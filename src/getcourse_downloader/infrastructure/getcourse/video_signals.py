@@ -1,5 +1,6 @@
 import re
 from html import unescape
+from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 MASTER_PLAYLIST_PATH = "/api/playlist/master/"
@@ -10,8 +11,23 @@ VIDEO_PLAYER_SELECTOR = ", ".join(
         "iframe.js--vhi-iframe",
         "iframe[src*='rutube.ru/play/embed/']",
         "iframe[src*='kinescope.io/embed/']",
+        "iframe[src*='player.vimeo.com/video/']",
+        "iframe[src*='/sign-player/']",
     )
 )
+
+
+def frame_lineage_ids(frame: Any) -> tuple[int, ...]:
+    """Keep ephemeral frame identities for associating nested player responses.
+
+    These identities live only during discovery; no signed frame URLs are retained.
+    """
+    frame_ids = []
+    while frame is not None:
+        frame_ids.append(id(frame))
+        frame = getattr(frame, "parent_frame", None)
+    return tuple(frame_ids)
+
 
 _HLS_REFERENCE_RE = re.compile(
     r"(?:(?:https?:)?//|/)[^\"'<>\s]+?\.m3u8(?:\?[^\"'<>\s]*)?",

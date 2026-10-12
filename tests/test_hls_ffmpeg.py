@@ -87,7 +87,10 @@ def _probe(muxer: FfmpegMuxer, path: Path) -> dict:
     return json.loads(process.stdout)
 
 
-def test_fmp4_hls_downloads_and_merges_real_video_and_audio(media_tools, tmp_path):
+@pytest.mark.parametrize("transient_outage", [False, True])
+def test_fmp4_hls_downloads_and_merges_real_video_and_audio(
+    media_tools, tmp_path, transient_outage
+):
     for kind in ("video", "audio"):
         _generate_fmp4_hls(media_tools, tmp_path / kind, kind)
     payloads = {
@@ -97,7 +100,14 @@ def test_fmp4_hls_downloads_and_merges_real_video_and_audio(media_tools, tmp_pat
     }
 
     async def scenario():
+        segment_requests = 0
+
         async def serve(request):
+            nonlocal segment_requests
+            if request.path == "/video/segment0.m4s":
+                segment_requests += 1
+                if transient_outage and segment_requests <= 3:
+                    raise web.HTTPGatewayTimeout()
             body = payloads.get(request.path)
             if body is None:
                 raise web.HTTPNotFound()
@@ -118,6 +128,7 @@ def test_fmp4_hls_downloads_and_merges_real_video_and_audio(media_tools, tmp_pat
                 f"{origin}/audio/media.m3u8", tmp_path / "Audio", "Local", lambda _: None
             )
             assert video.status is audio.status is HlsDownloadStatus.DOWNLOADED
+            assert segment_requests == (4 if transient_outage else 1)
             assert video.output_path is not None and audio.output_path is not None
             for kind, result in (("video", video), ("audio", audio)):
                 streams = _probe(media_tools, result.output_path)["streams"]

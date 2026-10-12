@@ -4,6 +4,7 @@ from enum import StrEnum
 
 class CompletionStep(StrEnum):
     RESULT = "result"
+    DETAILS = "details"
     SUPPORT = "support"
     INSTRUCTIONS = "instructions"
 

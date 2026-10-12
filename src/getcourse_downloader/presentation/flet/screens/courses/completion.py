@@ -11,7 +11,7 @@ from getcourse_downloader.presentation.flet.theme import Color
 
 
 class CompletionFlow:
-    """Three views inside the existing overlay, independent of download execution."""
+    """Result, lesson details and support inside the existing overlay."""
 
     def __init__(
         self,
@@ -31,8 +31,10 @@ class CompletionFlow:
         self._on_close = on_close
         self._on_github = on_github
         self._on_contact = on_contact
-        self._result_height = 440 if failed_details is not None else 360
-        self.result_content = self._build_result(failed_details)
+        self._failed_details = failed_details
+        self._details_content: ft.Column | None = None
+        self._result_height = 460 if failed_details is not None else 360
+        self.result_content = self._build_result()
         self._switcher = ft.AnimatedSwitcher(
             content=self.result_content,
             expand=True,
@@ -99,7 +101,7 @@ class CompletionFlow:
             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         )
 
-    def _build_result(self, failed_details: ft.Control | None) -> ft.Stack:
+    def _build_result(self) -> ft.Column:
         if self.result.is_error:
             title, icon, color = "Ошибка загрузки", ft.Icons.ERROR_ROUNDED, Color.RED
         elif self.result.cancelled:
@@ -130,14 +132,22 @@ class CompletionFlow:
         if not (self.result.is_error or self.result.is_warning or self.result.cancelled):
             body.append(self._text("Файлы сохранены в выбранную папку.", centered=True))
         body.append(self._text(self.result.message, centered=True))
-        if failed_details is not None:
-            body.append(failed_details)
-        return ft.Stack(
+        if self._failed_details is not None:
+            body.append(
+                ft.TextButton(
+                    "Посмотреть подробности",
+                    key="completion-details",
+                    icon=ft.Icons.LIST_ALT_ROUNDED,
+                    style=ft.ButtonStyle(color=Color.ACCENT_LIGHT),
+                    on_click=self.show_details,
+                )
+            )
+        return ft.Column(
             expand=True,
+            spacing=12,
             controls=[
                 ft.Container(
                     expand=True,
-                    padding=ft.Padding.symmetric(vertical=40),
                     alignment=ft.Alignment.CENTER,
                     content=ft.Column(
                         key="completion-body",
@@ -145,26 +155,45 @@ class CompletionFlow:
                         tight=True,
                         spacing=14,
                         alignment=ft.MainAxisAlignment.CENTER,
-                        scroll=ft.Scrollbar(thumb_visibility=True, thickness=4, interactive=True),
                         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                 ),
-                ft.Container(
-                    right=0,
-                    bottom=0,
-                    content=ft.TextButton(
-                        key="completion-next",
-                        content=ft.Row(
-                            tight=True,
-                            spacing=8,
-                            controls=[
-                                ft.Text("Далее"),
-                                ft.Icon(ft.Icons.ARROW_FORWARD, size=18),
-                            ],
-                        ),
-                        style=ft.ButtonStyle(color=Color.ACCENT_LIGHT),
-                        on_click=self.show_support,
-                    ),
+                ft.Row(
+                    alignment=ft.MainAxisAlignment.END,
+                    controls=[
+                        ft.TextButton(
+                            key="completion-next",
+                            content=ft.Row(
+                                tight=True,
+                                spacing=8,
+                                controls=[
+                                    ft.Text("Далее"),
+                                    ft.Icon(ft.Icons.ARROW_FORWARD, size=18),
+                                ],
+                            ),
+                            style=ft.ButtonStyle(color=Color.ACCENT_LIGHT),
+                            on_click=self.show_support,
+                        )
+                    ],
+                ),
+            ],
+        )
+
+    def _build_details(self) -> ft.Column:
+        assert self._failed_details is not None
+        return ft.Column(
+            expand=True,
+            spacing=12,
+            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+            controls=[
+                self._text("Подробности по урокам", heading=True),
+                self._failed_details,
+                ft.TextButton(
+                    "Назад к итогам",
+                    key="completion-result-back",
+                    icon=ft.Icons.ARROW_BACK,
+                    style=ft.ButtonStyle(color=Color.ACCENT_LIGHT),
+                    on_click=self.show_result,
                 ),
             ],
         )
@@ -423,16 +452,32 @@ class CompletionFlow:
         )
         self._card.width = {
             CompletionStep.RESULT: 600,
+            CompletionStep.DETAILS: 680,
             CompletionStep.SUPPORT: 660,
             CompletionStep.INSTRUCTIONS: 640,
         }[step]
         self._card.height = {
             CompletionStep.RESULT: self._result_height,
+            CompletionStep.DETAILS: 620,
             CompletionStep.SUPPORT: 560,
             CompletionStep.INSTRUCTIONS: 620,
         }[step]
         self._switcher.content = content
         self._card.content = self._switcher
+
+    def show_details(self, _event=None) -> None:
+        if self.state.step is not CompletionStep.RESULT or self._failed_details is None:
+            return
+        if self._details_content is None:
+            self._details_content = self._build_details()
+        self._show(self._details_content, CompletionStep.DETAILS)
+        self._on_change()
+
+    def show_result(self, _event=None) -> None:
+        if self.state.step is not CompletionStep.DETAILS:
+            return
+        self._show(self.result_content, CompletionStep.RESULT)
+        self._on_change()
 
     def show_support(self, _event=None) -> None:
         if self._support_content is None:

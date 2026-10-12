@@ -10,6 +10,7 @@ from playwright.async_api import BrowserContext, Route, async_playwright
 from getcourse_downloader.domain.errors import ExternalServiceError
 from getcourse_downloader.infrastructure.getcourse import discovery
 from getcourse_downloader.infrastructure.getcourse.discovery import GetCourseDiscoverer
+from getcourse_downloader.infrastructure.getcourse.lesson_access import lesson_access_denied
 from getcourse_downloader.infrastructure.getcourse.video_signals import VIDEO_PLAYER_SELECTOR
 
 pytestmark = pytest.mark.integration
@@ -128,6 +129,23 @@ def test_redesigned_module_cards_provide_titles_without_url_fallback():
             f"{ORIGIN}/teach/control/stream/view/id/{identifier}"
             for identifier in range(1101, 1107)
         ]
+
+    _run_in_firefox(check)
+
+
+@pytest.mark.parametrize(
+    "content,denied",
+    [
+        ("<div><h3>Нет доступа</h3><br>У вас нет доступа к этому уроку<br></div>", True),
+        ("<div><h3>Нет доступа</h3><p>Пример заголовка внутри учебного материала</p></div>", False),
+    ],
+)
+def test_lesson_access_uses_the_real_error_heading_and_adjacent_message(content, denied):
+    async def check(context: BrowserContext) -> None:
+        await _serve_pages(context, {MODULE_URL: content})
+        page = await context.new_page()
+        await page.goto(MODULE_URL, wait_until="domcontentloaded")
+        assert await lesson_access_denied(page) is denied
 
     _run_in_firefox(check)
 

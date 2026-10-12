@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -21,9 +21,11 @@ from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.domain.models import DownloadRequest, DownloadSummary, SelectedLesson
 from getcourse_downloader.infrastructure.browser.playwright import PlaywrightBrowserFactory
 from getcourse_downloader.infrastructure.getcourse.authentication import is_authentication_url
+from getcourse_downloader.infrastructure.getcourse.lesson_access import lesson_access_denied
 from getcourse_downloader.infrastructure.getcourse.video_signals import (
     VIDEO_PLAYER_SELECTOR,
     extract_hls_urls,
+    frame_lineage_ids,
     stream_manifest_kind,
 )
 from getcourse_downloader.infrastructure.media.hls import (
@@ -80,6 +82,7 @@ class _Playlist:
     session_key: HlsKeyDeclaration | None = None
     audio_url: str = ""
     height: int = 0
+    frame_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -519,7 +522,16 @@ class PlaywrightDownloadGateway:
                 if key not in observed_manifest_keys:
                     observed_manifest_keys.add(key)
                     observed_manifests.append(_ManifestObservation(kind, host, status))
-            if kind != "hls" or url in playlists:
+            if kind != "hls":
+                return
+            frame_ids: tuple[int, ...] = ()
+            with contextlib.suppress(Exception):
+                frame_ids = frame_lineage_ids(response.request.frame)
+            if url in playlists:
+                existing = playlists[url]
+                playlists[url] = replace(
+                    existing, frame_ids=tuple(set(existing.frame_ids + frame_ids))
+                )
                 return
             try:
                 text = await asyncio.wait_for(response.text(), timeout=15)
@@ -530,7 +542,10 @@ class PlaywrightDownloadGateway:
                 with contextlib.suppress(Exception):
                     headers = await response.request.all_headers()
                     referer_url = headers.get("referer", "")
-                playlists[url] = _Playlist(url, text, referer_url)
+                previous = playlists.get(url)
+                if previous is not None:
+                    frame_ids = tuple(set(previous.frame_ids + frame_ids))
+                playlists[url] = _Playlist(url, text, referer_url, frame_ids=frame_ids)
                 last_playlist_at = time.monotonic()
 
         def schedule_response(response) -> None:
@@ -552,6 +567,20 @@ class PlaywrightDownloadGateway:
             if await self._authentication_required(page):
                 raise _AuthenticationExpired
 
+            if await lesson_access_denied(page):
+                emit(
+                    self._event(
+                        item,
+                        DownloadEventType.ERROR,
+                        "GetCourse не предоставил доступ к этому уроку. "
+                        "Проверьте условия доступа на сайте.",
+                        stage="access",
+                        level="error",
+                        error_code="LESSON_ACCESS_DENIED",
+                    )
+                )
+                return _LessonResult(_LessonStatus.FAILED)
+
             player_present = await self._has_supported_player(page)
             embedded = await self._read_embedded_playlists(page)
             for playlist in embedded:
@@ -562,7 +591,11 @@ class PlaywrightDownloadGateway:
             while time.monotonic() - started_at < PLAYLIST_WAIT_SECONDS:
                 if self._cancelled.is_set():
                     return _LessonResult(_LessonStatus.CANCELLED)
-                if playlists and time.monotonic() - last_playlist_at >= PLAYLIST_QUIET_SECONDS:
+                if (
+                    playlists
+                    and time.monotonic() - last_playlist_at >= PLAYLIST_QUIET_SECONDS
+                    and not await self._missing_player_streams(page, playlists.values())
+                ):
                     break
                 await asyncio.sleep(0.25)
 
@@ -572,6 +605,21 @@ class PlaywrightDownloadGateway:
             if not playlists:
                 for playlist in await self._read_embedded_playlists(page):
                     playlists.setdefault(playlist.url, playlist)
+
+            missing_players = await self._missing_player_streams(page, playlists.values())
+            if playlists and missing_players:
+                emit(
+                    self._event(
+                        item,
+                        DownloadEventType.ERROR,
+                        f"Не получен видеопоток для {len(missing_players)} плееров. "
+                        "Повторите загрузку урока: часть плееров не успела ответить.",
+                        stage="playlist",
+                        level="error",
+                        error_code="PLAYER_STREAMS_INCOMPLETE",
+                    )
+                )
+                return _LessonResult(_LessonStatus.FAILED)
 
             if not playlists:
                 player_present = player_present or await self._has_supported_player(page)
@@ -825,6 +873,20 @@ class PlaywrightDownloadGateway:
         return [selected[key] for key in sorted(selected)]
 
     @staticmethod
+    async def _missing_player_streams(page: Any, playlists: Iterable[_Playlist]) -> set[int]:
+        observed = {frame_id for playlist in playlists for frame_id in playlist.frame_ids}
+        missing: set[int] = set()
+        elements = await page.query_selector_all(VIDEO_PLAYER_SELECTOR)
+        for element in elements:
+            try:
+                frame = await element.content_frame()
+                if frame is None or id(frame) not in observed:
+                    missing.add(id(frame) if frame is not None else -id(element))
+            finally:
+                await element.dispose()
+        return missing
+
+    @staticmethod
     async def _read_embedded_playlists(page: Any) -> list[_Playlist]:
         frames: list[Any] = []
         with contextlib.suppress(Exception):
@@ -833,7 +895,7 @@ class PlaywrightDownloadGateway:
             frames.append(page)
 
         playlists: list[_Playlist] = []
-        seen: set[str] = set()
+        seen: dict[str, int] = {}
         for frame in frames:
             try:
                 frame_url = frame.url or page.url
@@ -842,8 +904,13 @@ class PlaywrightDownloadGateway:
                 continue
             for candidate in extract_hls_urls(content, frame_url):
                 if candidate in seen:
+                    index = seen[candidate]
+                    existing = playlists[index]
+                    playlists[index] = replace(
+                        existing,
+                        frame_ids=tuple(set(existing.frame_ids + frame_lineage_ids(frame))),
+                    )
                     continue
-                seen.add(candidate)
                 try:
                     result = await frame.evaluate(
                         """async (url) => {
@@ -861,7 +928,10 @@ class PlaywrightDownloadGateway:
                 if not isinstance(url, str) or not isinstance(text, str):
                     continue
                 if is_hls_master_playlist(text) or is_hls_playlist(text):
-                    playlists.append(_Playlist(url, text, frame_url))
+                    seen[candidate] = len(playlists)
+                    playlists.append(
+                        _Playlist(url, text, frame_url, frame_ids=frame_lineage_ids(frame))
+                    )
         return playlists
 
     @staticmethod

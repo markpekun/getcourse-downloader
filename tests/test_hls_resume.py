@@ -711,6 +711,16 @@ def test_auto_checks_lesson_master_then_reuses_only_matching_maximum(
         async def query_selector(self, _selector):
             return object()
 
+        async def query_selector_all(self, _selector):
+            return []
+
+        def get_by_role(self, *_args, **_kwargs):
+            class Locator:
+                async def is_visible(self):
+                    return False
+
+            return Locator()
+
         async def wait_for_load_state(self, *_args, **_kwargs):
             pass
 
@@ -954,6 +964,117 @@ def test_segment_network_failure_preserves_downloaded_checkpoint(tmp_path):
     assert (checkpoint / "segments" / "000000.bin").read_bytes() == b"A"
     assert not (checkpoint / "segments" / "000001.bin").exists()
     assert not output.exists()
+
+
+def test_transient_segment_outage_gets_another_pass_without_redownloading_completed_segments(
+    monkeypatch, tmp_path
+):
+    async def no_delay(_):
+        pass
+
+    monkeypatch.setattr(hls_module.asyncio, "sleep", no_delay)
+    playlist_url = "https://cdn.example/media.m3u8"
+    failed_url = "https://cdn.example/b.ts"
+    requests = []
+
+    class RecoveringSession(_Session):
+        def get(self, url, **kwargs):
+            if url == failed_url and self._requests.count(url) < 3:
+                self._requests.append(url)
+                return _Response(
+                    error=aiohttp.ClientResponseError(request_info=None, history=(), status=504)
+                )
+            return super().get(url, **kwargs)
+
+    responses = {
+        playlist_url: _Response(text="#EXTM3U\n#EXTINF:1,\na.ts\n#EXTINF:1,\nb.ts\n"),
+        "https://cdn.example/a.ts": _Response(content=b"A"),
+        failed_url: _Response(content=b"B"),
+    }
+    downloader = HlsDownloader(
+        _Muxer(),
+        concurrency=1,
+        session_factory=lambda **kwargs: RecoveringSession(responses, requests, **kwargs),
+    )
+    result, events = _run(downloader, playlist_url, tmp_path / "Lesson")
+
+    assert result.status is HlsDownloadStatus.DOWNLOADED
+    assert result.output_path.read_bytes() == b"AB"
+    assert requests.count("https://cdn.example/a.ts") == 1
+    assert requests.count(failed_url) == 4
+    assert not any(event.type is DownloadEventType.ERROR for event in events)
+
+
+@pytest.mark.parametrize("status,expected_attempts", [(503, 6), (403, 3)])
+def test_extra_segment_pass_is_bounded_and_does_not_retry_access_denials(
+    monkeypatch, tmp_path, status, expected_attempts
+):
+    async def no_delay(_):
+        pass
+
+    monkeypatch.setattr(hls_module.asyncio, "sleep", no_delay)
+    requests = []
+    playlist_url = "https://cdn.example/media.m3u8"
+    responses = {
+        playlist_url: _Response(text="#EXTM3U\n#EXTINF:1,\na.ts\n#EXTINF:1,\nb.ts\n"),
+        "https://cdn.example/a.ts": _Response(content=b"A"),
+        "https://cdn.example/b.ts": _Response(
+            error=aiohttp.ClientResponseError(request_info=None, history=(), status=status)
+        ),
+    }
+    result, events = _run(_downloader(responses, requests), playlist_url, tmp_path / "Lesson")
+
+    assert result.status is HlsDownloadStatus.FAILED
+    assert requests.count("https://cdn.example/a.ts") == 1
+    assert requests.count("https://cdn.example/b.ts") == expected_attempts
+    assert events[-1].error_code == f"HTTP_{status}"
+    assert events[-1].current == 1
+    assert (
+        _checkpoint_path(tmp_path / "Lesson.mp4") / "segments" / "000000.bin"
+    ).read_bytes() == b"A"
+
+
+def test_cancellation_during_extra_segment_pass_keeps_checkpoint_and_stops_requests(
+    monkeypatch, tmp_path
+):
+    async def no_delay(_):
+        pass
+
+    monkeypatch.setattr(hls_module.asyncio, "sleep", no_delay)
+    requests = []
+    playlist_url = "https://cdn.example/media.m3u8"
+    responses = {
+        playlist_url: _Response(text="#EXTM3U\n#EXTINF:1,\na.ts\n#EXTINF:1,\nb.ts\n"),
+        "https://cdn.example/a.ts": _Response(content=b"A"),
+        "https://cdn.example/b.ts": _Response(
+            error=aiohttp.ClientResponseError(request_info=None, history=(), status=504)
+        ),
+    }
+    cancelled = False
+    events = []
+
+    def emit(event):
+        nonlocal cancelled
+        events.append(event)
+        if event.type is DownloadEventType.LOG and event.level == "warning":
+            cancelled = True
+
+    result = asyncio.run(
+        _downloader(responses, requests).download(
+            playlist_url,
+            tmp_path / "Lesson",
+            "Lesson",
+            emit,
+            is_cancelled=lambda: cancelled,
+        )
+    )
+
+    assert result.status is HlsDownloadStatus.CANCELLED
+    assert requests.count("https://cdn.example/b.ts") == 3
+    assert not any(event.type is DownloadEventType.ERROR for event in events)
+    assert (
+        _checkpoint_path(tmp_path / "Lesson.mp4") / "segments" / "000000.bin"
+    ).read_bytes() == b"A"
 
 
 def test_segment_http_failure_has_safe_code_host_and_progress_for_diagnostics(tmp_path):

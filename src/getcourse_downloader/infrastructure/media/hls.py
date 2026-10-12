@@ -27,6 +27,16 @@ from getcourse_downloader.infrastructure.storage.filenames import (
 _PROGRESS_UPDATE_SECONDS = 0.25
 _SPEED_UPDATE_SECONDS = 3.0
 _monotonic = time.monotonic
+_TRANSIENT_SEGMENT_ERRORS = {
+    "NETWORK_TIMEOUT",
+    "CONNECTION_FAILED",
+    "HTTP_408",
+    "HTTP_429",
+    "HTTP_500",
+    "HTTP_502",
+    "HTTP_503",
+    "HTTP_504",
+}
 _VOLATILE_QUERY_PARAMETERS = {
     "access_token",
     "auth",
@@ -834,7 +844,7 @@ class HlsDownloader:
             started_at = _monotonic()
             last_speed_report = started_at
             transferred_bytes = 0
-            segment_failures: list[tuple[int, str, str, str]] = []
+            segment_failures: dict[int, tuple[str, str, str]] = {}
 
             async def download_segment(index: int, resource: HlsMediaResource) -> bool:
                 nonlocal completed, last_progress_report, last_speed_report, transferred_bytes
@@ -869,6 +879,7 @@ class HlsDownloader:
                                 raise OSError("empty HLS segment")
                             temporary.write_bytes(content)
                             os.replace(temporary, path)
+                            segment_failures.pop(index, None)
                             completed += 1
                             transferred_bytes += len(content)
                             now = _monotonic()
@@ -900,8 +911,10 @@ class HlsDownloader:
                             temporary.unlink(missing_ok=True)
                             if attempt == 2:
                                 error_code, summary = _download_error_details(error)
-                                segment_failures.append(
-                                    (index, error_code, summary, urlsplit(url).netloc)
+                                segment_failures[index] = (
+                                    error_code,
+                                    summary,
+                                    urlsplit(url).netloc,
                                 )
                                 return False
                             await asyncio.sleep(2**attempt)
@@ -910,6 +923,35 @@ class HlsDownloader:
             results = await asyncio.gather(
                 *(download_segment(index, resource) for index, resource in enumerate(resources))
             )
+            retry_indices = [
+                index
+                for index, success in enumerate(results)
+                if not success
+                and index in segment_failures
+                and segment_failures[index][0] in _TRANSIENT_SEGMENT_ERRORS
+            ]
+            if retry_indices and any(results) and not (is_cancelled and is_cancelled()):
+                emit(
+                    event(
+                        DownloadEventType.LOG,
+                        f"Повторяю загрузку {len(retry_indices)} сегментов "
+                        "после временного сбоя сервера",
+                        stage="segments",
+                        current=completed,
+                        total=total,
+                        level="warning",
+                    )
+                )
+                for _ in range(20):
+                    if is_cancelled and is_cancelled():
+                        break
+                    await asyncio.sleep(0.1)
+                if not (is_cancelled and is_cancelled()):
+                    retried = await asyncio.gather(
+                        *(download_segment(index, resources[index]) for index in retry_indices)
+                    )
+                    for index, success in zip(retry_indices, retried, strict=True):
+                        results[index] = success
             if is_cancelled and is_cancelled():
                 return HlsDownloadResult(
                     HlsDownloadStatus.CANCELLED,
@@ -918,7 +960,8 @@ class HlsDownloader:
                 )
             if not all(results):
                 failed_count = sum(not result for result in results)
-                failed_index, error_code, summary, source_host = min(segment_failures)
+                failed_index = min(segment_failures)
+                error_code, summary, source_host = segment_failures[failed_index]
                 emit(
                     event(
                         DownloadEventType.ERROR,

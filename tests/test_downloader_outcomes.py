@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -51,6 +52,9 @@ class _Page:
     async def query_selector(self, _):
         return object() if self._player else None
 
+    async def query_selector_all(self, _):
+        return []
+
     async def wait_for_load_state(self, *_, **__):
         return None
 
@@ -59,6 +63,27 @@ class _Page:
 
     async def close(self):
         return None
+
+    def get_by_role(self, *_, **__):
+        return _Visibility(False)
+
+    def get_by_text(self, *_, **__):
+        return _Visibility(False)
+
+
+class _Visibility:
+    def __init__(self, visible, text=""):
+        self.visible = visible
+        self.text = text
+
+    async def is_visible(self):
+        return self.visible
+
+    def locator(self, _):
+        return self
+
+    async def inner_text(self):
+        return self.text
 
 
 class _Browser:
@@ -215,6 +240,136 @@ def test_no_player_and_no_hls_is_no_video(monkeypatch, tmp_path):
         )
     )
     assert result.status.value == "no_video"
+
+
+def test_closed_lesson_reports_access_denied_instead_of_missing_video(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+
+    class ClosedPage(_Page):
+        def get_by_role(self, role, **kwargs):
+            return _Visibility(
+                role == "heading" and kwargs.get("name") == "Нет доступа",
+                "Нет доступа\nУ вас нет доступа к этому уроку",
+            )
+
+        def get_by_text(self, text, **_):
+            return _Visibility(text == "У вас нет доступа к этому уроку")
+
+    events = []
+    result = asyncio.run(
+        PlaywrightDownloadGateway(None, _Hls())._download_lesson(
+            _Browser(ClosedPage(player=False)), _item(), tmp_path / "Lesson", "auto", events.append
+        )
+    )
+
+    assert result.status.value == "failed"
+    assert events[-1].error_code == "LESSON_ACCESS_DENIED"
+    assert events[-1].stage == "access"
+
+
+class _PlayerFrame:
+    def __init__(self, number):
+        self.url = f"https://video.example/sign-player/?video=test-{number}"
+
+    async def content(self):
+        return ""
+
+
+class _DelayedPlaylistPage(_Page):
+    def __init__(self, *, missing=False, unloaded=False):
+        super().__init__(player=True)
+        self.frames = [_PlayerFrame(number) for number in range(1, 4)]
+        if unloaded:
+            self.frames[2].url = "about:blank"
+        self.missing = missing
+        self.delayed = None
+
+    def emit_playlist(self, index):
+        self.frames[index - 1].url = f"https://video.example/sign-player/?video=test-{index}"
+        response = SimpleNamespace(
+            url=f"https://cdn.example/video-{index}/master.m3u8",
+            request=SimpleNamespace(frame=self.frames[index - 1]),
+        )
+
+        async def text():
+            return "#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=640x360\nvideo.m3u8\n"
+
+        response.text = text
+        for handler in self._handlers:
+            handler(response)
+
+    async def query_selector_all(self, _):
+        class Element:
+            def __init__(self, frame):
+                self.frame = frame
+
+            async def content_frame(self):
+                return self.frame
+
+            async def dispose(self):
+                pass
+
+        return [Element(frame) for frame in self.frames]
+
+    async def goto(self, url, **_):
+        self.url = url
+        self.emit_playlist(1)
+        self.emit_playlist(2)
+
+        async def delayed_response():
+            await asyncio.sleep(0.4)
+            self.emit_playlist(3)
+
+        if not self.missing:
+            self.delayed = asyncio.create_task(delayed_response())
+
+    async def close(self):
+        if self.delayed:
+            self.delayed.cancel()
+            await asyncio.gather(self.delayed, return_exceptions=True)
+
+
+@pytest.mark.parametrize("unloaded", [False, True])
+def test_all_player_streams_are_waited_for_after_network_quiet(monkeypatch, tmp_path, unloaded):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 2.0)
+    monkeypatch.setattr(downloader_module, "PLAYLIST_QUIET_SECONDS", 0.01)
+    hls = _SuccessfulHls()
+    result = asyncio.run(
+        PlaywrightDownloadGateway(None, hls)._download_lesson(
+            _Browser(_DelayedPlaylistPage(unloaded=unloaded)),
+            _item(),
+            tmp_path / "Lesson",
+            "auto",
+            lambda _: None,
+        )
+    )
+
+    assert result.status.value == "downloaded"
+    assert len(result.media) == 3
+    assert hls.calls == 3
+
+
+@pytest.mark.parametrize("unloaded", [False, True])
+def test_missing_third_player_stream_is_not_reported_as_complete_lesson(
+    monkeypatch, tmp_path, unloaded
+):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.3)
+    monkeypatch.setattr(downloader_module, "PLAYLIST_QUIET_SECONDS", 0.01)
+    events = []
+    hls = _SuccessfulHls()
+    result = asyncio.run(
+        PlaywrightDownloadGateway(None, hls)._download_lesson(
+            _Browser(_DelayedPlaylistPage(missing=True, unloaded=unloaded)),
+            _item(),
+            tmp_path / "Lesson",
+            "auto",
+            events.append,
+        )
+    )
+
+    assert result.status.value == "failed"
+    assert hls.calls == 0
+    assert events[-1].error_code == "PLAYER_STREAMS_INCOMPLETE"
 
 
 def test_no_video_event_explains_that_supported_player_is_missing(monkeypatch, tmp_path):

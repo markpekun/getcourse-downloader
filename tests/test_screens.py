@@ -169,8 +169,11 @@ def test_build_failed_lessons_scrollable():
     container = cs._build_failed_lessons([f"✗ Урок {i}" for i in range(1, 12)])
     assert isinstance(container, ft.Container)
     inner = container.content
-    assert isinstance(inner, ft.Column)
-    assert inner.scroll == ft.ScrollMode.AUTO
+    assert isinstance(inner, ft.ListView)
+    assert isinstance(inner.scroll, ft.Scrollbar)
+    assert inner.scroll.thumb_visibility
+    assert container.expand and inner.expand
+    assert container.height is None
     assert len(inner.controls) == 11
 
 

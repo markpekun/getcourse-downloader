@@ -40,7 +40,10 @@ def test_worker_event_sink_adds_per_lesson_and_run_report_paths(tmp_path):
         )
     )
 
-    events = [DownloadEvent.from_json(line) for line in events_path.read_text().splitlines()]
+    events = [
+        DownloadEvent.from_json(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert Path(events[0].diagnostic_report).is_file()
     assert Path(events[1].diagnostic_report).name == "last-run.json"
     assert Path(events[1].diagnostic_report).is_file()
@@ -80,7 +83,10 @@ def test_worker_preserves_profile_busy_error_code_in_events_and_report(tmp_path,
         == 1
     )
 
-    events = [DownloadEvent.from_json(line) for line in events_path.read_text().splitlines()]
+    events = [
+        DownloadEvent.from_json(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+    ]
     errors = [
         event
         for event in events

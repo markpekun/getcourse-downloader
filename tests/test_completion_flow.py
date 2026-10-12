@@ -191,9 +191,54 @@ def test_failed_lesson_diagnostic_returns_to_same_result(tmp_path):
     report.write_text('{"error_code":"HTTP_403"}', encoding="utf-8")
     screen._diagnostic_reports_by_title["Урок"] = report
     screen._show_completion_overlay("Ошибки: 1", is_warning=True, failed=["✗ Урок"])
+    _action(screen, "completion-details").on_click(None)
     original = screen._overlay_card.content
+    details_content = _content(screen)
     row = next(c for c in _walk(original) if isinstance(c, ft.Container) and c.on_click)
     row.on_click(None)
+    assert not any(c.key == "completion-next" for c in _walk(screen._overlay_card.content))
     screen._close_diagnostic_report()
     assert screen._overlay_card.content is original
+    assert _content(screen) is details_content
     assert screen.overlay.visible
+    _action(screen, "completion-result-back").on_click(None)
+    assert "Ошибки: 1" in _texts(screen)
+    assert any(c.key == "completion-next" for c in _walk(screen._overlay_card.content))
+
+
+def test_many_failures_live_in_separate_scroll_area_without_moving_summary():
+    screen, _ = _screen()
+    failures = [f"✗ Lesson {index}" for index in range(85)]
+    screen._show_completion_overlay("Ошибки: 85", is_warning=True, failed=failures)
+    original = _content(screen)
+    assert not any(getattr(c, "scroll", None) for c in _walk(original))
+    assert "Lesson 0" not in _texts(screen)
+    _action(screen, "completion-details").on_click(None)
+    assert "Ошибки: 85" not in _texts(screen)
+    assert "Lesson 0" in _texts(screen) and "Lesson 84" in _texts(screen)
+    assert len([c for c in _walk(_content(screen)) if getattr(c, "scroll", None)]) == 1
+    _action(screen, "completion-result-back").on_click(None)
+    assert _content(screen) is original
+
+
+def test_no_video_reports_are_available_even_without_failed_titles(tmp_path):
+    screen, _ = _screen()
+    report = tmp_path / "report.json"
+    report.write_text('{"error_code":"VIDEO_NOT_FOUND"}', encoding="utf-8")
+    screen._diagnostic_reports_by_title["Lesson without video"] = report
+    screen._show_completion_overlay("Без видео: 1", is_warning=True)
+    _action(screen, "completion-details").on_click(None)
+    assert "Lesson without video" in _texts(screen)
+
+
+def test_late_completion_close_cannot_hide_active_download():
+    screen, _ = _screen()
+    screen._show_completion_overlay("Скачано: 1")
+    _action(screen, "completion-next").on_click(None)
+    late_close = _action(screen, "completion-close").on_click
+    screen._completion_flow = None
+    screen.state.downloading = True
+    screen._overlay_card.content = ft.Text("Загрузка видео")
+    late_close(None)
+    assert screen.overlay.visible
+    assert screen.state.downloading
