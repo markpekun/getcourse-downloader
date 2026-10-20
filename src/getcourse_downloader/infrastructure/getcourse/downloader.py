@@ -22,6 +22,7 @@ from getcourse_downloader.domain.models import DownloadRequest, DownloadSummary,
 from getcourse_downloader.infrastructure.browser.playwright import PlaywrightBrowserFactory
 from getcourse_downloader.infrastructure.getcourse.authentication import is_authentication_url
 from getcourse_downloader.infrastructure.getcourse.lesson_access import lesson_access_denied
+from getcourse_downloader.infrastructure.getcourse.player_config import GetCoursePlayerResolver
 from getcourse_downloader.infrastructure.getcourse.video_signals import (
     VIDEO_PLAYER_SELECTOR,
     extract_hls_urls,
@@ -46,7 +47,7 @@ from getcourse_downloader.infrastructure.storage.download_catalog import (
     JsonDownloadCatalog,
 )
 from getcourse_downloader.infrastructure.storage.filenames import (
-    collision_safe_component,
+    allocate_component_names,
     collision_safe_stem,
     existing_output_path,
     safe_lesson_output_stem,
@@ -198,38 +199,35 @@ class PlaywrightDownloadGateway:
             )
             for item in request.lessons
         ]
-        folder_groups: dict[tuple[int, tuple[str, ...], str], list[int]] = {}
-        for index, (item, stem) in enumerate(zip(request.lessons, stems, strict=True)):
-            safe_parts = stem.relative_to(request.save_path).parts
-            for depth, _raw_component in enumerate(item.course_path):
-                key = (
-                    depth,
-                    tuple(part.casefold() for part in safe_parts[:depth]),
-                    safe_parts[depth].casefold(),
+        parts = [list(stem.relative_to(request.save_path).parts) for stem in stems]
+        max_depth = max((len(item.course_path) for item in request.lessons), default=0)
+        for depth in range(max_depth):
+            folders: dict[tuple[str, ...], list[int]] = {}
+            for index, item in enumerate(request.lessons):
+                if depth < len(item.course_path):
+                    parent = tuple(part.casefold() for part in parts[index][:depth])
+                    folders.setdefault(parent, []).append(index)
+            for indexes in folders.values():
+                identities = {
+                    index: "\x1f".join(request.lessons[index].course_path[: depth + 1])
+                    for index in indexes
+                }
+                names = allocate_component_names(
+                    (identities[index], parts[index][depth]) for index in indexes
                 )
-                folder_groups.setdefault(key, []).append(index)
-        for (depth, _, _), indexes in folder_groups.items():
-            if len({request.lessons[index].course_path[depth] for index in indexes}) < 2:
-                continue
+                for index in indexes:
+                    parts[index][depth] = names[identities[index]]
+        lessons: dict[tuple[str, ...], list[int]] = {}
+        for index, components in enumerate(parts):
+            parent = tuple(part.casefold() for part in components[:-1])
+            lessons.setdefault(parent, []).append(index)
+        for indexes in lessons.values():
+            names = allocate_component_names(
+                (request.lessons[index].lesson.url, parts[index][-1]) for index in indexes
+            )
             for index in indexes:
-                parts = list(stems[index].relative_to(request.save_path).parts)
-                parts[depth] = collision_safe_component(
-                    parts[depth],
-                    "\x1f".join(request.lessons[index].course_path[: depth + 1]),
-                )
-                stems[index] = request.save_path.joinpath(*parts)
-        collisions: dict[str, list[int]] = {}
-        for index, stem in enumerate(stems):
-            collisions.setdefault(str(stem.resolve()).casefold(), []).append(index)
-        for indexes in collisions.values():
-            if len(indexes) < 2:
-                continue
-            for index in indexes:
-                stems[index] = collision_safe_stem(
-                    stems[index],
-                    request.lessons[index].lesson.url,
-                )
-        return stems
+                parts[index][-1] = names[request.lessons[index].lesson.url]
+        return [request.save_path.joinpath(*components) for components in parts]
 
     async def _run_async(self, request: DownloadRequest, emit: EventHandler) -> DownloadSummary:
         downloaded = 0
@@ -239,12 +237,46 @@ class PlaywrightDownloadGateway:
         cancelled = 0
         output_stems = self._output_stems(request)
         if self._catalog:
-            output_stems = [
-                collision_safe_stem(stem, item.lesson.url)
-                if self._catalog.has_stem_conflict(item.lesson.url, stem)
-                else stem
+            bases = [
+                stem.with_name(
+                    safe_lesson_output_stem(
+                        request.save_path, item.course_path, item.lesson.title
+                    ).name
+                )
                 for item, stem in zip(request.lessons, output_stems, strict=True)
             ]
+            owned = [
+                self._catalog.owned_stem(item.lesson.url, base)
+                for item, base in zip(request.lessons, bases, strict=True)
+            ]
+            reserved = {
+                str((owner or stem).resolve()).casefold()
+                for owner, stem in zip(owned, output_stems, strict=True)
+            }
+            claimed = {str(stem.resolve()).casefold() for stem in owned if stem is not None}
+            for index in sorted(
+                range(len(request.lessons)), key=lambda i: request.lessons[i].lesson.url
+            ):
+                owner = owned[index]
+                if owner is not None:
+                    output_stems[index] = owner
+                    continue
+                item = request.lessons[index]
+                base = bases[index]
+                stem = output_stems[index]
+                number = 2
+                while (
+                    self._catalog.has_stem_conflict(item.lesson.url, stem)
+                    or str(stem.resolve()).casefold() in claimed
+                ):
+                    while True:
+                        stem = collision_safe_stem(base, number)
+                        number += 1
+                        if str(stem.resolve()).casefold() not in reserved:
+                            break
+                output_stems[index] = stem
+                reserved.add(str(stem.resolve()).casefold())
+                claimed.add(str(stem.resolve()).casefold())
 
         async with async_playwright() as playwright:
             pending: list[int] = []
@@ -505,7 +537,32 @@ class PlaywrightDownloadGateway:
         observed_manifests: list[_ManifestObservation] = []
         observed_manifest_keys: set[tuple[str, str, int | None]] = set()
         response_tasks: set[asyncio.Task[None]] = set()
+        configured_master_urls: dict[int, str] = {}
         last_playlist_at = 0.0
+        configured_players = GetCoursePlayerResolver(
+            self._cancelled.is_set,
+            lambda: emit(
+                self._event(
+                    item,
+                    DownloadEventType.LOG,
+                    "Подготовка персонального видео на стороне GetCourse",
+                    stage="playlist",
+                )
+            ),
+        )
+
+        def collect_configured_playlists() -> None:
+            nonlocal last_playlist_at
+            for master in configured_players.collect():
+                configured_master_urls[master.frame_ids[0]] = master.url
+                previous = playlists.get(master.url)
+                frame_ids = master.frame_ids
+                if previous is not None:
+                    frame_ids = tuple(set(previous.frame_ids + frame_ids))
+                playlists[master.url] = _Playlist(
+                    master.url, master.text, master.referer_url, frame_ids=frame_ids
+                )
+                last_playlist_at = time.monotonic()
 
         async def on_response(response) -> None:
             nonlocal last_playlist_at
@@ -582,31 +639,68 @@ class PlaywrightDownloadGateway:
                 return _LessonResult(_LessonStatus.FAILED)
 
             player_present = await self._has_supported_player(page)
+            configured_players.scan(getattr(page, "frames", ()))
             embedded = await self._read_embedded_playlists(page)
             for playlist in embedded:
                 playlists.setdefault(playlist.url, playlist)
             if embedded:
                 last_playlist_at = time.monotonic()
             started_at = time.monotonic()
-            while time.monotonic() - started_at < PLAYLIST_WAIT_SECONDS:
+            while (
+                time.monotonic() - started_at < PLAYLIST_WAIT_SECONDS or configured_players.pending
+            ):
                 if self._cancelled.is_set():
                     return _LessonResult(_LessonStatus.CANCELLED)
+                collect_configured_playlists()
                 if (
                     playlists
+                    and not configured_players.pending
                     and time.monotonic() - last_playlist_at >= PLAYLIST_QUIET_SECONDS
                     and not await self._missing_player_streams(page, playlists.values())
                 ):
                     break
+                if time.monotonic() - started_at < PLAYLIST_WAIT_SECONDS:
+                    configured_players.scan(getattr(page, "frames", ()))
                 await asyncio.sleep(0.25)
+
+            collect_configured_playlists()
 
             if response_tasks:
                 await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
+
+            if self._cancelled.is_set():
+                return _LessonResult(_LessonStatus.CANCELLED)
 
             if not playlists:
                 for playlist in await self._read_embedded_playlists(page):
                     playlists.setdefault(playlist.url, playlist)
 
             missing_players = await self._missing_player_streams(page, playlists.values())
+            observed_frames = {
+                frame_id for playlist in playlists.values() for frame_id in playlist.frame_ids
+            }
+            active_frames = {id(frame) for frame in getattr(page, "frames", ())}
+            player_failure = next(
+                (
+                    failure
+                    for failure in configured_players.failures
+                    if failure.frame_id in active_frames and failure.frame_id not in observed_frames
+                ),
+                None,
+            )
+            if player_failure is not None:
+                emit(
+                    self._event(
+                        item,
+                        DownloadEventType.ERROR,
+                        str(player_failure),
+                        stage="playlist",
+                        level="error",
+                        error_code=player_failure.code,
+                        source_host=player_failure.host,
+                    )
+                )
+                return _LessonResult(_LessonStatus.FAILED)
             if playlists and missing_players:
                 emit(
                     self._event(
@@ -684,6 +778,17 @@ class PlaywrightDownloadGateway:
                     )
                     return _LessonResult(_LessonStatus.FAILED)
                 return _LessonResult(_LessonStatus.NO_VIDEO)
+
+            # A known sign-player owns one video. Its confirmed master replaces
+            # captured renditions/CDN alternatives from that same iframe only.
+            playlists = {
+                url: playlist
+                for url, playlist in playlists.items()
+                if not any(frame_id in configured_master_urls for frame_id in playlist.frame_ids)
+                or any(
+                    configured_master_urls.get(frame_id) == url for frame_id in playlist.frame_ids
+                )
+            }
 
             encrypted_master = next(
                 (
@@ -815,6 +920,7 @@ class PlaywrightDownloadGateway:
                 return _LessonResult(_LessonStatus.SKIPPED, media)
             return _LessonResult(_LessonStatus.DOWNLOADED, media)
         finally:
+            await configured_players.close()
             for task in response_tasks:
                 task.cancel()
             if response_tasks:

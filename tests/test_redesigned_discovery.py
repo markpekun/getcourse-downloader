@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from getcourse_downloader.domain.errors import ExternalServiceError
 from getcourse_downloader.infrastructure.getcourse import discovery
 from getcourse_downloader.infrastructure.getcourse.discovery import GetCourseDiscoverer
 from getcourse_downloader.infrastructure.getcourse.lesson_access import lesson_access_denied
+from getcourse_downloader.infrastructure.getcourse.player_config import GetCoursePlayerResolver
 from getcourse_downloader.infrastructure.getcourse.video_signals import VIDEO_PLAYER_SELECTOR
 
 pytestmark = pytest.mark.integration
@@ -264,5 +266,85 @@ def test_unfinished_redesigned_loading_reports_an_error_instead_of_zero_lessons(
         with pytest.raises(ExternalServiceError) as error:
             await discoverer._parse_page(context, page, MODULE_URL)
         assert error.value.code == "CONTENT_LOAD_TIMEOUT"
+
+    _run_in_firefox(check)
+
+
+def test_sign_player_fetches_master_after_preparation_without_clicks(monkeypatch):
+    from getcourse_downloader.infrastructure.getcourse import player_config
+
+    monkeypatch.setattr(player_config, "PLAYER_POLL_SECONDS", 0.01)
+
+    async def check(context: BrowserContext) -> None:
+        player_url = "https://video.example/sign-player/"
+        ready_url = "https://video.example/player/example/view/ready"
+        create_url = "https://video.example/player/example/view/create-personal-video"
+        master_url = "https://video.example/api/playlist/master/example/view"
+        reserve_url = "https://reserve.example/api/playlist/master/example/view"
+        requests = []
+        prepared = False
+
+        async def serve(route: Route) -> None:
+            nonlocal prepared
+            url = route.request.url
+            requests.append((route.request.method, url))
+            if url == ROOT_URL:
+                await route.fulfill(body=f'<iframe src="{player_url}"></iframe>')
+            elif url == player_url:
+                config = {
+                    "isVideoReady": True,
+                    "isProtectReady": False,
+                    "masterPlaylistUrl": master_url,
+                    "masterPlaylistDomains": [master_url, reserve_url],
+                    "checkPersonalVideoUrl": ready_url,
+                    "createPersonalVideoUrl": create_url,
+                }
+                await route.fulfill(
+                    body=(
+                        "<script>setTimeout(() => window.configs = "
+                        f"{json.dumps(config)}, 50)</script>"
+                    )
+                )
+            elif url == ready_url:
+                assert route.request.method == "POST"
+                await route.fulfill(json={"ready": prepared})
+            elif url == create_url:
+                assert route.request.method == "POST"
+                prepared = True
+                await route.fulfill(body="")
+            elif url == master_url:
+                await route.fulfill(status=503)
+            elif url == reserve_url:
+                assert prepared and route.request.method == "GET"
+                await route.fulfill(
+                    content_type="text/plain",
+                    body="#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=1280x720\n720.m3u8\n",
+                )
+            else:
+                await route.abort()
+
+        await context.route("**/*", serve)
+        page = await context.new_page()
+        await page.goto(ROOT_URL, wait_until="load")
+        resolver = GetCoursePlayerResolver(lambda: False, lambda: None)
+        try:
+            masters = []
+            async with asyncio.timeout(5):
+                while not masters:
+                    resolver.scan(page.frames)
+                    await asyncio.sleep(0.02)
+                    masters.extend(resolver.collect())
+                    assert not resolver.failures
+            assert len(masters) == 1
+            assert masters[0].url == reserve_url
+            assert masters[0].referer_url == player_url
+            assert masters[0].frame_ids[0] == id(page.frames[1])
+            assert requests.count(("POST", create_url)) == 1
+            assert requests.count(("POST", ready_url)) == 2
+            assert requests.count(("GET", master_url)) == 1
+            assert requests.count(("GET", reserve_url)) == 1
+            assert await page.frames[1].evaluate("window.configs.isProtectReady") is False
+        finally:
+            await resolver.close()
 
     _run_in_firefox(check)

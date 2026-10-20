@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from getcourse_downloader.infrastructure.storage.filenames import collision_safe_component
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +97,36 @@ class JsonDownloadCatalog:
             ):
                 return True
         return False
+
+    def owned_stem(self, lesson_url: str, base: Path) -> Path | None:
+        """Reuse this lesson's plain/numbered name in the same output directory."""
+
+        records = self._load()["records"]
+        assert isinstance(records, dict)
+        parent = str(base.parent.resolve()).casefold()
+        matches: list[tuple[int, Path]] = []
+        for record in records.values():
+            if not isinstance(record, dict) or record.get("lesson_url") != lesson_url:
+                continue
+            raw_stem = record.get("output_stem")
+            if not isinstance(raw_stem, str):
+                continue
+            stem = Path(raw_stem)
+            if str(stem.parent.resolve()).casefold() != parent:
+                continue
+            if stem.name.casefold() == base.name.casefold():
+                matches.append((1, stem))
+                continue
+            suffix = re.search(r" \(([0-9]{1,9})\)$", stem.name)
+            if suffix:
+                number = int(suffix[1])
+                if (
+                    number >= 2
+                    and stem.name.casefold()
+                    == collision_safe_component(base.name, number).casefold()
+                ):
+                    matches.append((number, stem))
+        return min(matches, key=lambda item: (item[0], str(item[1])))[1] if matches else None
 
     def save(
         self,

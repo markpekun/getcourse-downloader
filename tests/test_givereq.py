@@ -27,6 +27,14 @@ def test_sanitize_filename_replaces_illegal_chars():
     assert sanitize_filename('a/b\\c:d*e?f"g<h>i|') == "a_b_c_d_e_f_g_h_i_"
 
 
+def test_long_names_are_truncated_to_readable_prefix_without_hash():
+    assert (
+        sanitize_filename("Длинное название учебного модуля", max_length=16) == "Длинное название"
+    )
+    assert sanitize_filename("CON " + "." * 20 + "tail", max_length=12) == "_CON"
+    assert sanitize_filename("." * 20 + "tail", fallback="course", max_length=12) == "course"
+
+
 def test_quality_suffix_uses_actual_height_without_hash(tmp_path):
     path = quality_suffixed_path(tmp_path / "Лекция №1 Жена Мечты", "720p")
 

@@ -8,6 +8,7 @@ import pytest
 from getcourse_downloader.domain.events import DownloadEventType
 from getcourse_downloader.domain.models import DownloadRequest, Lesson, SelectedLesson, VideoQuality
 from getcourse_downloader.infrastructure.getcourse import downloader as downloader_module
+from getcourse_downloader.infrastructure.getcourse import player_config as player_config_module
 from getcourse_downloader.infrastructure.getcourse.downloader import (
     PlaywrightDownloadGateway,
     _Playlist,
@@ -327,6 +328,170 @@ class _DelayedPlaylistPage(_Page):
         if self.delayed:
             self.delayed.cancel()
             await asyncio.gather(self.delayed, return_exceptions=True)
+
+
+class _ConfiguredPlayerFrame(_PlayerFrame):
+    def __init__(self, number, *, ready=False, protected=True):
+        super().__init__(number)
+        self.ready = ready
+        self.created = 0
+        self.requests = []
+        self.config = {
+            "isVideoReady": True,
+            "isProtectReady": ready and (number == 1 or not protected),
+            "isVideoProtect": protected,
+            "masterPlaylistUrl": f"https://video.example/api/playlist/master/video-{number}/view",
+            "masterPlaylistDomains": [],
+            "createPersonalVideoUrl": f"https://video.example/player/video-{number}/view/create-personal-video",
+            "checkPersonalVideoUrl": f"https://video.example/player/video-{number}/view/ready",
+        }
+
+    async def evaluate(self, _script, request=None):
+        if request is None:
+            return self.config
+        url, method = request["url"], request["method"]
+        self.requests.append((method, url))
+        if url.endswith("/create-personal-video"):
+            self.created += 1
+            self.ready = True
+            return {"status": 200, "url": url, "text": ""}
+        if url.endswith("/ready"):
+            return {"status": 200, "url": url, "text": json.dumps({"ready": self.ready})}
+        return {
+            "status": 200,
+            "url": url,
+            "text": (
+                "#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=640x360\n360.m3u8\n"
+                "#EXT-X-STREAM-INF:RESOLUTION=1280x720\n720.m3u8\n"
+            ),
+        }
+
+
+def test_configured_players_prepare_once_and_use_existing_master_quality_selection(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(downloader_module, "PLAYLIST_QUIET_SECONDS", 0.0)
+    page = _DelayedPlaylistPage(missing=True)
+    page.frames = [
+        _ConfiguredPlayerFrame(1, ready=True),
+        _ConfiguredPlayerFrame(2, ready=True),  # Initial config is stale after prior preparation.
+        _ConfiguredPlayerFrame(3),
+        _ConfiguredPlayerFrame(4, ready=True, protected=False),
+    ]
+
+    async def goto(url, **_):
+        page.url = url
+        # A browser may have already requested another CDN for the same player.
+        response = SimpleNamespace(
+            url="https://alternate.example/api/playlist/master/video-1/view",
+            request=SimpleNamespace(frame=page.frames[0]),
+        )
+
+        async def text():
+            return "#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=1280x720\n720.m3u8\n"
+
+        response.text = text
+        for handler in page._handlers:
+            handler(response)
+
+    page.goto = goto
+    hls = _RecordingHls()
+    events = []
+    result = asyncio.run(
+        PlaywrightDownloadGateway(None, hls)._download_lesson(
+            _Browser(page), _item(), tmp_path / "Lesson", "720", events.append
+        )
+    )
+
+    assert result.status.value == "downloaded"
+    assert len(result.media) == len(hls.calls) == 4
+    assert [frame.created for frame in page.frames] == [0, 0, 1, 0]
+    assert [len(frame.requests) for frame in page.frames] == [1, 2, 4, 1]
+    assert all(url.endswith("/720.m3u8") for url, _ in hls.calls)
+    assert all(kwargs["selected_height"] == 720 for _, kwargs in hls.calls)
+    assert {kwargs["referer_url"] for _, kwargs in hls.calls} == {
+        frame.url for frame in page.frames
+    }
+    assert not any(event.error_code for event in events)
+
+
+@pytest.mark.parametrize(
+    "failure,code",
+    [
+        ("http", "PLAYER_ACCESS_DENIED"),
+        ("json", "PLAYER_INVALID_RESPONSE"),
+        ("timeout", "PLAYER_PREPARATION_TIMEOUT"),
+        ("cancel", ""),
+    ],
+)
+def test_personal_video_failure_or_cancel_does_not_download_partial_lesson(
+    monkeypatch, tmp_path, failure, code
+):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(player_config_module, "PLAYER_PREPARATION_SECONDS", 0.05)
+    monkeypatch.setattr(player_config_module, "PLAYER_POLL_SECONDS", 0.01)
+    gateway = PlaywrightDownloadGateway(None, _Hls())
+
+    class FailingFrame(_ConfiguredPlayerFrame):
+        async def evaluate(self, script, request=None):
+            if request and request["url"].endswith("/ready"):
+                if failure == "cancel":
+                    gateway.cancel()
+                return {
+                    "status": 403 if failure == "http" else 200,
+                    "url": request["url"],
+                    "text": "private-response" if failure == "json" else '{"ready":false}',
+                }
+            return await super().evaluate(script, request)
+
+    page = _DelayedPlaylistPage(missing=True)
+    page.frames = [FailingFrame(3)]
+
+    async def goto(url, **_):
+        page.url = url
+
+    page.goto = goto
+    events = []
+    result = asyncio.run(
+        gateway._download_lesson(
+            _Browser(page), _item(), tmp_path / "Lesson", "auto", events.append
+        )
+    )
+    assert result.status.value == ("cancelled" if failure == "cancel" else "failed")
+    assert all("private-response" not in event.message for event in events)
+    if code:
+        assert events[-1].error_code == code
+
+
+def test_replaced_player_does_not_keep_failure_from_detached_frame(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 1.0)
+    monkeypatch.setattr(downloader_module, "PLAYLIST_QUIET_SECONDS", 0.0)
+    page = _DelayedPlaylistPage(missing=True)
+
+    class ReplacedFrame(_ConfiguredPlayerFrame):
+        async def evaluate(self, script, request=None):
+            if request and request["url"].endswith("/ready"):
+                page.frames = [_ConfiguredPlayerFrame(1, ready=True)]
+                return {"status": 403}
+            return await super().evaluate(script, request)
+
+    page.frames = [ReplacedFrame(1)]
+
+    async def goto(url, **_):
+        page.url = url
+
+    page.goto = goto
+    hls = _RecordingHls()
+    events = []
+    result = asyncio.run(
+        PlaywrightDownloadGateway(None, hls)._download_lesson(
+            _Browser(page), _item(), tmp_path / "Lesson", "auto", events.append
+        )
+    )
+    assert result.status.value == "downloaded"
+    assert len(hls.calls) == 1
+    assert not any(event.error_code for event in events)
 
 
 @pytest.mark.parametrize("unloaded", [False, True])
@@ -951,7 +1116,7 @@ def test_bandwidth_only_master_selects_best_and_suppresses_captured_variants():
     ]
 
 
-def test_output_stems_preserve_hierarchy_and_hash_only_real_collisions(tmp_path):
+def test_output_stems_preserve_hierarchy_and_number_only_real_collisions(tmp_path):
     lessons = (
         SelectedLesson(("Course", "Module"), Lesson("A:B", "https://school/lesson/1")),
         SelectedLesson(("Course", "Module"), Lesson("A?B", "https://school/lesson/2")),
@@ -961,8 +1126,8 @@ def test_output_stems_preserve_hierarchy_and_hash_only_real_collisions(tmp_path)
     stems = PlaywrightDownloadGateway._output_stems(request)
     assert stems[0].parent == tmp_path / "Course" / "Module"
     assert stems[1].parent == tmp_path / "Course" / "Module"
-    assert stems[0].name.startswith("A_B~")
-    assert stems[1].name.startswith("A_B~")
+    assert stems[0].name == "A_B"
+    assert stems[1].name == "A_B (2)"
     assert stems[0] != stems[1]
     assert stems[2].parent == tmp_path / "Course" / "Other"
     assert stems[2].name == "A_B"
@@ -1000,8 +1165,35 @@ def test_output_stems_disambiguate_sanitized_folder_collisions_stably(tmp_path):
     }
     assert by_url == reversed_by_url
     assert stems[0].parent != stems[1].parent
-    assert stems[0].parent.name.startswith("A_B~")
-    assert stems[1].parent.name.startswith("A_B~")
+    assert stems[0].parent.name == "A_B"
+    assert stems[1].parent.name == "A_B (2)"
+
+
+def test_truncated_folder_names_do_not_collide_with_literal_numbered_folder(tmp_path):
+    prefix = "Демонстрационный модуль " * 8
+    lessons = (
+        SelectedLesson((prefix + "А",), Lesson("Lesson", "https://school.example/lesson/1")),
+        SelectedLesson((prefix + "Б",), Lesson("Lesson", "https://school.example/lesson/2")),
+        SelectedLesson(("Module:X",), Lesson("Lesson", "https://school.example/lesson/3")),
+        SelectedLesson(("Module?X",), Lesson("Lesson", "https://school.example/lesson/4")),
+        SelectedLesson(("Module_X (2)",), Lesson("Lesson", "https://school.example/lesson/5")),
+    )
+    stems = PlaywrightDownloadGateway._output_stems(
+        DownloadRequest(lessons, VideoQuality.AUTO, tmp_path)
+    )
+    reversed_stems = PlaywrightDownloadGateway._output_stems(
+        DownloadRequest(tuple(reversed(lessons)), VideoQuality.AUTO, tmp_path)
+    )
+    assert stems == list(reversed(reversed_stems))
+    assert len({stem.parent for stem in stems}) == 5
+    assert all("~" not in str(stem.relative_to(tmp_path)) for stem in stems)
+    assert all(len(str(stem.resolve())) <= 200 for stem in stems)
+    assert stems[1].parent.name.endswith(" (2)")
+    assert {stem.parent.name for stem in stems[2:]} == {"Module_X", "Module_X (2)", "Module_X (3)"}
+    for stem in stems:
+        stem.parent.mkdir(parents=True, exist_ok=True)
+        stem.with_name(f"{stem.name}_720.mp4").write_bytes(b"synthetic")
+    assert len(list(tmp_path.rglob("*.mp4"))) == 5
 
 
 def test_existing_output_is_detected_before_opening_lesson(tmp_path):
@@ -1058,6 +1250,52 @@ def test_same_explicit_quality_is_skipped_from_catalog(tmp_path):
 
     assert result.status.value == "skipped"
     assert result.media == (DownloadedMedia(video, "480p"),)
+
+
+def test_numbered_name_reuses_its_catalog_record_after_separate_downloads(monkeypatch, tmp_path):
+    class PlaywrightContext:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *_):
+            return None
+
+    monkeypatch.setattr(downloader_module, "async_playwright", PlaywrightContext)
+    catalog = JsonDownloadCatalog(tmp_path / "downloads.json")
+    recorded_names = {2: "Lesson", 1: "Lesson (2)", 3: "Lesson (3)"}
+    for number, name in recorded_names.items():
+        stem = tmp_path / "Course" / name
+        stem.parent.mkdir(exist_ok=True)
+        video = stem.with_name(f"{name}_720.mp4")
+        video.write_bytes(b"synthetic")
+        catalog.save(
+            f"https://school.example/lesson/{number}", stem, (DownloadedMedia(video, "720p"),)
+        )
+    gateway = PlaywrightDownloadGateway(None, _Hls(), catalog)
+    original = gateway._existing_result
+    checked = []
+
+    async def existing(item, stem, quality):
+        checked.append(stem)
+        return await original(item, stem, quality)
+
+    monkeypatch.setattr(gateway, "_existing_result", existing)
+    items = {
+        number: SelectedLesson(
+            ("Course",), Lesson("Lesson", f"https://school.example/lesson/{number}")
+        )
+        for number in recorded_names
+    }
+    for numbers in ((3,), (3,), (1, 2), (2, 1)):
+        checked.clear()
+        summary = asyncio.run(
+            gateway._run_async(
+                DownloadRequest(tuple(items[n] for n in numbers), VideoQuality.P720, tmp_path),
+                lambda _: None,
+            )
+        )
+        assert summary.already_present == len(numbers)
+        assert checked == [tmp_path / "Course" / recorded_names[number] for number in numbers]
 
 
 def test_requested_version_on_disk_is_found_when_catalog_describes_another_quality(tmp_path):

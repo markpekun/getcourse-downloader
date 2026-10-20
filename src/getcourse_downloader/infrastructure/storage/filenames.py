@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import re
+from collections.abc import Iterable
 from pathlib import Path
 
 _WINDOWS_RESERVED = {
@@ -19,9 +19,7 @@ def _shorten_component(value: str, max_length: int) -> str:
         return value
     if max_length < 12:
         raise ValueError("max_length must be at least 12")
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
-    prefix = value[: max_length - len(digest) - 1].rstrip(". ")
-    return f"{prefix}~{digest}"
+    return value[:max_length].rstrip(". ")
 
 
 def sanitize_filename(
@@ -42,7 +40,10 @@ def sanitize_filename(
         clean = fallback
     if clean.split(".", maxsplit=1)[0].upper() in _WINDOWS_RESERVED:
         clean = f"_{clean}"
-    return _shorten_component(clean, max_length)
+    clean = _shorten_component(clean, max_length) or _shorten_component(fallback, max_length)
+    if clean.split(".", maxsplit=1)[0].upper() in _WINDOWS_RESERVED:
+        clean = f"_{clean}"
+    return clean
 
 
 def safe_lesson_output_stem(
@@ -76,19 +77,47 @@ def safe_lesson_output_stem(
     return save_root.joinpath(*safe_parts)
 
 
-def collision_safe_stem(stem: Path, lesson_url: str) -> Path:
-    """Add a stable suffix when two selected lessons sanitize to the same path."""
+def collision_safe_stem(stem: Path, number: int) -> Path:
+    """Add a readable number without exceeding the component's length budget."""
 
-    return stem.with_name(collision_safe_component(stem.name, lesson_url))
+    return stem.with_name(collision_safe_component(stem.name, number))
 
 
-def collision_safe_component(value: str, stable_identity: str) -> str:
+def collision_safe_component(value: str, number: int) -> str:
     """Disambiguate a path component without exceeding its allocated length."""
 
-    digest = hashlib.sha256(stable_identity.encode("utf-8")).hexdigest()[:8]
+    if number < 2:
+        raise ValueError("collision number must be at least 2")
+    suffix = f" ({number})"
     target_length = max(12, len(value))
-    prefix = value[: target_length - len(digest) - 1].rstrip(". ") or "item"
-    return f"{prefix}~{digest}"
+    prefix = value[: target_length - len(suffix)].rstrip(". ") or "item"
+    return f"{prefix}{suffix}"
+
+
+def allocate_component_names(components: Iterable[tuple[str, str]]) -> dict[str, str]:
+    """Assign sibling names by stable identity, reserving literal names like 'Module (2)'."""
+
+    proposed: dict[str, str] = {}
+    for identity, name in components:
+        previous = proposed.get(identity)
+        if previous is None or (len(name), name) < (len(previous), previous):
+            proposed[identity] = name
+    reserved = {name.casefold() for name in proposed.values()}
+    used: set[str] = set()
+    allocated: dict[str, str] = {}
+    for identity in sorted(proposed):
+        base = proposed[identity]
+        name = base
+        if name.casefold() in used:
+            number = 2
+            while True:
+                name = collision_safe_component(base, number)
+                if name.casefold() not in used and name.casefold() not in reserved:
+                    break
+                number += 1
+        used.add(name.casefold())
+        allocated[identity] = name
+    return allocated
 
 
 def quality_suffixed_path(stem: Path, quality: str) -> Path:
