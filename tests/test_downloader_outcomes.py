@@ -153,7 +153,8 @@ class _KinescopeFrame:
             r'?expires=123\u0026sign=master"</script>'
         )
 
-    async def evaluate(self, _script, playlist_url):
+    async def evaluate(self, _script, request):
+        playlist_url = request["url"]
         assert playlist_url == ("https://kinescope.io/video-id/master.m3u8?expires=123&sign=master")
         return {
             "url": playlist_url,
@@ -171,6 +172,24 @@ class _KinescopePage(_Page):
     def __init__(self) -> None:
         super().__init__(player=True)
         self.frames = [_KinescopeFrame()]
+
+
+def test_embedded_playlist_request_has_a_deadline(monkeypatch):
+    monkeypatch.setattr(downloader_module, "EMBEDDED_PLAYLIST_REQUEST_SECONDS", 0.01)
+
+    class UnresponsiveFrame(_KinescopeFrame):
+        async def evaluate(self, *_):
+            await asyncio.Event().wait()
+
+    page = _KinescopePage()
+    page.frames = [UnresponsiveFrame()]
+
+    async def scenario():
+        return await asyncio.wait_for(
+            PlaywrightDownloadGateway._read_embedded_playlists(page), timeout=1.5
+        )
+
+    assert asyncio.run(scenario()) == []
 
 
 class _LateKinescopePage(_Page):
@@ -365,6 +384,109 @@ class _ConfiguredPlayerFrame(_PlayerFrame):
                 "#EXT-X-STREAM-INF:RESOLUTION=1280x720\n720.m3u8\n"
             ),
         }
+
+
+@pytest.mark.parametrize("phase", ["navigation", "embedded", "personal", "cleanup"])
+def test_video_check_deadline_fails_lesson_and_releases_pending_work(monkeypatch, tmp_path, phase):
+    monkeypatch.setattr(downloader_module, "VIDEO_CHECK_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(downloader_module, "PAGE_CLEANUP_TIMEOUT_SECONDS", 0.05)
+    entered = []
+    cancelled = []
+    reported_before_cleanup = []
+
+    async def hang():
+        entered.append(phase)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(phase)
+
+    class HangingFrame(_ConfiguredPlayerFrame):
+        async def content(self):
+            if phase == "embedded":
+                await hang()
+            return ""
+
+        async def evaluate(self, script, request=None):
+            if phase == "personal" and request:
+                await hang()
+            return await super().evaluate(script, request)
+
+    class HangingPage(_Page):
+        closed = False
+
+        async def goto(self, url, **kwargs):
+            if phase in {"navigation", "cleanup"}:
+                await hang()
+            await super().goto(url, **kwargs)
+
+        async def close(self):
+            try:
+                if phase == "cleanup":
+                    reported_before_cleanup.append(
+                        any(event.error_code == "VIDEO_CHECK_TIMEOUT" for event in events)
+                    )
+                    await asyncio.Event().wait()
+            finally:
+                self.closed = True
+
+    page = HangingPage(player=True)
+    page.frames = [HangingFrame(1)] if phase != "navigation" else []
+    gateway = PlaywrightDownloadGateway(None, _Hls())
+    events = []
+
+    async def scenario():
+        result = await asyncio.wait_for(
+            gateway._download_lesson(
+                _Browser(page), _item(), tmp_path / "Lesson", "auto", events.append
+            ),
+            timeout=1.0,
+        )
+        monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+        following = await gateway._download_lesson(
+            _Browser(_Page(player=False)), _item(), tmp_path / "Next", "auto", events.append
+        )
+        return result, following
+
+    result, following = asyncio.run(scenario())
+
+    assert result.status.value == "failed"
+    assert following.status.value == "no_video"
+    assert entered == cancelled == [phase]
+    assert page.closed
+    errors = [event for event in events if event.type is DownloadEventType.ERROR]
+    assert len(errors) == 1
+    assert errors[0].error_code == "VIDEO_CHECK_TIMEOUT"
+    assert errors[0].lesson_url == _item().lesson.url
+    assert errors[0].stage == "playlist"
+    if phase == "cleanup":
+        assert reported_before_cleanup == [True]
+
+
+def test_video_check_deadline_does_not_limit_media_download(monkeypatch, tmp_path):
+    monkeypatch.setattr(downloader_module, "VIDEO_CHECK_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+
+    class SlowHls(_SuccessfulHls):
+        async def download(self, *args, **kwargs):
+            await asyncio.sleep(0.3)
+            return await super().download(*args, **kwargs)
+
+    hls = SlowHls()
+    page = _Page(
+        player=True,
+        playlist=("https://cdn.example/video.m3u8", "#EXTM3U\n#EXTINF:5,\nsegment.ts\n"),
+    )
+    events = []
+    result = asyncio.run(
+        PlaywrightDownloadGateway(None, hls)._download_lesson(
+            _Browser(page), _item(), tmp_path / "Lesson", "auto", events.append
+        )
+    )
+
+    assert result.status.value == "downloaded"
+    assert hls.calls == 1
+    assert not any(event.type is DownloadEventType.ERROR for event in events)
 
 
 def test_configured_players_prepare_once_and_use_existing_master_quality_selection(
@@ -638,7 +760,7 @@ def test_getcourse_media_playlist_response_is_downloaded(monkeypatch, tmp_path):
     page = _Page(
         player=True,
         playlist=(
-            "https://school.example/api/playlist/media/342118993/360?token=secret",
+            "https://school.example/api/playlist/media/1001/360?token=secret",
             "#EXTM3U\n#EXTINF:5,\nsegment.ts\n",
         ),
     )

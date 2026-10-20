@@ -51,6 +51,10 @@ class AppPaths:
     def worker_log_file(self) -> Path:
         return self.data / "worker.log"
 
+    @property
+    def ui_lifecycle_log_file(self) -> Path:
+        return self.data / "ui-lifecycle.log"
+
     def ensure_runtime_directories(self) -> None:
         self.data.mkdir(parents=True, exist_ok=True)
         self.session.mkdir(parents=True, exist_ok=True)

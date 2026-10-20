@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from getcourse_downloader.domain.errors import ExternalServiceError
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.domain.models import DownloadRequest, Lesson, SelectedLesson, VideoQuality
@@ -11,7 +13,8 @@ from getcourse_downloader.presentation.cli import worker
 from getcourse_downloader.presentation.cli.worker import DiagnosticEventSink, JsonLineEventSink
 
 
-def test_worker_event_sink_adds_per_lesson_and_run_report_paths(tmp_path):
+@pytest.mark.parametrize("code", ["HTTP_403", "VIDEO_CHECK_TIMEOUT"])
+def test_worker_event_sink_adds_per_lesson_and_run_report_paths(tmp_path, code):
     events_path = tmp_path / "events.jsonl"
     sink = DiagnosticEventSink(
         JsonLineEventSink(events_path),
@@ -25,7 +28,7 @@ def test_worker_event_sink_adds_per_lesson_and_run_report_paths(tmp_path):
             stage="segments",
             lesson="Урок",
             lesson_url="https://school.example/lesson?token=secret",
-            error_code="HTTP_403",
+            error_code=code,
             source_host="cdn.example",
             level="error",
         )
@@ -47,7 +50,9 @@ def test_worker_event_sink_adds_per_lesson_and_run_report_paths(tmp_path):
     assert Path(events[0].diagnostic_report).is_file()
     assert Path(events[1].diagnostic_report).name == "last-run.json"
     assert Path(events[1].diagnostic_report).is_file()
-    assert "secret" not in Path(events[0].diagnostic_report).read_text(encoding="utf-8")
+    report_text = Path(events[0].diagnostic_report).read_text(encoding="utf-8")
+    assert "secret" not in report_text
+    assert code in report_text
 
 
 def test_worker_preserves_profile_busy_error_code_in_events_and_report(tmp_path, monkeypatch):

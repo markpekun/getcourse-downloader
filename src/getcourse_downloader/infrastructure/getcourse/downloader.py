@@ -53,8 +53,11 @@ from getcourse_downloader.infrastructure.storage.filenames import (
     safe_lesson_output_stem,
 )
 
+VIDEO_CHECK_TIMEOUT_SECONDS = 60.0
+PAGE_CLEANUP_TIMEOUT_SECONDS = 5.0
 PLAYLIST_WAIT_SECONDS = 30.0
 PLAYLIST_QUIET_SECONDS = 1.0
+EMBEDDED_PLAYLIST_REQUEST_SECONDS = 15.0
 
 
 class _AuthenticationExpired(RuntimeError):
@@ -532,6 +535,44 @@ class PlaywrightDownloadGateway:
         if existing is not None:
             return existing
 
+        check_timeout = asyncio.timeout(VIDEO_CHECK_TIMEOUT_SECONDS)
+        try:
+            async with check_timeout:
+                return await self._download_lesson_in_page(
+                    browser, item, output_stem, quality, emit, check_timeout
+                )
+        except TimeoutError:
+            if not check_timeout.expired():
+                raise
+            return self._video_check_timeout_result(item, emit)
+
+    def _video_check_timeout_result(
+        self, item: SelectedLesson, emit: EventHandler
+    ) -> _LessonResult:
+        if self._cancelled.is_set():
+            return _LessonResult(_LessonStatus.CANCELLED)
+        emit(
+            self._event(
+                item,
+                DownloadEventType.ERROR,
+                f"Проверка видео превысила {VIDEO_CHECK_TIMEOUT_SECONDS:g} секунд. "
+                "Не удалось получить видео за отведённое время. Повторите загрузку урока.",
+                stage="playlist",
+                level="error",
+                error_code="VIDEO_CHECK_TIMEOUT",
+            )
+        )
+        return _LessonResult(_LessonStatus.FAILED)
+
+    async def _download_lesson_in_page(
+        self,
+        browser,
+        item: SelectedLesson,
+        output_stem: Path,
+        quality: str,
+        emit: EventHandler,
+        check_timeout: asyncio.Timeout,
+    ) -> _LessonResult:
         page = await browser.new_page()
         playlists: dict[str, _Playlist] = {}
         observed_manifests: list[_ManifestObservation] = []
@@ -827,6 +868,8 @@ class PlaywrightDownloadGateway:
                 )
                 return _LessonResult(_LessonStatus.FAILED)
 
+            # The deadline covers discovery and player preparation, not media transfer or muxing.
+            check_timeout.reschedule(None)
             download_results = []
             for video_index, playlist in enumerate(selected, start=1):
                 output = output_stem if len(selected) == 1 else output_stem / f"video_{video_index}"
@@ -919,14 +962,20 @@ class PlaywrightDownloadGateway:
             if all(status is HlsDownloadStatus.ALREADY_PRESENT for status in statuses):
                 return _LessonResult(_LessonStatus.SKIPPED, media)
             return _LessonResult(_LessonStatus.DOWNLOADED, media)
+        except asyncio.CancelledError:
+            if not check_timeout.expired():
+                raise
+            # Publish the error before cleanup, which may itself need to time out.
+            return self._video_check_timeout_result(item, emit)
         finally:
-            await configured_players.close()
             for task in response_tasks:
                 task.cancel()
-            if response_tasks:
-                await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
-            with contextlib.suppress(PlaywrightError):
-                await page.close()
+            with contextlib.suppress(TimeoutError, PlaywrightError):
+                async with asyncio.timeout(PAGE_CLEANUP_TIMEOUT_SECONDS):
+                    await configured_players.close()
+                    if response_tasks:
+                        await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
+                    await page.close()
 
     @staticmethod
     def _select_playlist_urls(playlists: Iterable[_Playlist], quality: str) -> list[str]:
@@ -1005,7 +1054,9 @@ class PlaywrightDownloadGateway:
         for frame in frames:
             try:
                 frame_url = frame.url or page.url
-                content = await frame.content()
+                content = await asyncio.wait_for(
+                    frame.content(), timeout=EMBEDDED_PLAYLIST_REQUEST_SECONDS
+                )
             except Exception:
                 continue
             for candidate in extract_hls_urls(content, frame_url):
@@ -1018,12 +1069,26 @@ class PlaywrightDownloadGateway:
                     )
                     continue
                 try:
-                    result = await frame.evaluate(
-                        """async (url) => {
-                            const response = await fetch(url, {credentials: "include"});
-                            return {url: response.url || url, text: await response.text()};
-                        }""",
-                        candidate,
+                    result = await asyncio.wait_for(
+                        frame.evaluate(
+                            """async ({url, timeoutMs}) => {
+                                const controller = new AbortController();
+                                const timer = setTimeout(() => controller.abort(), timeoutMs);
+                                try {
+                                    const response = await fetch(url, {
+                                        credentials: "include", signal: controller.signal
+                                    });
+                                    return {url: response.url || url, text: await response.text()};
+                                } finally {
+                                    clearTimeout(timer);
+                                }
+                            }""",
+                            {
+                                "url": candidate,
+                                "timeoutMs": int(EMBEDDED_PLAYLIST_REQUEST_SECONDS * 1000),
+                            },
+                        ),
+                        timeout=EMBEDDED_PLAYLIST_REQUEST_SECONDS + 1,
                     )
                 except Exception:
                     continue

@@ -6,6 +6,7 @@ import flet as ft
 import pytest
 
 from getcourse_downloader.domain.models import DownloadSummary
+from getcourse_downloader.presentation.flet.screens.courses import view as courses_view
 from getcourse_downloader.presentation.flet.screens.courses.state import CoursesViewState
 from getcourse_downloader.presentation.flet.screens.courses.view import CoursesScreen
 
@@ -107,21 +108,22 @@ def test_support_and_instruction_can_be_closed(instruction):
     assert not screen.overlay.visible
 
 
-def test_links_open_existing_addresses_without_changing_step():
+def test_links_open_existing_addresses_without_changing_step(monkeypatch):
+    contact_url = "https://contact.example/help"
+    project_url = "https://project.example/source"
+    monkeypatch.setattr(courses_view, "_CONTACT_URL", contact_url)
+    monkeypatch.setattr(courses_view, "_GITHUB_URL", project_url)
     screen, opened = _screen()
     screen._show_completion_overlay("Скачано: 1")
     _action(screen, "completion-next").on_click(None)
     content = _content(screen)
     asyncio.run(_action(screen, "completion-contact").on_click(None))
     asyncio.run(_action(screen, "completion-github").on_click(None))
-    assert opened == [
-        "https://t.me/No_Resp_404",
-        "https://github.com/markpekun/getcourse-downloader",
-    ]
+    assert opened == [contact_url, project_url]
     assert _content(screen) is content
     _action(screen, "completion-help").on_click(None)
     asyncio.run(_action(screen, "completion-github").on_click(None))
-    assert opened[-1] == "https://github.com/markpekun/getcourse-downloader"
+    assert opened[-1] == project_url
 
 
 def test_new_completion_starts_with_new_result():

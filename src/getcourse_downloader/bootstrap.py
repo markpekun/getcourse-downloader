@@ -6,6 +6,9 @@ from getcourse_downloader.application.use_cases.discover_courses import Discover
 from getcourse_downloader.application.use_cases.download_lessons import DownloadLessons
 from getcourse_downloader.infrastructure.browser.playwright import PlaywrightBrowserFactory
 from getcourse_downloader.infrastructure.browser.profile_reset import BrowserProfileResetter
+from getcourse_downloader.infrastructure.diagnostics.ui_lifecycle import (
+    configure_ui_lifecycle_logging,
+)
 from getcourse_downloader.infrastructure.getcourse.discovery import GetCourseDiscoverer
 from getcourse_downloader.infrastructure.platform.paths import AppPaths
 from getcourse_downloader.infrastructure.storage.json_repositories import (
@@ -30,6 +33,7 @@ class AppContainer:
 def build_container() -> AppContainer:
     paths = AppPaths.discover()
     paths.ensure_runtime_directories()
+    configure_ui_lifecycle_logging(paths)
     courses = JsonCourseRepository(paths.courses_file)
     settings = JsonSettingsRepository(paths.settings_file)
     browsers = PlaywrightBrowserFactory(paths)

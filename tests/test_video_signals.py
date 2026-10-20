@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 from getcourse_downloader.infrastructure.getcourse import video_signals
 from getcourse_downloader.infrastructure.getcourse.video_signals import (
     VIDEO_PLAYER_SELECTOR,
@@ -37,3 +40,14 @@ def test_extract_signed_hls_urls_from_kinescope_configuration():
     assert video_signals.extract_hls_urls(html, "https://kinescope.io/embed/public-id") == [
         "https://kinescope.io/video-id/master.m3u8?expires=123&sign=abc"
     ]
+
+
+def test_extract_hls_urls_does_not_stall_on_long_non_playlist_values():
+    script = (
+        "from getcourse_downloader.infrastructure.getcourse.video_signals import extract_hls_urls\n"
+        "html = '<img src=\"data:image/png;base64,' + '/' * 80_000 + '\">'\n"
+        "html += '<script>src=\"https://cdn.example/master.m3u8?sign=example\"</script>'\n"
+        "assert extract_hls_urls(html, 'https://school.example/lesson') == "
+        "['https://cdn.example/master.m3u8?sign=example']\n"
+    )
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=5)

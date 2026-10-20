@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import flet as ft
@@ -14,12 +15,14 @@ from getcourse_downloader.presentation.flet.theme import Color, build_theme
 
 _START_WIN_W, _START_WIN_H = 680, 460
 _COURSES_WIN_W, _COURSES_WIN_H = 1400, 850
+_LOGGER = logging.getLogger("getcourse_downloader.ui")
 
 
 class App:
     def __init__(self, page: ft.Page, container: AppContainer | None = None) -> None:
         self.page = page
         self.container = container or build_container()
+        _LOGGER.info("app_created app=%x", id(self))
         self._screen: Any = None
         self._closing = False
         page.title = "GetCourse Video Downloader"
@@ -50,12 +53,15 @@ class App:
     async def _on_window_event(self, event) -> None:
         if event.type != ft.WindowEventType.CLOSE or self._closing:
             return
+        _LOGGER.info("window_close_requested app=%x", id(self))
         self._closing = True
         await self._dispose_screen(wait=True)
         self.page.window.prevent_close = False
         await self.page.window.close()
 
     async def _on_page_closed(self, _event) -> None:
+        reason = "disconnect" if getattr(_event, "name", None) == "disconnect" else "close"
+        _LOGGER.info("page_session_ended app=%x reason=%s", id(self), reason)
         if self._closing:
             return
         self._closing = True
@@ -68,6 +74,7 @@ class App:
             await self.show_start()
 
     async def show_courses(self) -> None:
+        _LOGGER.info("show_courses app=%x", id(self))
         await self._dispose_screen(wait=True)
         self.page.clean()
         self.page.window.width = _COURSES_WIN_W
@@ -84,6 +91,7 @@ class App:
         self.page.update()
 
     async def show_start(self) -> None:
+        _LOGGER.info("show_start app=%x", id(self))
         await self._dispose_screen(wait=True)
         self.page.clean()
         self.page.window.width = _START_WIN_W

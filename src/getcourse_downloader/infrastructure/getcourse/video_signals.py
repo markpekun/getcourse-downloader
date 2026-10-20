@@ -29,6 +29,7 @@ def frame_lineage_ids(frame: Any) -> tuple[int, ...]:
     return tuple(frame_ids)
 
 
+_URL_REFERENCE_RE = re.compile(r"(?:(?:https?:)?//|/)[^\"'<>\s]+", flags=re.IGNORECASE)
 _HLS_REFERENCE_RE = re.compile(
     r"(?:(?:https?:)?//|/)[^\"'<>\s]+?\.m3u8(?:\?[^\"'<>\s]*)?",
     flags=re.IGNORECASE,
@@ -66,7 +67,12 @@ def extract_hls_urls(content: str, base_url: str) -> list[str]:
     normalized = unescape(content).replace("\\u0026", "&").replace("\\/", "/")
     urls: list[str] = []
     seen: set[str] = set()
-    for match in _HLS_REFERENCE_RE.finditer(normalized):
+    # Match each URL-like token once. Searching for a required .m3u8 suffix over
+    # the whole document retries at every slash in large inline image values.
+    for reference in _URL_REFERENCE_RE.finditer(normalized):
+        match = _HLS_REFERENCE_RE.match(reference.group(0))
+        if match is None:
+            continue
         url = urljoin(base_url, match.group(0))
         parts = urlsplit(url)
         if parts.scheme not in {"http", "https"} or not parts.netloc or url in seen:

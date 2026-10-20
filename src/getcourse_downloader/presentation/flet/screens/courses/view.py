@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from functools import partial
 from pathlib import Path
@@ -11,6 +12,7 @@ import flet as ft
 from getcourse_downloader.domain.errors import DownloaderError
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.domain.models import Course, DownloadSummary, Lesson
+from getcourse_downloader.presentation.flet.lifecycle import UiCallbacks
 from getcourse_downloader.presentation.flet.screens.courses.completion import CompletionFlow
 from getcourse_downloader.presentation.flet.screens.courses.components import (
     DownloadLessonRow,
@@ -41,6 +43,7 @@ from getcourse_downloader.presentation.flet.theme import (
 _GITHUB_URL = "https://github.com/markpekun/getcourse-downloader"
 _CONTACT_URL = "https://t.me/No_Resp_404"
 _DOWNLOAD_FOLLOW_PAUSE_SECONDS = 10.0
+_LOGGER = logging.getLogger("getcourse_downloader.ui")
 
 
 _COURSE_COLORS = [
@@ -65,6 +68,9 @@ class CoursesScreen:
         self.page = page
         self._controller = controller
         self._on_navigate_start = on_navigate_start
+        self._disposed = False
+        self._ui_callbacks = UiCallbacks(page, self.dispose, screen_id=id(self))
+        _LOGGER.info("courses_screen_created screen=%x", id(self))
         self.state = CoursesViewState(save_path=controller.load_save_path())
         self._confirmation_dialog: ft.AlertDialog | None = None
         self._download_scroll_task: concurrent.futures.Future[None] | None = None
@@ -1205,6 +1211,12 @@ class CoursesScreen:
         self._refresh_clear_actions()
         self._active_download_id += 1
         run_id = self._active_download_id
+        _LOGGER.info(
+            "download_started screen=%x run=%s lessons=%s",
+            id(self),
+            run_id,
+            len(lessons_to_download),
+        )
         self._reset_download_follow()
         self._cancel_btn.disabled = False
         self._cancel_btn.content = "Отмена"
@@ -1241,14 +1253,15 @@ class CoursesScreen:
         )
         self._controller.start_download(
             request,
-            on_event=lambda event: self.page.run_thread(
-                partial(self._handle_download_event, event, run_id=run_id)
+            on_event=lambda event: self._ui_callbacks.post(
+                partial(self._handle_download_event, event, run_id=run_id), kind="event"
             ),
-            on_finished=lambda summary: self.page.run_thread(
-                partial(self._finish_summary, summary, run_id=run_id)
+            on_finished=lambda summary: self._ui_callbacks.post(
+                partial(self._finish_summary, summary, run_id=run_id), kind="finished"
             ),
-            on_failed=lambda error: self.page.run_thread(
-                partial(self._finish_download, f"Ошибка: {error}", True, run_id=run_id)
+            on_failed=lambda error: self._ui_callbacks.post(
+                partial(self._finish_download, f"Ошибка: {error}", True, run_id=run_id),
+                kind="failed",
             ),
         )
 
@@ -1312,6 +1325,7 @@ class CoursesScreen:
         self._show_diagnostic_report(report, "Отчёт по уроку")
 
     def _show_diagnostic_report(self, path: Path, title: str) -> None:
+        _LOGGER.info("lesson_report_open_requested screen=%x", id(self))
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             formatted = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
@@ -1368,6 +1382,8 @@ class CoursesScreen:
         self.overlay.visible = True
         self.page.update()
 
+        _LOGGER.info("lesson_report_opened screen=%x", id(self))
+
     def _close_diagnostic_report(self, _event=None) -> None:
         if not self._diagnostic_open:
             return
@@ -1377,6 +1393,7 @@ class CoursesScreen:
         self._diagnostic_open = False
         self._diagnostic_previous_content = None
         self.page.update()
+        _LOGGER.info("lesson_report_closed screen=%x", id(self))
 
     @staticmethod
     def _format_speed(speed_bps: float) -> str:
@@ -1496,6 +1513,7 @@ class CoursesScreen:
             and not (summary.downloaded or summary.already_present or summary.cancelled),
             is_warning=bool(summary.no_video or summary.failed or summary.cancelled),
             failed=failed,
+            run_id=run_id,
             cancelled=bool(summary.cancelled),
         )
 
@@ -1512,6 +1530,13 @@ class CoursesScreen:
         if run_id is not None and run_id != self._active_download_id:
             return
         self.state.downloading = False
+        _LOGGER.info(
+            "download_finished screen=%x run=%s error=%s diagnostic_open=%s",
+            id(self),
+            run_id,
+            is_error,
+            getattr(self, "_diagnostic_open", False),
+        )
         self.state.cancelling = False
         self._refresh_clear_actions()
         self._reset_download_follow()
@@ -1547,6 +1572,13 @@ class CoursesScreen:
         self._controller.shutdown(timeout)
 
     def dispose(self) -> None:
+        if getattr(self, "_disposed", False):
+            return
+        self._disposed = True
+        callbacks = getattr(self, "_ui_callbacks", None)
+        if callbacks is not None:
+            callbacks.close()
+        _LOGGER.info("courses_screen_disposed screen=%x", id(self))
         self._reset_download_follow()
         if self.state.downloading:
             self._controller.cancel()
@@ -1653,6 +1685,7 @@ class CoursesScreen:
         if flow is None or flow.state.step in {CompletionStep.RESULT, CompletionStep.DETAILS}:
             return
         self.overlay.visible = False
+        _LOGGER.info("completion_overlay_closed screen=%x", id(self))
         self.page.update()
 
     def _show_snack(self, message: str, is_error: bool = False):
