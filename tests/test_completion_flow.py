@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import flet as ft
 import pytest
 
+from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.domain.models import DownloadSummary
 from getcourse_downloader.presentation.flet.screens.courses import view as courses_view
 from getcourse_downloader.presentation.flet.screens.courses.state import CoursesViewState
@@ -187,17 +188,47 @@ def test_summary_outcomes_keep_accurate_titles_and_statistics(summary, title):
     assert screen._completion_flow.result.message.startswith(f"Скачано: {summary.downloaded}")
 
 
-def test_failed_lesson_diagnostic_returns_to_same_result(tmp_path):
+@pytest.mark.parametrize("report_state", ["valid", "missing", "invalid", "encoding"])
+def test_failed_lesson_diagnostic_returns_to_same_result(tmp_path, report_state):
     screen, _ = _screen()
+    screen._show_snack = lambda *_args, **_kwargs: None
     report = tmp_path / "report.json"
-    report.write_text('{"error_code":"HTTP_403"}', encoding="utf-8")
-    screen._diagnostic_reports_by_title["Урок"] = report
+    if report_state == "valid":
+        report.write_text('{"error_code":"HTTP_403"}', encoding="utf-8")
+    elif report_state == "invalid":
+        report.write_text('{"error_code":', encoding="utf-8")
+    elif report_state == "encoding":
+        report.write_bytes(b"\xff\xfeinvalid")
+    screen._diagnostic_reports = {}
+    screen._remember_diagnostic(
+        DownloadEvent(
+            DownloadEventType.ERROR,
+            lesson="Урок",
+            lesson_url="https://school.example/lesson/1?token=secret",
+            message="Failed https://cdn.example/video?token=secret",
+            stage="playlist",
+            error_code="HTTP_403",
+            diagnostic_report=str(report),
+        )
+    )
+    screen._remember_diagnostic(
+        DownloadEvent(
+            DownloadEventType.LESSON_FAILED,
+            lesson="Урок",
+            diagnostic_report=str(report),
+        )
+    )
     screen._show_completion_overlay("Ошибки: 1", is_warning=True, failed=["✗ Урок"])
     _action(screen, "completion-details").on_click(None)
     original = screen._overlay_card.content
     details_content = _content(screen)
     row = next(c for c in _walk(original) if isinstance(c, ft.Container) and c.on_click)
     row.on_click(None)
+    assert screen._overlay_card.content is not original
+    assert any("HTTP_403" in text for text in _texts(screen))
+    assert all("secret" not in text for text in _texts(screen))
+    if report_state != "valid":
+        assert any("playlist" in text for text in _texts(screen))
     assert not any(c.key == "completion-next" for c in _walk(screen._overlay_card.content))
     screen._close_diagnostic_report()
     assert screen._overlay_card.content is original

@@ -17,6 +17,16 @@ def test_start_state_only_tracks_fast_discovery():
     assert not hasattr(state, "video_check_visible")
 
 
+def test_forbidden_course_card_shows_skipped_status_instead_of_zero_lessons():
+    update = CourseDiscoveryUpdate("https://school.example/course", "Private", skipped=True)
+
+    texts = _control_texts(StartScreen._build_discovery_card(update))
+
+    assert update.loaded
+    assert "Пропущен: нет доступа" in texts
+    assert "0 ур." not in texts
+
+
 def test_successful_discovery_does_not_cancel_its_own_navigation_task():
     class Controller:
         async def discover(self, *_args, **_kwargs):
@@ -49,6 +59,43 @@ def test_successful_discovery_does_not_cancel_its_own_navigation_task():
     assert transition_completed is True
     assert task_cancelled is False
     assert parse_task is None
+
+
+def test_first_course_after_login_replaces_checking_card_before_discovery_finishes():
+    async def scenario():
+        screen = StartScreen(SimpleNamespace(update=lambda: None), object(), lambda: None)
+        screen.state.parse_running = True
+        screen.state.discovery_visible = True
+        screen.loader.visible = True
+        screen._show_course_discovery()
+        screen._schedule_discovery_scroll = lambda _url: None
+
+        # Wait for the actual Continue handler, as discovery does after opening Firefox.
+        waiting = asyncio.create_task(screen._wait_for_authentication("Sign in"))
+        await asyncio.sleep(0)
+        auth_card = screen.loader.content
+        screen._on_auth_ready(None)
+        await waiting
+        assert screen._auth_status.value == "Проверяем..."
+        assert screen._auth_button.disabled
+
+        await screen._on_course_parsed(
+            CourseDiscoveryUpdate("https://school.example/course/1", "Available course")
+        )
+
+        assert screen.loader.content is not auth_card
+        assert "Получаем список курсов" in _control_texts(screen.loader.content)
+        assert "Требуется вход" not in _control_texts(screen.loader.content)
+        assert "Available course" in _control_texts(screen.loader.content)
+        assert screen.state.parse_running
+
+        await screen._on_course_parsed(
+            CourseDiscoveryUpdate("https://school.example/course/1", "Available course", 2)
+        )
+        assert "2 ур." in _control_texts(screen.loader.content)
+        screen.dispose()
+
+    asyncio.run(scenario())
 
 
 def test_discovery_failure_stays_visible_with_code_and_sanitized_details():

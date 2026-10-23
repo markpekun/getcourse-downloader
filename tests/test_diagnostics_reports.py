@@ -72,6 +72,29 @@ def test_non_failure_events_are_omitted_from_diagnostic_reports(tmp_path):
     assert json.loads(run_report.read_text(encoding="utf-8"))["failed_lessons"] == []
 
 
+def test_report_is_retried_after_a_failed_write(tmp_path, monkeypatch):
+    diagnostics = DownloadDiagnostics(tmp_path)
+    event = DownloadEvent(DownloadEventType.ERROR, lesson="Lesson", error_code="HTTP_403")
+    write = diagnostics._write_json
+    attempts = []
+
+    def fail_once(path, payload):
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise OSError("Simulated write failure")
+        write(path, payload)
+
+    monkeypatch.setattr(diagnostics, "_write_json", fail_once)
+    with pytest.raises(OSError, match="Simulated write failure"):
+        diagnostics.record(event)
+
+    report = diagnostics.record(event)
+
+    assert len(attempts) == 2
+    assert report.is_file()
+    assert json.loads(report.read_text(encoding="utf-8"))["error_code"] == "HTTP_403"
+
+
 def test_run_report_keeps_global_errors_without_creating_a_fake_lesson(tmp_path):
     diagnostics = DownloadDiagnostics(tmp_path)
 

@@ -80,6 +80,7 @@ class CoursesScreen:
         self._completion_flow: CompletionFlow | None = None
         self._diagnostic_reports: dict[str, Path] = {}
         self._diagnostic_reports_by_title: dict[str, Path] = {}
+        self._diagnostic_fallbacks: dict[Path, str] = {}
         self._diagnostic_open = False
         self._diagnostic_previous_content: ft.Control | None = None
         self._diagnostic_previous_visible = False
@@ -1225,6 +1226,7 @@ class CoursesScreen:
         self._log_column.controls.clear()
         self._diagnostic_reports.clear()
         self._diagnostic_reports_by_title.clear()
+        self._diagnostic_fallbacks.clear()
         self._download_rows.clear()
         self._download_rows_column.controls.clear()
         for item in lessons_to_download:
@@ -1312,6 +1314,9 @@ class CoursesScreen:
         report = Path(event.diagnostic_report)
         if event.type is DownloadEventType.SUMMARY:
             return
+        if not hasattr(self, "_diagnostic_fallbacks"):
+            self._diagnostic_fallbacks = {}
+        self._diagnostic_fallbacks.setdefault(report, CoursesController.describe_diagnostic(event))
         if event.lesson_url:
             self._diagnostic_reports[event.lesson_url] = report
         if event.lesson:
@@ -1326,12 +1331,24 @@ class CoursesScreen:
 
     def _show_diagnostic_report(self, path: Path, title: str) -> None:
         _LOGGER.info("lesson_report_open_requested screen=%x", id(self))
+        report_notice = ""
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
             formatted = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
-        except (OSError, json.JSONDecodeError):
-            self._show_snack("Не удалось открыть отчёт диагностики", is_error=True)
-            return
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            _LOGGER.warning(
+                "lesson_report_file_unavailable screen=%x reason=%s", id(self), type(error).__name__
+            )
+            formatted = getattr(self, "_diagnostic_fallbacks", {}).get(path, "")
+            if formatted:
+                report_notice = "Файл отчёта недоступен. Показаны сохранённые сведения об ошибке."
+            else:
+                report_notice = "Не удалось прочитать сохранённый файл отчёта."
+                formatted = json.dumps(
+                    {"error_code": "DIAGNOSTIC_REPORT_UNAVAILABLE", "summary": report_notice},
+                    ensure_ascii=False,
+                    indent=2,
+                )
         if not getattr(self, "_diagnostic_open", False):
             self._diagnostic_previous_content = self._overlay_card.content
             self._diagnostic_previous_visible = self.overlay.visible
@@ -1348,6 +1365,13 @@ class CoursesScreen:
             controls=[
                 ft.Icon(ft.Icons.BUG_REPORT_OUTLINED, size=38, color=Color.YELLOW),
                 ft.Text(title, size=19, weight=ft.FontWeight.W_700, color=Color.TEXT),
+                ft.Text(
+                    report_notice,
+                    visible=bool(report_notice),
+                    size=11,
+                    color=Color.YELLOW,
+                    text_align=ft.TextAlign.CENTER,
+                ),
                 ft.Text(
                     str(path),
                     size=11,

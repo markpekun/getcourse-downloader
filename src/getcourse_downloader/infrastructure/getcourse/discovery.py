@@ -58,6 +58,7 @@ class _StreamSnapshot:
     title: str
     lessons: tuple[Lesson, ...]
     children: tuple[_StreamLink, ...]
+    skipped: bool = False
 
 
 def clean_title(title: str) -> str:
@@ -396,7 +397,7 @@ class GetCourseDiscoverer:
 
     @staticmethod
     def _resolved_snapshot_count(snapshot: _StreamSnapshot) -> int | None:
-        if snapshot.children:
+        if snapshot.children or snapshot.skipped:
             return None
         return len(snapshot.lessons)
 
@@ -450,8 +451,16 @@ class GetCourseDiscoverer:
             page = await browser.new_page()
             try:
                 response = await self._navigate(page, stream.url, timeout=30_000)
-                self._raise_for_http_error(response)
-                snapshot = await self._read_loaded_stream(page, stream)
+                if getattr(response, "status", None) == 403:
+                    snapshot = _StreamSnapshot(
+                        title=self._discovery_update(stream).title,
+                        lessons=(),
+                        children=(),
+                        skipped=True,
+                    )
+                else:
+                    self._raise_for_http_error(response)
+                    snapshot = await self._read_loaded_stream(page, stream)
             finally:
                 with contextlib.suppress(Exception):
                     await page.close()
@@ -463,6 +472,7 @@ class GetCourseDiscoverer:
                         stream.url,
                         snapshot.title,
                         self._resolved_snapshot_count(snapshot),
+                        skipped=snapshot.skipped,
                     )
                 )
                 for child in snapshot.children:
@@ -552,7 +562,7 @@ class GetCourseDiscoverer:
         if stream.url in claimed:
             return None
         snapshot = graph.get(stream.url)
-        if snapshot is None:
+        if snapshot is None or snapshot.skipped:
             return None
         claimed.add(stream.url)
         children = tuple(

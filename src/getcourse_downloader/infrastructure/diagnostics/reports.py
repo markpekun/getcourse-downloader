@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
+from getcourse_downloader.infrastructure.storage.json_repositories import _write_json_atomic
 
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
@@ -71,11 +71,11 @@ class DownloadDiagnostics:
         )
         if key in reports:
             return self._lesson_root / f"{self._file_stem(key)}.json"
-        report = self._lesson_report(event)
-        reports[key] = report
+        report = self.describe(event, app_version=self._app_version)
         self._lesson_root.mkdir(parents=True, exist_ok=True)
         target = self._lesson_root / f"{self._file_stem(key)}.json"
         self._write_json(target, report)
+        reports[key] = report
         return target
 
     def finish(
@@ -103,11 +103,13 @@ class DownloadDiagnostics:
         self._write_json(target, report)
         return target
 
-    def _lesson_report(self, event: DownloadEvent) -> dict[str, object]:
+    @staticmethod
+    def describe(event: DownloadEvent, *, app_version: str = "") -> dict[str, object]:
+        """Build the same sanitized details for a file and an in-memory preview."""
         source_host = _source_host(event.source_host or event.lesson_url)
         return {
-            "app_version": self._app_version,
-            "error_code": event.error_code or self._default_error_code(event),
+            "app_version": app_version,
+            "error_code": event.error_code or DownloadDiagnostics._default_error_code(event),
             "lesson": event.lesson,
             "lesson_url": _without_query(event.lesson_url),
             "progress": {"current": event.current, "total": event.total},
@@ -129,7 +131,4 @@ class DownloadDiagnostics:
 
     @staticmethod
     def _write_json(path: Path, data: Mapping[str, object]) -> None:
-        path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        _write_json_atomic(path, data)

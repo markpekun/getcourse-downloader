@@ -335,6 +335,7 @@ class StartScreen:
 
     def _show_auth_card(self) -> None:
         self._stop_all_animations()
+        self.state.discovery_visible = False
         self._auth_error.visible = False
         self._auth_button.disabled = True
         self._auth_status.value = "Браузер откроется через 10 сек."
@@ -518,6 +519,11 @@ class StartScreen:
 
     @staticmethod
     def _build_discovery_card(update: CourseDiscoveryUpdate) -> ft.Container:
+        status = "в очереди"
+        if update.skipped:
+            status = "Пропущен: нет доступа"
+        elif update.loaded:
+            status = f"{update.lesson_count} ур."
         return ft.Container(
             key=ft.ScrollKey(update.url),  # type: ignore[call-arg]
             padding=ft.Padding.symmetric(horizontal=10, vertical=6),
@@ -526,16 +532,22 @@ class StartScreen:
             content=ft.Row(
                 controls=[
                     ft.Icon(
-                        ft.Icons.CHECK_CIRCLE_OUTLINE
-                        if update.loaded
-                        else ft.Icons.SCHEDULE_ROUNDED,
+                        ft.Icons.BLOCK_ROUNDED
+                        if update.skipped
+                        else (
+                            ft.Icons.CHECK_CIRCLE_OUTLINE
+                            if update.loaded
+                            else ft.Icons.SCHEDULE_ROUNDED
+                        ),
                         size=14,
-                        color=Color.GREEN if update.loaded else Color.ACCENT_LIGHT,
+                        color=Color.TEXT_MUTED
+                        if update.skipped
+                        else (Color.GREEN if update.loaded else Color.ACCENT_LIGHT),
                     ),
                     ft.Text(update.title, size=12, color=Color.TEXT, expand=True),
                     ft.Container(
                         content=ft.Text(
-                            f"{update.lesson_count} ур." if update.loaded else "в очереди",
+                            status,
                             size=11,
                             color=Color.TEXT_MUTED,
                         ),

@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from getcourse_downloader.domain.errors import ExternalServiceError
 from getcourse_downloader.infrastructure.getcourse.discovery import (
     GetCourseDiscoverer,
     clean_title,
@@ -177,10 +179,11 @@ class _FakePage:
         self.url = start_url
         self.closed = False
 
-    async def goto(self, url: str, **_: object) -> None:
+    async def goto(self, url: str, **_: object) -> SimpleNamespace:
         self.url = url
         self._browser.visited_urls.append(url)
         await asyncio.sleep(float(self._pages[url].get("delay", 0)))
+        return SimpleNamespace(status=self._pages[url].get("status", 200))
 
     async def close(self) -> None:
         if not self.closed:
@@ -376,6 +379,52 @@ def test_recursive_discovery_keeps_tree_order_and_ignores_stream_page_fallback()
     assert progress[0][2] is None
     assert set(browser.visited_urls) == {course_a, course_b, module_b, module_c}
     assert browser.max_active_pages <= 4
+    assert browser.active_pages == 0
+
+
+@pytest.mark.parametrize("status", [403, 503])
+def test_discovery_skips_only_forbidden_streams_and_keeps_accessible_tree(status):
+    base = "https://school.example/teach/control/stream/view/id/"
+    landing = "https://school.example/teach/control/stream"
+    pages = {
+        landing: {
+            "stream_rows": [_stream_row_html(100, "Available"), _stream_row_html(200, "Private")]
+        },
+        base + "100": {
+            "title": "Available",
+            "stream_rows": [
+                _stream_row_html(300, "Module"),
+                _stream_row_html(400, "Private module"),
+            ],
+        },
+        base + "200": {"status": status},
+        base + "300": {"title": "Module", "lessons": [_lesson_html(1, "Lesson")]},
+        base + "400": {"status": status},
+    }
+    browser = _FakeBrowser(pages)
+    discoverer = GetCourseDiscoverer(None)
+    updates = []
+
+    async def on_course(update):
+        updates.append(update)
+
+    operation = discoverer._parse_page(
+        browser, browser.landing_page(landing), landing, on_course_discovered=on_course
+    )
+    if status != 403:
+        with pytest.raises(ExternalServiceError) as captured:
+            asyncio.run(operation)
+        assert captured.value.code == "HTTP_5XX"
+        return
+
+    courses = asyncio.run(operation)
+    assert [course.title for course in courses] == ["Available"]
+    assert [course.title for course in courses[0].children] == ["Module"]
+    assert courses[0].lesson_count == 1
+    assert {update.url for update in updates if update.skipped} == {base + "200", base + "400"}
+    assert all(update.loaded for update in updates if update.skipped)
+    assert updates[-1].url == base + "100"
+    assert updates[-1].lesson_count == 1
     assert browser.active_pages == 0
 
 

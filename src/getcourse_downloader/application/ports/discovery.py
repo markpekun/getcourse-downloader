@@ -12,10 +12,11 @@ class CourseDiscoveryUpdate:
     url: str
     title: str
     lesson_count: int | None = None
+    skipped: bool = False
 
     @property
     def loaded(self) -> bool:
-        return self.lesson_count is not None
+        return self.skipped or self.lesson_count is not None
 
 
 CourseDiscoveredCallback = Callable[[CourseDiscoveryUpdate], Awaitable[None]]

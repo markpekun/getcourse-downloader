@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from getcourse_downloader import __version__
 from getcourse_downloader.application.ports.browser import BrowserAuthorizationResetter
 from getcourse_downloader.application.ports.repositories import (
     CourseRepository,
@@ -21,12 +23,18 @@ from getcourse_downloader.domain.models import (
     Settings,
     VideoQuality,
 )
+from getcourse_downloader.infrastructure.diagnostics.reports import DownloadDiagnostics
 
 DownloadFinished = Callable[[DownloadSummary], None]
 DownloadFailed = Callable[[Exception], None]
 
 
 class CoursesController:
+    @staticmethod
+    def describe_diagnostic(event: DownloadEvent) -> str:
+        payload = DownloadDiagnostics.describe(event, app_version=__version__)
+        return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+
     def __init__(
         self,
         courses: CourseRepository,
