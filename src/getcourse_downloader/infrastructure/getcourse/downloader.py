@@ -578,6 +578,7 @@ class PlaywrightDownloadGateway:
         observed_manifests: list[_ManifestObservation] = []
         observed_manifest_keys: set[tuple[str, str, int | None]] = set()
         response_tasks: set[asyncio.Task[None]] = set()
+        document_status: int | None = None
         configured_master_urls: dict[int, str] = {}
         last_playlist_at = 0.0
         configured_players = GetCoursePlayerResolver(
@@ -647,6 +648,14 @@ class PlaywrightDownloadGateway:
                 last_playlist_at = time.monotonic()
 
         def schedule_response(response) -> None:
+            nonlocal document_status
+            request = getattr(response, "request", None)
+            if (
+                request is not None
+                and getattr(request, "resource_type", None) == "document"
+                and request.frame is page.main_frame
+            ):
+                document_status = response.status
             task = asyncio.create_task(on_response(response))
             response_tasks.add(task)
             task.add_done_callback(response_tasks.discard)
@@ -662,10 +671,10 @@ class PlaywrightDownloadGateway:
                 item=item,
             ):
                 return _LessonResult(_LessonStatus.CANCELLED)
-            if await self._authentication_required(page):
+            if document_status != 403 and await self._authentication_required(page):
                 raise _AuthenticationExpired
 
-            if await lesson_access_denied(page):
+            if document_status == 403 or await lesson_access_denied(page):
                 emit(
                     self._event(
                         item,

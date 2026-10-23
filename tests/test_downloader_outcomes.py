@@ -247,12 +247,31 @@ class _DelayedPlayerPage(_Page):
         return object() if self._player_checks > 1 else None
 
 
-def test_no_player_and_no_hls_is_no_video(monkeypatch, tmp_path):
+@pytest.mark.parametrize("forbidden_resource", [None, "image", "iframe"])
+def test_no_player_and_no_hls_is_no_video(monkeypatch, tmp_path, forbidden_resource):
     monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
+
+    class Page(_Page):
+        main_frame = object()
+
+        async def goto(self, url, **kwargs):
+            await super().goto(url, **kwargs)
+            if forbidden_resource:
+                response = SimpleNamespace(
+                    url="https://cdn.example/forbidden",
+                    status=403,
+                    request=SimpleNamespace(
+                        resource_type="document" if forbidden_resource == "iframe" else "image",
+                        frame=object() if forbidden_resource == "iframe" else self.main_frame,
+                    ),
+                )
+                for handler in self._handlers:
+                    handler(response)
+
     gateway = PlaywrightDownloadGateway(None, _Hls())  # type: ignore[arg-type]
     result = asyncio.run(
         gateway._download_lesson(
-            _Browser(_Page(player=False)),
+            _Browser(Page(player=False)),
             _item(),
             tmp_path / "Lesson",
             "auto",
@@ -262,18 +281,41 @@ def test_no_player_and_no_hls_is_no_video(monkeypatch, tmp_path):
     assert result.status.value == "no_video"
 
 
-def test_closed_lesson_reports_access_denied_instead_of_missing_video(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("http_status", "error_heading"),
+    [(200, "Нет доступа"), (403, ""), (200, "Возникла ошибка #403")],
+)
+def test_closed_lesson_reports_access_denied_instead_of_missing_video(
+    monkeypatch, tmp_path, http_status, error_heading
+):
     monkeypatch.setattr(downloader_module, "PLAYLIST_WAIT_SECONDS", 0.0)
 
     class ClosedPage(_Page):
+        main_frame = object()
+
+        async def goto(self, url, **kwargs):
+            await super().goto(url, **kwargs)
+            response = SimpleNamespace(
+                url=url,
+                status=http_status,
+                request=SimpleNamespace(resource_type="document", frame=self.main_frame),
+            )
+            for handler in self._handlers:
+                handler(response)
+
         def get_by_role(self, role, **kwargs):
             return _Visibility(
-                role == "heading" and kwargs.get("name") == "Нет доступа",
-                "Нет доступа\nУ вас нет доступа к этому уроку",
+                role == "heading" and kwargs.get("name") == error_heading,
+                f"{error_heading}\nУ вас нет доступа к этому уроку",
             )
 
         def get_by_text(self, text, **_):
-            return _Visibility(text == "У вас нет доступа к этому уроку")
+            return _Visibility(
+                bool(error_heading) and text in {error_heading, "У вас нет доступа к этому уроку"}
+            )
+
+        async def query_selector(self, _):
+            raise AssertionError("An inaccessible lesson must not reach video discovery")
 
     events = []
     result = asyncio.run(
