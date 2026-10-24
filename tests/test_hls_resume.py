@@ -721,6 +721,8 @@ def test_auto_checks_lesson_master_then_reuses_only_matching_maximum(
 
             return Locator()
 
+        get_by_text = get_by_role
+
         async def wait_for_load_state(self, *_args, **_kwargs):
             pass
 

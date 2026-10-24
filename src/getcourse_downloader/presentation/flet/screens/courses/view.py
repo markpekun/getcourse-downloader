@@ -1,7 +1,6 @@
 import asyncio
 import concurrent.futures
 import contextlib
-import json
 import logging
 from collections.abc import Awaitable, Callable
 from functools import partial
@@ -11,7 +10,8 @@ import flet as ft
 
 from getcourse_downloader.domain.errors import DownloaderError
 from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
-from getcourse_downloader.domain.models import Course, DownloadSummary, Lesson
+from getcourse_downloader.domain.models import Course, DownloadSummary, Lesson, SelectedLesson
+from getcourse_downloader.infrastructure.diagnostics.ui_lifecycle import trace_operation
 from getcourse_downloader.presentation.flet.lifecycle import UiCallbacks
 from getcourse_downloader.presentation.flet.screens.courses.completion import CompletionFlow
 from getcourse_downloader.presentation.flet.screens.courses.components import (
@@ -26,6 +26,10 @@ from getcourse_downloader.presentation.flet.screens.courses.confirmations import
     build_clear_confirmation,
 )
 from getcourse_downloader.presentation.flet.screens.courses.controller import CoursesController
+from getcourse_downloader.presentation.flet.screens.courses.diagnostics import DiagnosticOverlay
+from getcourse_downloader.presentation.flet.screens.courses.download_follow import (
+    DownloadListFollow,
+)
 from getcourse_downloader.presentation.flet.screens.courses.state import (
     CompletionResult,
     CompletionStep,
@@ -38,6 +42,11 @@ from getcourse_downloader.presentation.flet.theme import (
     accent_button,
     body_text,
     divider,
+)
+from getcourse_downloader.presentation.flet.transitions import (
+    OverlayTransition,
+    PreparationReveal,
+    RowTransitions,
 )
 
 _GITHUB_URL = "https://github.com/markpekun/getcourse-downloader"
@@ -70,21 +79,22 @@ class CoursesScreen:
         self._on_navigate_start = on_navigate_start
         self._disposed = False
         self._ui_callbacks = UiCallbacks(page, self.dispose, screen_id=id(self))
+        self._row_transitions = RowTransitions(page)
         _LOGGER.info("courses_screen_created screen=%x", id(self))
         self.state = CoursesViewState(save_path=controller.load_save_path())
         self._confirmation_dialog: ft.AlertDialog | None = None
-        self._download_scroll_task: concurrent.futures.Future[None] | None = None
-        self._download_follow_resume_task: concurrent.futures.Future[None] | None = None
-        self._download_follow_paused = False
         self._active_lesson_url: str | None = None
         self._completion_flow: CompletionFlow | None = None
         self._diagnostic_reports: dict[str, Path] = {}
         self._diagnostic_reports_by_title: dict[str, Path] = {}
         self._diagnostic_fallbacks: dict[Path, str] = {}
         self._diagnostic_open = False
-        self._diagnostic_previous_content: ft.Control | None = None
-        self._diagnostic_previous_visible = False
+        self._download_view_active = True
+        self._diagnostics = DiagnosticOverlay(page, self._close_diagnostic_report)
         self._active_download_id = 0
+        self._preparation_task: concurrent.futures.Future[None] | None = None
+        self._preparing_download = False
+        self._preparation_total = 0
         self._download_title = ft.Text(
             "Подготовка",
             size=18,
@@ -157,6 +167,35 @@ class CoursesScreen:
             scroll_interval=100,
             on_scroll=self._on_download_rows_scroll,
         )
+        self._download_follow = DownloadListFollow(
+            page,
+            self._download_rows_column,
+            can_follow=self._can_follow_download_rows,
+            target_for=self._download_scroll_target,
+            target_index=self._download_target_index,
+            screen_id=id(self),
+            logger=_LOGGER,
+            pause_seconds=_DOWNLOAD_FOLLOW_PAUSE_SECONDS,
+        )
+        self._preparation_status = ft.Text(size=13, color=Color.TEXT_SECONDARY)
+        self._preparation_cover = ft.Container(
+            left=0,
+            right=0,
+            top=0,
+            bottom=0,
+            visible=False,
+            bgcolor=Color.BG_CARD,
+            alignment=ft.Alignment.CENTER,
+            content=ft.Column(
+                tight=True,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                controls=[
+                    ft.ProgressRing(width=30, height=30, stroke_width=3, color=Color.ACCENT_LIGHT),
+                    self._preparation_status,
+                ],
+            ),
+        )
+        self._preparation_reveal = PreparationReveal(page, self._preparation_cover)
         self._download_rows_container = ft.Container(
             width=540,
             height=290,
@@ -164,7 +203,11 @@ class CoursesScreen:
             bgcolor="rgba(0,0,0,0.25)",
             border=ft.Border.all(1, "rgba(255,255,255,0.06)"),
             padding=ft.Padding.all(10),
-            content=self._download_rows_column,
+            on_tap_down=self._on_download_rows_interaction,
+            content=ft.Stack(
+                fit=ft.StackFit.EXPAND,
+                controls=[self._download_rows_column, self._preparation_cover],
+            ),
         )
         self._continue_btn = ft.Container(
             visible=False,
@@ -243,6 +286,18 @@ class CoursesScreen:
 
         self._auth_overlay_task: asyncio.Task | None = None
 
+        self._download_overlay_content = ft.Column(
+            tight=True,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=12,
+            controls=[
+                ft.Icon(ft.Icons.VIDEO_LIBRARY_ROUNDED, size=38, color=Color.ACCENT_LIGHT),
+                self._download_title,
+                self._download_rows_container,
+                self._continue_btn,
+                self._cancel_btn,
+            ],
+        )
         self._overlay_card = ft.Container(
             width=600,
             padding=ft.Padding.all(24),
@@ -260,23 +315,7 @@ class CoursesScreen:
             animate_opacity=ft.Animation(350, ft.AnimationCurve.EASE_OUT),
             animate_offset=ft.Animation(350, ft.AnimationCurve.EASE_OUT),
             animate=ft.Animation(300, ft.AnimationCurve.EASE_OUT),
-            content=ft.Column(
-                tight=True,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=12,
-                controls=[
-                    ft.Icon(ft.Icons.VIDEO_LIBRARY_ROUNDED, size=38, color=Color.ACCENT_LIGHT),
-                    ft.Text(
-                        "Загрузка видео",
-                        size=18,
-                        weight=ft.FontWeight.W_600,
-                        color=Color.TEXT,
-                    ),
-                    self._download_rows_container,
-                    self._continue_btn,
-                    self._cancel_btn,
-                ],
-            ),
+            content=self._download_overlay_content,
         )
 
         self.overlay = ft.Container(
@@ -294,6 +333,7 @@ class CoursesScreen:
                 content=self._overlay_card,
             ),
         )
+        self._overlay_transition = OverlayTransition(page, self.overlay, self._overlay_card)
 
         self.error_overlay = ft.Container(
             expand=True,
@@ -410,6 +450,7 @@ class CoursesScreen:
                         ],
                     ),
                     self.overlay,
+                    self._diagnostics.control,
                     self.error_overlay,
                 ],
             ),
@@ -536,6 +577,7 @@ class CoursesScreen:
             self.folder_badges.update(tree.folder_badges)
             self.course_list.controls.append(tree.control)
 
+    @trace_operation("course_expand_toggle")
     def _toggle_course(self, course_url: str):
         if course_url in self.state.expanded_course_urls:
             self.state.expanded_course_urls.discard(course_url)
@@ -544,11 +586,13 @@ class CoursesScreen:
         self._build_course_list()
         self.page.update()
 
+    @trace_operation("course_search")
     def _on_search(self, e):
         self.state.search_query = e.control.value.strip()
         self._build_course_list()
         self.page.update()
 
+    @trace_operation("lesson_selection")
     def _set_lesson_selection(self, lesson: Lesson, selected: bool) -> None:
         if selected:
             self.state.selected_lesson_urls.add(lesson.url)
@@ -557,6 +601,7 @@ class CoursesScreen:
         self._build_course_list()
         self._update_selected_count()
 
+    @trace_operation("course_selection")
     def _set_course_selection(self, course: Course, selected: bool) -> None:
         urls = {item.lesson.url for item in iter_course_lessons(course)}
         if selected:
@@ -856,6 +901,7 @@ class CoursesScreen:
             if button is not None:
                 button.disabled = self._clear_is_blocked()
 
+    @trace_operation("clear_confirmation_open")
     def _request_clear(self, target: ClearTarget) -> None:
         if self._confirmation_dialog is not None:
             return
@@ -923,6 +969,7 @@ class CoursesScreen:
         self.selected_label.value = str(len(self.state.selected_lesson_urls))
         self.page.update()
 
+    @trace_operation("lessons_select_all")
     def _select_all(self, e):
         self.state.selected_lesson_urls = {
             item.lesson.url for course in self.data for item in iter_course_lessons(course)
@@ -930,6 +977,7 @@ class CoursesScreen:
         self._build_course_list()
         self._update_selected_count()
 
+    @trace_operation("lessons_unselect_all")
     def _unselect_all(self, e):
         self.state.selected_lesson_urls.clear()
         self._build_course_list()
@@ -965,32 +1013,30 @@ class CoursesScreen:
                 header.append(line)
         return header, failed
 
-    async def _scroll_download_to(self, lesson_url: str) -> None:
-        try:
-            await self._download_rows_column.scroll_to(
-                scroll_key=lesson_url,
-                duration=650,
-                curve=ft.AnimationCurve.EASE_IN_OUT_CUBIC,
-            )
-        except (asyncio.CancelledError, IndexError, RuntimeError):
-            return
+    def _can_follow_download_rows(self) -> bool:
+        return bool(
+            self.state.downloading
+            and not self._preparing_download
+            and self._download_view_active
+            and not self._disposed
+        )
 
-    def _schedule_download_scroll(self, lesson_url: str) -> None:
-        previous = self._download_scroll_task
-        if previous is not None and not previous.done():
-            previous.cancel()
-        try:
-            self._download_scroll_task = self.page.run_task(
-                self._scroll_download_to,
-                lesson_url,
-            )
-        except (AttributeError, RuntimeError):
-            self._download_scroll_task = None
+    def _download_target_index(self, lesson_url: str) -> int:
+        for index, candidate_url in enumerate(self._download_rows, start=1):
+            if candidate_url == lesson_url:
+                return index
+        return 0
 
     def _follow_download_lesson(self, lesson_url: str) -> None:
         self._active_lesson_url = lesson_url
-        if not self._download_follow_paused:
-            self._schedule_download_scroll(self._download_scroll_target(lesson_url))
+        follow = getattr(self, "_download_follow", None)
+        if follow is not None:
+            follow.follow(lesson_url)
+
+    def _on_download_rows_interaction(self, _event) -> None:
+        ft.context.disable_auto_update()
+        if self._can_follow_download_rows():
+            self._download_follow.pause_for_interaction("tap")
 
     def _download_scroll_target(self, lesson_url: str) -> str:
         previous_url = lesson_url
@@ -1001,42 +1047,16 @@ class CoursesScreen:
         return lesson_url
 
     def _on_download_rows_scroll(self, event: ft.OnScrollEvent) -> None:
-        if not self.state.downloading or event.event_type is not ft.ScrollType.USER:
+        # Scroll notifications change follow state, not controls; skip Flet's page-wide patch.
+        ft.context.disable_auto_update()
+        if not self._can_follow_download_rows() or event.event_type is not ft.ScrollType.USER:
             return
-        if event.direction is ft.ScrollDirection.IDLE and not self._download_follow_paused:
-            return
-        self._download_follow_paused = True
-        scroll_task = self._download_scroll_task
-        if scroll_task is not None and not scroll_task.done():
-            scroll_task.cancel()
-        resume_task = self._download_follow_resume_task
-        if resume_task is not None and not resume_task.done():
-            resume_task.cancel()
-        try:
-            self._download_follow_resume_task = self.page.run_task(
-                self._resume_download_follow,
-            )
-        except (AttributeError, RuntimeError):
-            self._download_follow_resume_task = None
-
-    async def _resume_download_follow(self) -> None:
-        try:
-            await asyncio.sleep(_DOWNLOAD_FOLLOW_PAUSE_SECONDS)
-        except asyncio.CancelledError:
-            return
-        self._download_follow_resume_task = None
-        self._download_follow_paused = False
-        lesson_url = self._active_lesson_url
-        if self.state.downloading and lesson_url:
-            await self._scroll_download_to(self._download_scroll_target(lesson_url))
+        self._download_follow.pause_for_interaction("scroll")
 
     def _reset_download_follow(self) -> None:
-        for task in (self._download_scroll_task, self._download_follow_resume_task):
-            if task is not None and not task.done():
-                task.cancel()
-        self._download_scroll_task = None
-        self._download_follow_resume_task = None
-        self._download_follow_paused = False
+        follow = getattr(self, "_download_follow", None)
+        if follow is not None:
+            follow.reset()
         self._active_lesson_url = None
 
     @staticmethod
@@ -1071,9 +1091,9 @@ class CoursesScreen:
         return False
 
     def _refresh_title(self, changed: bool):
-        if changed:
+        if changed and getattr(self, "_download_view_active", True):
             with contextlib.suppress(IndexError, RuntimeError):
-                self.page.update()
+                self.page.update(self._download_title)
 
     def _add_log(self, line: str):
         title_changed = self._update_download_title(line)
@@ -1083,8 +1103,9 @@ class CoursesScreen:
         self.log_lines.append(line)
         color = self._log_color(line)
         self._log_column.controls.append(ft.Text(line, size=13, color=color, selectable=False))
-        with contextlib.suppress(IndexError, RuntimeError):
-            self.page.update()
+        del self.log_lines[:-200]
+        del self._log_column.controls[:-200]
+        self._refresh_title(title_changed)
 
     def _update_last_log(self, line: str):
         title_changed = self._update_download_title(line)
@@ -1102,8 +1123,7 @@ class CoursesScreen:
                 last.color = self._log_color(line)
                 if self.log_lines:
                     self.log_lines[-1] = line
-                with contextlib.suppress(IndexError, RuntimeError):
-                    self.page.update()
+                self._refresh_title(title_changed)
                 return
         self._add_log(line)
 
@@ -1111,34 +1131,57 @@ class CoursesScreen:
         self._continue_btn.visible = True
         self.page.update()
 
-    def _switch_overlay_to_download(self):
+    def _update_overlay(self) -> None:
+        controls: list[ft.Control] = [self.overlay]
+        for name in ("_clear_courses_button", "_clear_authorization_button", "_speed_text"):
+            button = getattr(self, name, None)
+            if button is not None:
+                controls.append(button)
+        self.page.update(*controls)
+
+    def _download_overlay_layout(self) -> ft.Column:
+        layout = getattr(self, "_download_overlay_content", None)
+        if layout is None:
+            layout = ft.Column(
+                tight=True,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=12,
+                controls=[
+                    ft.Icon(ft.Icons.VIDEO_LIBRARY_ROUNDED, size=38, color=Color.ACCENT_LIGHT),
+                    self._download_title,
+                    self._download_rows_container,
+                    self._continue_btn,
+                    self._cancel_btn,
+                ],
+            )
+            self._download_overlay_content = layout
+        return layout
+
+    @trace_operation("overlay_download")
+    def _switch_overlay_to_download(self, *, update: bool = True):
+        layout = self._download_overlay_layout()
+        if self._download_view_active and self._overlay_card.content is layout:
+            return
+        self._download_view_active = True
         self._completion_flow = None
         self._overlay_card.width = 600
         self._overlay_card.height = None
-        self._diagnostic_open = False
-        self._diagnostic_previous_content = None
         if self._auth_overlay_task is not None:
             self._auth_overlay_task.cancel()
             self._auth_overlay_task = None
 
         self._download_title.value = "Подготовка"
-        self._overlay_card.content = ft.Column(
-            tight=True,
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            spacing=12,
-            controls=[
-                ft.Icon(ft.Icons.VIDEO_LIBRARY_ROUNDED, size=38, color=Color.ACCENT_LIGHT),
-                self._download_title,
-                self._download_rows_container,
-                self._continue_btn,
-                self._cancel_btn,
-            ],
-        )
-        self.page.update()
+        self._overlay_card.content = layout
+        follow = getattr(self, "_download_follow", None)
+        if follow is not None:
+            follow.refresh()
+        if update:
+            self._update_overlay()
 
+    @trace_operation("overlay_authentication")
     def _switch_overlay_to_auth(self):
-        self._diagnostic_open = False
-        self._diagnostic_previous_content = None
+        self._download_view_active = False
+        self._download_follow.refresh()
         if self._auth_overlay_task is not None:
             self._auth_overlay_task.cancel()
             self._auth_overlay_task = None
@@ -1159,21 +1202,21 @@ class CoursesScreen:
                 self._cancel_btn,
             ],
         )
-        self.page.update()
+        self._update_overlay()
 
         try:
             loop = asyncio.get_running_loop()
             self._auth_overlay_task = loop.create_task(self._auth_overlay_countdown())
         except RuntimeError:
             self._continue_btn.visible = True
-            self.page.update()
+            self.page.update(self._continue_btn)
 
     async def _auth_overlay_countdown(self):
         try:
             for i in range(5, 0, -1):
                 self._auth_status.value = f"Браузер откроется через {i} сек."
                 try:
-                    self.page.update()
+                    self.page.update(self._auth_status)
                 except Exception:
                     return
                 await asyncio.sleep(1)
@@ -1181,17 +1224,19 @@ class CoursesScreen:
             self._auth_status.value = "Войдите в аккаунт в браузере"
             self._continue_btn.visible = True
             with contextlib.suppress(Exception):
-                self.page.update()
+                self.page.update(self._auth_status, self._continue_btn)
         except asyncio.CancelledError:
             pass
 
+    @trace_operation("authentication_continue_click")
     def _send_continue(self, e):
         self._continue_btn.visible = False
         self._switch_overlay_to_download()
-        self.page.update()
         self._controller.continue_authentication()
 
+    @trace_operation("download_start")
     def _start_download(self, e):
+        ft.context.disable_auto_update()
         if self._clear_is_blocked():
             return
         lessons_to_download = selected_course_lessons(
@@ -1202,13 +1247,10 @@ class CoursesScreen:
             self._show_snack("Нет выбранных уроков", is_error=True)
             return
 
-        if not Path(self.state.save_path).is_dir():
-            self.error_overlay.visible = True
-            self.page.update()
-            return
-
         self.state.downloading = True
         self.state.cancelling = False
+        self._preparing_download = True
+        self._preparation_total = len(lessons_to_download)
         self._refresh_clear_actions()
         self._active_download_id += 1
         run_id = self._active_download_id
@@ -1219,6 +1261,7 @@ class CoursesScreen:
             len(lessons_to_download),
         )
         self._reset_download_follow()
+        self._row_transitions.reset()
         self._cancel_btn.disabled = False
         self._cancel_btn.content = "Отмена"
         self._speed_text.value = "Средняя: —"
@@ -1227,36 +1270,97 @@ class CoursesScreen:
         self._diagnostic_reports.clear()
         self._diagnostic_reports_by_title.clear()
         self._diagnostic_fallbacks.clear()
+        self._diagnostics.close(update=False)
+        self._diagnostic_open = False
         self._download_rows.clear()
         self._download_rows_column.controls.clear()
-        for item in lessons_to_download:
-            row = build_download_lesson_row(
-                item,
-                on_details=partial(self._show_lesson_diagnostics, item.lesson.url),
-            )
-            self._download_rows[item.lesson.url] = row
-            self._download_rows_column.controls.append(row.control)
+        groups = [ft.Column(spacing=5) for _ in range(0, len(lessons_to_download), 24)]
+        self._download_rows_column.controls.extend(groups)
+        self._preparation_status.value = f"Подготовлено: 0 из {len(lessons_to_download)}"
+        self._preparation_reveal.show()
         self._continue_btn.visible = False
-        self._switch_overlay_to_download()
-        self._overlay_card.opacity = 0
-        self._overlay_card.offset = ft.Offset(0, 0.15)
-        self.overlay.visible = True
-        self.page.update()
-        self._overlay_card.opacity = 1
-        self._overlay_card.offset = ft.Offset(0, 0)
-        self.page.update()
-
-        self._add_log(f"Старт скачивания: {len(lessons_to_download)} уроков")
-
-        request = self._controller.make_request(
+        self._switch_overlay_to_download(update=False)
+        self._download_title.value = "Подготавливаем очередь…"
+        self._overlay_transition.show()
+        self.page.update(
+            self._clear_courses_button, self._clear_authorization_button, self._speed_text
+        )
+        _LOGGER.info("download_preparation_shown screen=%x run=%s", id(self), run_id)
+        self._preparation_task = self.page.run_task(
+            self._prepare_download,
             lessons_to_download,
+            groups,
             self.state.quality,
             self.state.save_path,
+            run_id,
         )
+
+    async def _prepare_download(
+        self,
+        lessons: list[SelectedLesson],
+        groups: list[ft.Column],
+        quality: str,
+        save_path: str,
+        run_id: int,
+    ) -> None:
+        try:
+            await asyncio.sleep(0.025)
+            if not await asyncio.to_thread(Path(save_path).is_dir):
+                if self._disposed or run_id != self._active_download_id:
+                    return
+                self._preparing_download = False
+                self.state.downloading = False
+                self._overlay_transition.close(update=False)
+                self.error_overlay.visible = True
+                self._refresh_clear_actions()
+                self.page.update(self.overlay, self.error_overlay)
+                self.page.update(self._clear_courses_button, self._clear_authorization_button)
+                return
+            with trace_operation("download_prepare_queue", lessons=len(lessons), run=run_id):
+                for group_index, group in enumerate(groups):
+                    if self._disposed or run_id != self._active_download_id:
+                        return
+                    for item in lessons[group_index * 24 : (group_index + 1) * 24]:
+                        row = build_download_lesson_row(
+                            item,
+                            on_details=partial(self._show_lesson_diagnostics, item.lesson.url),
+                        )
+                        self._download_rows[item.lesson.url] = row
+                        group.controls.append(row.control)
+                    self._preparation_status.value = (
+                        f"Подготовлено: {len(self._download_rows)} из {len(lessons)}"
+                    )
+                    self.page.update(group, self._preparation_status)
+                    await asyncio.sleep(0.008)
+            if self._disposed or run_id != self._active_download_id:
+                return
+            self._download_title.value = "Подготовка"
+            self._preparation_reveal.reveal()
+            self.page.update(self._download_title)
+            request = self._controller.make_request(lessons, quality, save_path)
+            self._preparing_download = False
+            self._preparation_task = None
+            self._add_log(f"Старт скачивания: {len(lessons)} уроков")
+            self._launch_download(request, run_id)
+        except asyncio.CancelledError:
+            return
+        except Exception as error:
+            _LOGGER.error("download_preparation_failed error_type=%s", type(error).__name__)
+            self._preparing_download = False
+            self._preparation_task = None
+            if self._disposed or run_id != self._active_download_id:
+                return
+            self._finish_download("Не удалось подготовить очередь загрузки.", True, run_id=run_id)
+
+    def _launch_download(self, request, run_id: int) -> None:
         self._controller.start_download(
             request,
             on_event=lambda event: self._ui_callbacks.post(
-                partial(self._handle_download_event, event, run_id=run_id), kind="event"
+                partial(self._handle_download_event, event, run_id=run_id),
+                kind="event",
+                replace_key=(run_id, event.lesson_url, event.video_index)
+                if event.type is DownloadEventType.PROGRESS
+                else None,
             ),
             on_finished=lambda summary: self._ui_callbacks.post(
                 partial(self._finish_summary, summary, run_id=run_id), kind="finished"
@@ -1270,6 +1374,15 @@ class CoursesScreen:
     def _handle_download_event(self, event: DownloadEvent, *, run_id: int | None = None) -> None:
         if run_id is not None and run_id != self._active_download_id:
             return
+        if not self.state.downloading:
+            return
+        _LOGGER.log(
+            logging.DEBUG if event.type is DownloadEventType.PROGRESS else logging.INFO,
+            "download_event screen=%x run=%s type=%s",
+            id(self),
+            self._active_download_id,
+            event.type.value,
+        )
         self._remember_diagnostic(event)
         if event.type is DownloadEventType.AUTH_REQUIRED:
             self._switch_overlay_to_auth()
@@ -1281,27 +1394,27 @@ class CoursesScreen:
             if event.speed_bps is not None:
                 self._speed_text.value = f"Средняя: {self._format_speed(event.speed_bps)}"
             self._update_last_log(event.message)
-            self._update_download_row(event)
+            self._update_download_row(event, update_header=True)
             return
         elif event.type is DownloadEventType.LESSON_STARTED:
             self._download_title.value = "Проверяем видео"
             self._speed_text.value = "Средняя: —"
             self._add_log(f"▶ {event.lesson}")
-            self._update_download_row(event)
+            self._update_download_row(event, update_header=True)
             if event.lesson_url:
                 self._follow_download_lesson(event.lesson_url)
             return
         elif event.type is DownloadEventType.VIDEO_FOUND:
             self._speed_text.value = "Средняя: —"
-            self._update_download_row(event)
+            self._update_download_row(event, update_header=True)
         elif event.type in {
             DownloadEventType.LESSON_COMPLETED,
             DownloadEventType.LESSON_SKIPPED,
             DownloadEventType.LESSON_NO_VIDEO,
         }:
-            self._update_download_row(event)
+            self._update_download_row(event, update_header=True)
         elif event.type is DownloadEventType.LESSON_FAILED or event.type is DownloadEventType.ERROR:
-            self._update_download_row(event)
+            self._update_download_row(event, update_header=True)
             self._add_log(f"❌ {event.message}")
             return
         elif event.message:
@@ -1316,7 +1429,8 @@ class CoursesScreen:
             return
         if not hasattr(self, "_diagnostic_fallbacks"):
             self._diagnostic_fallbacks = {}
-        self._diagnostic_fallbacks.setdefault(report, CoursesController.describe_diagnostic(event))
+        if report not in self._diagnostic_fallbacks:
+            self._diagnostic_fallbacks[report] = CoursesController.describe_diagnostic(event)
         if event.lesson_url:
             self._diagnostic_reports[event.lesson_url] = report
         if event.lesson:
@@ -1329,94 +1443,34 @@ class CoursesScreen:
             return
         self._show_diagnostic_report(report, "Отчёт по уроку")
 
+    @trace_operation("lesson_report_open")
     def _show_diagnostic_report(self, path: Path, title: str) -> None:
+        ft.context.disable_auto_update()
+        if getattr(self, "_diagnostic_open", False):
+            return
+        if not hasattr(self, "_diagnostics"):
+            self._diagnostics = DiagnosticOverlay(self.page, self._close_diagnostic_report)
         _LOGGER.info("lesson_report_open_requested screen=%x", id(self))
-        report_notice = ""
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8-sig"))
-            formatted = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-            _LOGGER.warning(
-                "lesson_report_file_unavailable screen=%x reason=%s", id(self), type(error).__name__
-            )
-            formatted = getattr(self, "_diagnostic_fallbacks", {}).get(path, "")
-            if formatted:
-                report_notice = "Файл отчёта недоступен. Показаны сохранённые сведения об ошибке."
-            else:
-                report_notice = "Не удалось прочитать сохранённый файл отчёта."
-                formatted = json.dumps(
-                    {"error_code": "DIAGNOSTIC_REPORT_UNAVAILABLE", "summary": report_notice},
-                    ensure_ascii=False,
-                    indent=2,
-                )
-        if not getattr(self, "_diagnostic_open", False):
-            self._diagnostic_previous_content = self._overlay_card.content
-            self._diagnostic_previous_visible = self.overlay.visible
-            self._diagnostic_previous_height = self._overlay_card.height
-            self._diagnostic_open = True
-        in_completion = getattr(self, "_completion_flow", None) is not None
-        if in_completion:
-            self._overlay_card.height = 620
-        self._overlay_card.content = ft.Column(
-            expand=in_completion,
-            tight=not in_completion,
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            spacing=12,
-            controls=[
-                ft.Icon(ft.Icons.BUG_REPORT_OUTLINED, size=38, color=Color.YELLOW),
-                ft.Text(title, size=19, weight=ft.FontWeight.W_700, color=Color.TEXT),
-                ft.Text(
-                    report_notice,
-                    visible=bool(report_notice),
-                    size=11,
-                    color=Color.YELLOW,
-                    text_align=ft.TextAlign.CENTER,
-                ),
-                ft.Text(
-                    str(path),
-                    size=11,
-                    color=Color.TEXT_MUTED,
-                    selectable=True,
-                    text_align=ft.TextAlign.CENTER,
-                ),
-                ft.Container(
-                    width=None if in_completion else 520,
-                    height=None if in_completion else 360,
-                    expand=in_completion,
-                    padding=ft.Padding.all(12),
-                    border_radius=10,
-                    bgcolor="rgba(0,0,0,0.3)",
-                    border=ft.Border.all(1, "rgba(255,255,255,0.08)"),
-                    content=ft.Column(
-                        scroll=ft.ScrollMode.AUTO,
-                        controls=[
-                            ft.Text(
-                                formatted,
-                                size=11,
-                                color=Color.TEXT_SECONDARY,
-                                selectable=True,
-                                font_family="Consolas",
-                            )
-                        ],
-                    ),
-                ),
-                ft.OutlinedButton("Назад", on_click=self._close_diagnostic_report),
-            ],
-        )
-        self.overlay.visible = True
-        self.page.update()
+        cached = getattr(self, "_diagnostic_fallbacks", {}).get(path, "")
+        self._diagnostic_open = True
+        follow = getattr(self, "_download_follow", None)
+        if follow is not None:
+            follow.set_report_open(True)
+        self._diagnostics.show(path, title, cached)
+        _LOGGER.info("lesson_report_opened screen=%x cached=%s", id(self), bool(cached))
 
-        _LOGGER.info("lesson_report_opened screen=%x", id(self))
-
+    @trace_operation("lesson_report_back")
     def _close_diagnostic_report(self, _event=None) -> None:
+        ft.context.disable_auto_update()
         if not self._diagnostic_open:
             return
-        self._overlay_card.content = self._diagnostic_previous_content
-        self._overlay_card.height = getattr(self, "_diagnostic_previous_height", None)
-        self.overlay.visible = self._diagnostic_previous_visible
         self._diagnostic_open = False
-        self._diagnostic_previous_content = None
-        self.page.update()
+        self._diagnostics.close()
+        follow = getattr(self, "_download_follow", None)
+        if follow is not None:
+            follow.set_report_open(False)
+            if self.state.downloading:
+                follow.pause_for_interaction("report_back")
         _LOGGER.info("lesson_report_closed screen=%x", id(self))
 
     @staticmethod
@@ -1427,88 +1481,74 @@ class CoursesScreen:
             return f"{speed_bps / 1024:.0f} КБ/с"
         return f"{speed_bps:.0f} Б/с"
 
-    def _update_download_row(self, event: DownloadEvent) -> None:
+    def _update_download_row(self, event: DownloadEvent, *, update_header: bool = False) -> None:
         if not event.lesson_url:
             return
         row = self._download_rows.get(event.lesson_url)
         if row is None:
             return
 
+        motions: tuple[ft.Container, ...] = ()
+        controls: list[ft.Control] = [row.control]
         if event.type is DownloadEventType.LESSON_STARTED:
-            row.status_holder.content = ft.Icon(
-                ft.Icons.VIDEO_FILE_ROUNDED,
-                size=18,
-                color=Color.ACCENT_LIGHT,
+            previous = self._download_rows.get(getattr(self, "_active_lesson_url", None) or "")
+            if previous is not None and previous is not row and previous.set_active(False):
+                controls.append(previous.control)
+            row.set_active(True)
+            motions = row.set_status(
+                ft.Icons.VIDEO_FILE_ROUNDED, "Проверяем видео…", Color.ACCENT_LIGHT
             )
-            row.status_text.value = "Проверяем видео…"
-            row.status_text.color = Color.ACCENT_LIGHT
-        elif event.type is DownloadEventType.VIDEO_FOUND:
-            row.status_holder.content = ft.Icon(
-                ft.Icons.DOWNLOADING_ROUNDED,
-                size=18,
-                color=Color.ACCENT_LIGHT,
-            )
-            row.status_text.value = "Загрузка"
-            row.status_text.color = Color.ACCENT_LIGHT
+        elif event.type in {DownloadEventType.VIDEO_FOUND, DownloadEventType.PROGRESS}:
+            row.set_active(True)
+            motions = row.set_status(ft.Icons.DOWNLOADING_ROUNDED, "Загрузка", Color.ACCENT_LIGHT)
             row.progress.visible = True
             row.progress_text.visible = True
-        elif event.type is DownloadEventType.PROGRESS:
-            total = event.total or 0
-            current = event.current or 0
-            value = min(1.0, current / total) if total else 0
-            row.progress.value = value
-            row.progress.visible = True
-            row.progress_text.visible = True
-            row.progress_text.value = f"{round(value * 100)}%"
-            row.status_text.value = "Загрузка"
-            row.status_text.color = Color.ACCENT_LIGHT
+            if event.type is DownloadEventType.PROGRESS:
+                total = event.total or 0
+                current = event.current or 0
+                value = min(1.0, current / total) if total else 0
+                row.progress.value = value
+                row.progress_text.value = f"{round(value * 100)}%"
         elif event.type is DownloadEventType.LESSON_COMPLETED:
-            row.status_holder.content = ft.Icon(
+            row.set_active(False)
+            motions = row.set_status(
                 ft.Icons.CHECK_CIRCLE_ROUNDED,
-                size=18,
-                color=Color.GREEN,
+                f"Готово · {event.quality}" if event.quality else "Готово",
+                Color.GREEN,
             )
-            row.status_text.value = f"Готово · {event.quality}" if event.quality else "Готово"
-            row.status_text.color = Color.GREEN
             row.progress.visible = False
             row.progress_text.visible = False
         elif event.type is DownloadEventType.LESSON_SKIPPED:
-            row.status_holder.content = ft.Icon(
+            row.set_active(False)
+            motions = row.set_status(
                 ft.Icons.CHECK_CIRCLE_OUTLINE_ROUNDED,
-                size=18,
-                color=Color.GREEN,
+                f"Уже скачано · {event.quality}" if event.quality else "Уже скачано",
+                Color.GREEN,
             )
-            row.status_text.value = (
-                f"Уже скачано · {event.quality}" if event.quality else "Уже скачано"
-            )
-            row.status_text.color = Color.GREEN
             row.progress.visible = False
             row.progress_text.visible = False
         elif event.type is DownloadEventType.LESSON_NO_VIDEO:
-            row.status_holder.content = ft.Icon(
-                ft.Icons.CANCEL_ROUNDED,
-                size=18,
-                color=Color.RED,
-            )
-            row.status_text.value = "Видео не найдено"
-            row.status_text.color = Color.RED
+            row.set_active(False)
+            motions = row.set_status(ft.Icons.CANCEL_ROUNDED, "Видео не найдено", Color.RED)
             if event.diagnostic_report:
-                row.details_button.visible = True
+                motions += row.show_details()
             row.progress.visible = False
             row.progress_text.visible = False
         elif event.type in {DownloadEventType.LESSON_FAILED, DownloadEventType.ERROR}:
-            row.status_holder.content = ft.Icon(
-                ft.Icons.ERROR_ROUNDED,
-                size=18,
-                color=Color.YELLOW,
-            )
-            row.status_text.value = "Ошибка"
-            row.status_text.color = Color.YELLOW
+            row.set_active(False)
+            motions = row.set_status(ft.Icons.ERROR_ROUNDED, "Ошибка", Color.YELLOW)
             if event.diagnostic_report:
-                row.details_button.visible = True
+                motions += row.show_details()
             row.progress.visible = False
             row.progress_text.visible = False
-        self.page.update()
+        if not getattr(self, "_download_view_active", True):
+            return
+        if update_header:
+            controls.extend((self._download_title, self._speed_text))
+        self.page.update(*controls)
+        transitions = getattr(self, "_row_transitions", None)
+        if transitions is not None:
+            transitions.reveal(event.lesson_url, motions)
 
     def _finish_summary(self, summary: DownloadSummary, *, run_id: int | None = None) -> None:
         if run_id is not None and run_id != self._active_download_id:
@@ -1541,6 +1581,7 @@ class CoursesScreen:
             cancelled=bool(summary.cancelled),
         )
 
+    @trace_operation("download_finish")
     def _finish_download(
         self,
         message: str,
@@ -1554,6 +1595,9 @@ class CoursesScreen:
         if run_id is not None and run_id != self._active_download_id:
             return
         self.state.downloading = False
+        transitions = getattr(self, "_row_transitions", None)
+        if transitions is not None:
+            transitions.reset()
         _LOGGER.info(
             "download_finished screen=%x run=%s error=%s diagnostic_open=%s",
             id(self),
@@ -1562,6 +1606,10 @@ class CoursesScreen:
             getattr(self, "_diagnostic_open", False),
         )
         self.state.cancelling = False
+        auth_task = getattr(self, "_auth_overlay_task", None)
+        if auth_task is not None:
+            auth_task.cancel()
+            self._auth_overlay_task = None
         self._refresh_clear_actions()
         self._reset_download_follow()
         self._cancel_btn.disabled = False
@@ -1571,24 +1619,39 @@ class CoursesScreen:
             self._mark_unfinished_rows("Ошибка", Color.YELLOW, ft.Icons.ERROR_ROUNDED)
         self._show_completion_overlay(message, is_error, is_warning, failed, cancelled=cancelled)
 
+    @trace_operation("download_cancel")
     def _cancel_download(self, _event=None) -> None:
+        ft.context.disable_auto_update()
         if not self.state.downloading or self.state.cancelling:
             return
         self.state.cancelling = True
         self._cancel_btn.disabled = True
         self._cancel_btn.content = "Останавливаем…"
         self._download_title.value = "Останавливаем загрузку"
+        if self._preparing_download:
+            self._preparing_download = False
+            task, self._preparation_task = self._preparation_task, None
+            if task is not None:
+                task.cancel()
+            self._finish_summary(
+                DownloadSummary(
+                    total=self._preparation_total,
+                    downloaded=0,
+                    cancelled=self._preparation_total,
+                ),
+                run_id=self._active_download_id,
+            )
+            return
         self._controller.cancel()
-        self.page.update()
+        self.page.update(self._cancel_btn)
 
     def _mark_unfinished_rows(self, text: str, color: str, icon: ft.IconData) -> None:
         terminal_prefixes = ("Готово", "Уже скачано", "Видео не найдено", "Ошибка")
         for row in self._download_rows.values():
             if str(row.status_text.value).startswith(terminal_prefixes):
                 continue
-            row.status_holder.content = ft.Icon(icon, size=18, color=color)
-            row.status_text.value = text
-            row.status_text.color = color
+            row.set_active(False)
+            row.set_status(icon, text, color, animate=False)
             row.progress.visible = False
             row.progress_text.visible = False
 
@@ -1599,12 +1662,35 @@ class CoursesScreen:
         if getattr(self, "_disposed", False):
             return
         self._disposed = True
+        preparation = getattr(self, "_preparation_task", None)
+        if preparation is not None:
+            preparation.cancel()
+            self._preparation_task = None
+        transition = getattr(self, "_overlay_transition", None)
+        if transition is not None:
+            transition.dispose()
+        row_transitions = getattr(self, "_row_transitions", None)
+        if row_transitions is not None:
+            row_transitions.dispose()
+        preparation_reveal = getattr(self, "_preparation_reveal", None)
+        if preparation_reveal is not None:
+            preparation_reveal.dispose()
         callbacks = getattr(self, "_ui_callbacks", None)
         if callbacks is not None:
             callbacks.close()
+        diagnostics = getattr(self, "_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.dispose()
+        auth_task = getattr(self, "_auth_overlay_task", None)
+        if auth_task is not None:
+            auth_task.cancel()
+            self._auth_overlay_task = None
         _LOGGER.info("courses_screen_disposed screen=%x", id(self))
+        follow = getattr(self, "_download_follow", None)
+        if follow is not None:
+            follow.dispose()
         self._reset_download_follow()
-        if self.state.downloading:
+        if self.state.downloading and not getattr(self, "_preparing_download", False):
             self._controller.cancel()
 
     def _show_completion_overlay(
@@ -1616,8 +1702,7 @@ class CoursesScreen:
         *,
         cancelled: bool = False,
     ) -> None:
-        self._diagnostic_open = False
-        self._diagnostic_previous_content = None
+        self._download_view_active = False
         self._overlay_card.opacity = 1
         self._overlay_card.offset = ft.Offset(0, 0)
         detail_titles = list(
@@ -1634,14 +1719,14 @@ class CoursesScreen:
         self._completion_flow = CompletionFlow(
             CompletionResult(message, is_error, is_warning, cancelled),
             self._overlay_card,
-            on_change=self.page.update,
+            on_change=self._update_overlay,
             on_close=self._close_completion_overlay,
             on_github=self._open_github,
             on_contact=self._open_contact,
             failed_details=self._build_failed_lessons(detail_titles) if detail_titles else None,
         )
         self.overlay.visible = True
-        self.page.update()
+        self._update_overlay()
 
     def _build_failed_lessons(self, failed: list[str]) -> ft.Container:
         rows: list[ft.Control] = []
@@ -1702,15 +1787,16 @@ class CoursesScreen:
     async def _open_contact(self, _event=None) -> None:
         await self.page.launch_url(_CONTACT_URL)
 
+    @trace_operation("completion_close")
     def _close_completion_overlay(self, _event=None) -> None:
+        ft.context.disable_auto_update()
         if self.state.downloading or self.state.cancelling:
             return
         flow = getattr(self, "_completion_flow", None)
         if flow is None or flow.state.step in {CompletionStep.RESULT, CompletionStep.DETAILS}:
             return
-        self.overlay.visible = False
+        self._overlay_transition.close()
         _LOGGER.info("completion_overlay_closed screen=%x", id(self))
-        self.page.update()
 
     def _show_snack(self, message: str, is_error: bool = False):
         bg = "#1A0A0A" if is_error else "#0A1A15"

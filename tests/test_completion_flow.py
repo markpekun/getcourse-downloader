@@ -10,6 +10,7 @@ from getcourse_downloader.domain.models import DownloadSummary
 from getcourse_downloader.presentation.flet.screens.courses import view as courses_view
 from getcourse_downloader.presentation.flet.screens.courses.state import CoursesViewState
 from getcourse_downloader.presentation.flet.screens.courses.view import CoursesScreen
+from getcourse_downloader.presentation.flet.transitions import OverlayTransition
 
 
 def _walk(control):
@@ -26,7 +27,13 @@ def _walk(control):
 
 
 def _texts(screen):
-    return [c.value for c in _walk(screen._overlay_card.content) if isinstance(c, ft.Text)]
+    diagnostics = getattr(screen, "_diagnostics", None)
+    content = (
+        diagnostics.card.content
+        if diagnostics is not None and diagnostics.control.visible
+        else screen._overlay_card.content
+    )
+    return [c.value for c in _walk(content) if isinstance(c, ft.Text)]
 
 
 def _content(screen):
@@ -45,10 +52,17 @@ def _screen():
     async def launch_url(url):
         opened.append(url)
 
-    screen.page = SimpleNamespace(update=lambda: None, launch_url=launch_url)
+    screen.page = SimpleNamespace(
+        update=lambda *_: None,
+        launch_url=launch_url,
+        run_task=lambda handler, *args: asyncio.run(handler(*args)),
+    )
     screen.state = CoursesViewState(save_path="D:/demo")
     screen.overlay = ft.Container(visible=False, content=ft.Container())
     screen._overlay_card = ft.Container(width=600, padding=24)
+    screen._overlay_transition = OverlayTransition(
+        screen.page, screen.overlay, screen._overlay_card
+    )
     screen._diagnostic_reports_by_title = {}
     return screen, opened
 
@@ -224,11 +238,11 @@ def test_failed_lesson_diagnostic_returns_to_same_result(tmp_path, report_state)
     details_content = _content(screen)
     row = next(c for c in _walk(original) if isinstance(c, ft.Container) and c.on_click)
     row.on_click(None)
-    assert screen._overlay_card.content is not original
+    assert screen._overlay_card.content is original
+    assert screen._diagnostics.control.visible
     assert any("HTTP_403" in text for text in _texts(screen))
     assert all("secret" not in text for text in _texts(screen))
-    if report_state != "valid":
-        assert any("playlist" in text for text in _texts(screen))
+    assert any("playlist" in text for text in _texts(screen))
     assert not any(c.key == "completion-next" for c in _walk(screen._overlay_card.content))
     screen._close_diagnostic_report()
     assert screen._overlay_card.content is original
@@ -237,6 +251,32 @@ def test_failed_lesson_diagnostic_returns_to_same_result(tmp_path, report_state)
     _action(screen, "completion-result-back").on_click(None)
     assert "Ошибки: 1" in _texts(screen)
     assert any(c.key == "completion-next" for c in _walk(screen._overlay_card.content))
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_report_back_shows_latest_result_when_download_finishes(tmp_path, cancelled):
+    screen, _ = _screen()
+    screen._cancel_btn = ft.OutlinedButton("Отмена")
+    screen._speed_text = ft.Text()
+    screen._download_rows = {}
+    screen._reset_download_follow = lambda: None
+    screen.state.downloading = True
+    report = tmp_path / "lesson.json"
+    screen._diagnostic_fallbacks = {report: '{"error_code":"LESSON_ACCESS_DENIED"}'}
+    screen._show_diagnostic_report(report, "Отчёт по уроку")
+
+    screen._finish_summary(
+        DownloadSummary(total=2, downloaded=0 if cancelled else 2, cancelled=2 if cancelled else 0)
+    )
+
+    assert screen._diagnostics.control.visible
+    assert screen._diagnostic_open
+    assert not screen.state.downloading
+    screen._close_diagnostic_report()
+    assert not screen._diagnostics.control.visible
+    assert screen.overlay.visible
+    expected = "Загрузка отменена" if cancelled else "Готово! Видео скачаны"
+    assert expected in _texts(screen)
 
 
 def test_many_failures_live_in_separate_scroll_area_without_moving_summary():

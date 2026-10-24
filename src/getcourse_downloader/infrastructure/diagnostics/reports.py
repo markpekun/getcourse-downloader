@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -35,6 +36,11 @@ def _sanitize_text(value: str) -> str:
 
 class DownloadDiagnostics:
     """Writes one sanitized JSON report per failed lesson and download run."""
+
+    @staticmethod
+    def read(path: Path) -> str:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
 
     def __init__(self, data_directory: Path, *, app_version: str = "") -> None:
         self._root = data_directory / "diagnostics"

@@ -1,6 +1,6 @@
 import asyncio
-import concurrent.futures
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +14,9 @@ from getcourse_downloader.presentation.flet.screens.courses.components import (
     folder_badge_text,
     iter_course_lessons,
     selected_course_lessons,
+)
+from getcourse_downloader.presentation.flet.screens.courses.download_follow import (
+    DownloadListFollow,
 )
 from getcourse_downloader.presentation.flet.screens.courses.view import CoursesScreen
 from getcourse_downloader.presentation.flet.theme import Color
@@ -126,11 +129,18 @@ def test_update_download_title_page_then_waiting():
     assert cs._download_title.value == "Получение запроса"
 
 
+def _report_page():
+    return SimpleNamespace(
+        update=lambda *_: None,
+        run_task=lambda handler, *args: asyncio.run(handler(*args)),
+    )
+
+
 class _FakePage:
     def __init__(self):
         self.updates = 0
 
-    def update(self):
+    def update(self, *_controls):
         self.updates += 1
 
 
@@ -219,12 +229,23 @@ def test_active_download_overlay_has_no_logs_action():
     screen._diagnostic_open = False
     screen._diagnostic_previous_content = None
     screen._auth_overlay_task = None
+    screen._download_view_active = False
     screen._download_title = ft.Text("Подготовка")
     screen._download_rows_container = ft.Container()
     screen._continue_btn = ft.OutlinedButton("Продолжить")
     screen._overlay_logs_button = ft.OutlinedButton("Логи")
     screen._cancel_btn = ft.OutlinedButton("Отмена")
     screen._overlay_card = ft.Container()
+    screen._download_overlay_content = ft.Column(
+        controls=[
+            screen._download_title,
+            screen._download_rows_container,
+            screen._continue_btn,
+            screen._cancel_btn,
+        ]
+    )
+    screen._download_follow = SimpleNamespace(refresh=lambda: None)
+    screen.overlay = ft.Container(content=screen._overlay_card)
 
     screen._switch_overlay_to_download()
 
@@ -435,7 +456,7 @@ def test_failed_download_row_exposes_the_individual_diagnostic_report():
     opened: list[str] = []
     lesson_row = build_download_lesson_row(item, on_details=lambda: opened.append("opened"))
     screen = CoursesScreen.__new__(CoursesScreen)
-    screen.page = SimpleNamespace(update=lambda: None)
+    screen.page = _report_page()
     screen._download_rows = {item.lesson.url: lesson_row}
 
     screen._update_download_row(
@@ -486,7 +507,7 @@ def test_no_video_row_exposes_its_diagnostic_report_without_relayout():
     item = SelectedLesson(("Курс",), Lesson("Урок", "https://school.example/lesson/1"))
     lesson_row = build_download_lesson_row(item, on_details=lambda: None)
     screen = CoursesScreen.__new__(CoursesScreen)
-    screen.page = SimpleNamespace(update=lambda: None)
+    screen.page = _report_page()
     screen._download_rows = {item.lesson.url: lesson_row}
 
     screen._update_download_row(
@@ -508,28 +529,28 @@ def test_diagnostic_report_viewport_fits_inside_overlay_card(tmp_path):
     path = tmp_path / "report.json"
     path.write_text(json.dumps({"error_code": "HTTP_403"}), encoding="utf-8")
     screen = CoursesScreen.__new__(CoursesScreen)
-    screen.page = SimpleNamespace(update=lambda: None)
+    screen.page = _report_page()
     screen.overlay = SimpleNamespace(visible=False)
     screen._overlay_card = ft.Container(width=600, padding=ft.Padding.all(24))
 
     screen._show_diagnostic_report(path, "Отчёт по уроку")
 
-    report_column = screen._overlay_card.content
+    report_column = screen._diagnostics.card.content
     viewport = next(
         control for control in report_column.controls if isinstance(control, ft.Container)
     )
     available_width = (
-        screen._overlay_card.width
-        - screen._overlay_card.padding.left
-        - screen._overlay_card.padding.right
+        screen._diagnostics.card.width
+        - screen._diagnostics.card.padding.left
+        - screen._diagnostics.card.padding.right
     )
     assert viewport.width <= available_width
-    assert screen.overlay.visible is True
+    assert screen._diagnostics.control.visible is True
 
 
 def test_completion_overlay_never_offers_a_general_diagnostic_report():
     screen = CoursesScreen.__new__(CoursesScreen)
-    screen.page = SimpleNamespace(update=lambda: None)
+    screen.page = _report_page()
     screen.overlay = SimpleNamespace(visible=False)
     screen._overlay_card = ft.Container()
     screen._last_run_report = Path("C:/reports/previous-run.json")
@@ -558,13 +579,16 @@ def test_closing_diagnostics_restores_active_download_controls(tmp_path):
     path = tmp_path / "lesson.json"
     path.write_text(json.dumps({"error_code": "HTTP_403"}), encoding="utf-8")
     screen = CoursesScreen.__new__(CoursesScreen)
-    screen.page = SimpleNamespace(update=lambda: None)
+    screen.state = SimpleNamespace(downloading=True)
+    screen._active_lesson_url = None
+    screen.page = _report_page()
     screen.overlay = SimpleNamespace(visible=True)
     original_controls = ft.Column(controls=[ft.Text("Загрузка"), ft.OutlinedButton("Отмена")])
     screen._overlay_card = ft.Container(content=original_controls)
 
     screen._show_diagnostic_report(path, "Отчёт по уроку")
-    report_controls = screen._overlay_card.content.controls
+    assert screen._overlay_card.content is original_controls
+    report_controls = screen._diagnostics.card.content.controls
     report_controls[-1].on_click(None)
 
     assert screen._overlay_card.content is original_controls
@@ -575,19 +599,20 @@ def test_closing_diagnostics_from_header_hides_only_the_report(tmp_path):
     path = tmp_path / "run.json"
     path.write_text(json.dumps({"failed_lessons": []}), encoding="utf-8")
     screen = CoursesScreen.__new__(CoursesScreen)
-    screen.page = SimpleNamespace(update=lambda: None)
+    screen.state = SimpleNamespace(downloading=False)
+    screen.page = _report_page()
     screen.overlay = SimpleNamespace(visible=False)
     previous_content = ft.Text("Предыдущий экран")
     screen._overlay_card = ft.Container(content=previous_content)
 
     screen._show_diagnostic_report(path, "Последний отчёт")
-    screen._overlay_card.content.controls[-1].on_click(None)
+    screen._diagnostics.card.content.controls[-1].on_click(None)
 
     assert screen._overlay_card.content is previous_content
     assert screen.overlay.visible is False
 
 
-def test_download_scroll_targets_lesson_and_ignores_detached_control():
+def test_download_follow_scrolls_to_latest_previous_lesson_and_ignores_detached_control():
     class Scrollable:
         def __init__(self, *, detached: bool = False):
             self.detached = detached
@@ -599,19 +624,44 @@ def test_download_scroll_targets_lesson_and_ignores_detached_control():
             self.calls.append(kwargs)
 
     async def scenario() -> list[dict[str, object]]:
-        screen = CoursesScreen.__new__(CoursesScreen)
+        class Page:
+            def run_task(self, handler, *args):
+                return asyncio.create_task(handler(*args))
+
         visible = Scrollable()
-        screen._download_rows_column = visible
-        await screen._scroll_download_to("https://school.example/lesson/7")
-        screen._download_rows_column = Scrollable(detached=True)
-        await screen._scroll_download_to("https://school.example/lesson/8")
+        follow = DownloadListFollow(
+            Page(),
+            visible,
+            can_follow=lambda: True,
+            target_for=lambda url: url,
+            target_index=lambda _url: 7,
+            screen_id=1,
+            logger=logging.getLogger("test"),
+            pause_seconds=0.01,
+        )
+        follow.follow("https://school.example/lesson/7")
+        await asyncio.sleep(0.02)
+        follow.dispose()
+        detached = DownloadListFollow(
+            Page(),
+            Scrollable(detached=True),
+            can_follow=lambda: True,
+            target_for=lambda url: url,
+            target_index=lambda _url: 8,
+            screen_id=1,
+            logger=logging.getLogger("test"),
+            pause_seconds=0.01,
+        )
+        detached.follow("https://school.example/lesson/8")
+        await asyncio.sleep(0.02)
+        detached.dispose()
         return visible.calls
 
     calls = asyncio.run(scenario())
 
     assert calls[0]["scroll_key"] == "https://school.example/lesson/7"
-    assert calls[0]["duration"] == 650
-    assert calls[0]["curve"] is ft.AnimationCurve.EASE_IN_OUT_CUBIC
+    assert calls[0]["duration"] == 350
+    assert calls[0]["curve"] is ft.AnimationCurve.EASE_OUT_CUBIC
 
 
 def test_download_scroll_keeps_previous_lesson_at_top():
@@ -633,23 +683,17 @@ def test_download_scroll_keeps_previous_lesson_at_top():
 
 
 def test_download_follow_pauses_on_manual_scroll_and_tracks_latest_lesson():
-    class Page:
-        def __init__(self):
-            self.handlers = []
-
-        def run_task(self, handler, *args):
-            self.handlers.append((handler, args))
-            return concurrent.futures.Future()
-
     screen = CoursesScreen.__new__(CoursesScreen)
-    screen.page = Page()
     screen.state = SimpleNamespace(downloading=True)
-    screen._download_follow_paused = False
-    screen._active_lesson_url = "https://school.example/lesson/1"
-    screen._download_scroll_task = concurrent.futures.Future()
-    screen._download_follow_resume_task = None
-    scheduled: list[str] = []
-    screen._schedule_download_scroll = scheduled.append
+    screen._preparing_download = False
+    screen._download_view_active = True
+    screen._disposed = False
+    pauses: list[str] = []
+    followed: list[str] = []
+    screen._download_follow = SimpleNamespace(
+        pause_for_interaction=pauses.append,
+        follow=followed.append,
+    )
 
     screen._on_download_rows_scroll(
         SimpleNamespace(
@@ -657,48 +701,41 @@ def test_download_follow_pauses_on_manual_scroll_and_tracks_latest_lesson():
             direction=ft.ScrollDirection.REVERSE,
         )
     )
-    first_resume_task = screen._download_follow_resume_task
-    screen._on_download_rows_scroll(
-        SimpleNamespace(
-            event_type=ft.ScrollType.USER,
-            direction=ft.ScrollDirection.IDLE,
-        )
-    )
     screen._follow_download_lesson("https://school.example/lesson/2")
 
-    assert screen._download_follow_paused is True
-    assert screen._download_scroll_task.cancelled() is True
     assert screen._active_lesson_url == "https://school.example/lesson/2"
-    assert scheduled == []
-    assert first_resume_task.cancelled() is True
-    assert len(screen.page.handlers) == 2
-    assert screen.page.handlers[0][0] == screen._resume_download_follow
+    assert pauses == ["scroll"]
+    assert followed == ["https://school.example/lesson/2"]
 
 
-def test_download_follow_resumes_at_active_lesson_after_pause(monkeypatch):
-    from getcourse_downloader.presentation.flet.screens.courses import view as view_module
+def test_download_follow_resumes_at_latest_lesson_after_the_interaction_pause():
+    class Page:
+        def run_task(self, handler, *args):
+            return asyncio.create_task(handler(*args))
 
-    async def scenario() -> tuple[bool, list[str]]:
-        screen = CoursesScreen.__new__(CoursesScreen)
-        screen.state = SimpleNamespace(downloading=True)
-        screen._download_follow_resume_task = concurrent.futures.Future()
-        screen._download_follow_paused = True
-        screen._active_lesson_url = "https://school.example/lesson/9"
-        screen._download_rows = {
-            "https://school.example/lesson/8": object(),
-            "https://school.example/lesson/9": object(),
-        }
-        calls: list[str] = []
+    class Scrollable:
+        def __init__(self):
+            self.calls: list[str] = []
 
-        async def scroll(lesson_url: str) -> None:
-            calls.append(lesson_url)
+        async def scroll_to(self, **kwargs):
+            self.calls.append(kwargs["scroll_key"])
 
-        screen._scroll_download_to = scroll
-        await screen._resume_download_follow()
-        return screen._download_follow_paused, calls
+    async def scenario() -> list[str]:
+        scrollable = Scrollable()
+        follow = DownloadListFollow(
+            Page(),
+            scrollable,
+            can_follow=lambda: True,
+            target_for=lambda url: "https://school.example/lesson/8" if url.endswith("9") else url,
+            target_index=lambda _url: 8,
+            screen_id=1,
+            logger=logging.getLogger("test"),
+            pause_seconds=0.01,
+        )
+        follow.pause_for_interaction("scroll")
+        follow.follow("https://school.example/lesson/9")
+        await asyncio.sleep(0.04)
+        follow.dispose()
+        return scrollable.calls
 
-    monkeypatch.setattr(view_module, "_DOWNLOAD_FOLLOW_PAUSE_SECONDS", 0)
-    paused, calls = asyncio.run(scenario())
-
-    assert paused is False
-    assert calls == ["https://school.example/lesson/8"]
+    assert asyncio.run(scenario()) == ["https://school.example/lesson/8"]

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from typing import Any
 
 import flet as ft
 
 from getcourse_downloader.bootstrap import AppContainer, build_container
+from getcourse_downloader.infrastructure.diagnostics.ui_lifecycle import (
+    flush_ui_lifecycle_logging,
+    trace_operation,
+)
 from getcourse_downloader.presentation.flet.screens.courses.controller import CoursesController
 from getcourse_downloader.presentation.flet.screens.courses.view import CoursesScreen
 from getcourse_downloader.presentation.flet.screens.start.controller import StartController
@@ -37,25 +42,67 @@ class App:
         page.window.on_event = self._on_window_event
         page.on_close = self._on_page_closed
         page.on_disconnect = self._on_page_closed
+        page.on_error = self._on_page_error
+        page.on_app_lifecycle_state_change = self._on_observation_event
+        page.on_resize = self._on_observation_event
+        page.on_platform_brightness_change = self._on_observation_event
+
+    def _on_observation_event(self, event) -> None:
+        """System observations do not change controls, so never patch the whole Page."""
+        ft.context.disable_auto_update()
+        _LOGGER.debug(
+            "page_observation app=%x event=%s",
+            id(self),
+            type(event).__name__,
+        )
+
+    def _on_page_error(self, event) -> None:
+        ft.context.disable_auto_update()
+        message = str(getattr(event, "data", ""))
+        kind = next(
+            (
+                name
+                for name in (
+                    "RangeError",
+                    "StateError",
+                    "AssertionError",
+                    "TypeError",
+                    "ValueError",
+                )
+                if name in message
+            ),
+            "unknown",
+        )
+        fingerprint = hashlib.sha256(message.encode("utf-8")).hexdigest()[:12]
+        _LOGGER.error(
+            "page_client_error app=%x kind=%s fingerprint=%s length=%s",
+            id(self),
+            kind,
+            fingerprint,
+            len(message),
+        )
 
     async def _dispose_screen(self, *, wait: bool = False) -> None:
         screen = self._screen
         self._screen = None
         if screen is None:
             return
-        dispose = getattr(screen, "dispose", None)
-        if dispose:
-            dispose()
-        shutdown = getattr(screen, "shutdown", None)
-        if wait and shutdown:
-            await asyncio.to_thread(shutdown, 6.0)
+        with trace_operation("screen_dispose", app=id(self), screen=id(screen), wait=wait):
+            dispose = getattr(screen, "dispose", None)
+            if dispose:
+                dispose()
+            shutdown = getattr(screen, "shutdown", None)
+            if wait and shutdown:
+                await asyncio.to_thread(shutdown, 6.0)
 
     async def _on_window_event(self, event) -> None:
+        ft.context.disable_auto_update()
         if event.type != ft.WindowEventType.CLOSE or self._closing:
             return
         _LOGGER.info("window_close_requested app=%x", id(self))
         self._closing = True
         await self._dispose_screen(wait=True)
+        await asyncio.to_thread(flush_ui_lifecycle_logging)
         self.page.window.prevent_close = False
         await self.page.window.close()
 
@@ -66,6 +113,7 @@ class App:
             return
         self._closing = True
         await self._dispose_screen(wait=True)
+        await asyncio.to_thread(flush_ui_lifecycle_logging)
 
     async def show_initial_screen(self) -> None:
         if self.container.courses.has_courses():
@@ -85,8 +133,9 @@ class App:
             self.container.download_lessons,
             self.container.authorization,
         )
-        self._screen = CoursesScreen(self.page, controller, self.show_start)
-        self.page.add(self._screen.view)
+        with trace_operation("courses_screen_build", app=id(self)):
+            self._screen = CoursesScreen(self.page, controller, self.show_start)
+            self.page.add(self._screen.view)
         await self.page.window.center()
         self.page.update()
 
@@ -97,8 +146,9 @@ class App:
         self.page.window.width = _START_WIN_W
         self.page.window.height = _START_WIN_H
         controller = StartController(self.container.discover_courses)
-        self._screen = StartScreen(self.page, controller, self.show_courses)
-        self.page.add(self._screen.view)
+        with trace_operation("start_screen_build", app=id(self)):
+            self._screen = StartScreen(self.page, controller, self.show_courses)
+            self.page.add(self._screen.view)
         await self.page.window.center()
         self.page.update()
 

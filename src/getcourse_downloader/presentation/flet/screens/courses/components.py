@@ -17,7 +17,7 @@ class CourseTreeView:
     folder_badges: dict[str, ft.Text]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class DownloadLessonRow:
     control: ft.Container
     status_holder: ft.Container
@@ -25,6 +25,102 @@ class DownloadLessonRow:
     details_button: ft.Container
     progress: ft.ProgressBar
     progress_text: ft.Text
+    icon_switcher: ft.AnimatedSwitcher
+    status_switcher: ft.AnimatedSwitcher
+    details_motion: ft.Container
+    active: bool = False
+    _revision: int = 0
+
+    def set_active(self, active: bool) -> bool:
+        if active == self.active:
+            return False
+        self.active = active
+        self.control.bgcolor = ft.Colors.with_opacity(
+            0.12 if active else 0.03, Color.ACCENT if active else ft.Colors.WHITE
+        )
+        self.control.border = ft.Border.all(
+            1,
+            ft.Colors.with_opacity(0.24, Color.ACCENT_LIGHT) if active else ft.Colors.TRANSPARENT,
+        )
+        return True
+
+    def set_status(
+        self, icon: ft.IconData, text: str, color: str, *, animate: bool = True
+    ) -> tuple[ft.Container, ...]:
+        previous_icon = self.status_holder.content
+        if (
+            isinstance(previous_icon, ft.Icon)
+            and previous_icon.icon == icon
+            and self.status_text.value == text
+            and self.status_text.color == color
+        ):
+            return ()
+        if not animate:
+            self.status_holder.content = ft.Icon(icon, size=18, color=color)
+            self.status_text.value, self.status_text.color = text, color
+            return ()
+        self._revision += 1
+        self.status_holder = _row_motion(
+            ft.Icon(icon, size=18, color=color),
+            key=f"icon-{self._revision}",
+            width=24,
+            scale=0.9,
+        )
+        self.status_text = _download_status_text(text, color)
+        status_motion = _row_motion(
+            self.status_text, key=f"status-{self._revision}", width=112, scale=0.98
+        )
+        self.icon_switcher.content = self.status_holder
+        self.status_switcher.content = status_motion
+        return self.status_holder, status_motion
+
+    def show_details(self) -> tuple[ft.Container, ...]:
+        if self.details_button.visible:
+            return ()
+        self.details_button.visible = True
+        self.details_motion.ignore_interactions = False
+        return (self.details_motion,)
+
+
+def _download_status_text(text: str, color: str) -> ft.Text:
+    return ft.Text(
+        text,
+        size=11,
+        color=color,
+        width=112,
+        max_lines=1,
+        overflow=ft.TextOverflow.ELLIPSIS,
+        text_align=ft.TextAlign.RIGHT,
+    )
+
+
+def _row_motion(
+    content: ft.Control, *, key: str | None = None, width: int, scale: float
+) -> ft.Container:
+    return ft.Container(
+        key=key,
+        content=content,
+        width=width,
+        height=24,
+        alignment=ft.Alignment.CENTER,
+        scale=scale,
+        offset=ft.Offset(0, 0.1),
+        animate_scale=ft.Animation(220, ft.AnimationCurve.EASE_OUT_BACK),
+        animate_offset=ft.Animation(220, ft.AnimationCurve.EASE_OUT_BACK),
+    )
+
+
+def _status_switcher(content: ft.Control, width: int) -> ft.AnimatedSwitcher:
+    return ft.AnimatedSwitcher(
+        content=content,
+        width=width,
+        height=24,
+        duration=200,
+        reverse_duration=180,
+        switch_in_curve=ft.AnimationCurve.EASE_OUT_CUBIC,
+        switch_out_curve=ft.AnimationCurve.EASE_IN_CUBIC,
+        transition=ft.AnimatedSwitcherTransition.FADE,
+    )
 
 
 def iter_course_lessons(
@@ -277,20 +373,14 @@ def build_download_lesson_row(
         alignment=ft.Alignment(0, 0),
         content=ft.Icon(ft.Icons.SCHEDULE_ROUNDED, size=17, color=Color.TEXT_MUTED),
     )
-    status_text = ft.Text(
-        "Ожидание",
-        size=11,
-        color=Color.TEXT_MUTED,
-        width=112,
-        max_lines=1,
-        overflow=ft.TextOverflow.ELLIPSIS,
-        text_align=ft.TextAlign.RIGHT,
-    )
+    status_text = _download_status_text("Ожидание", Color.TEXT_MUTED)
+    icon_switcher = _status_switcher(status_holder, 24)
+    status_switcher = _status_switcher(status_text, 112)
     details_button = ft.Container(
         visible=False,
         padding=ft.Padding.symmetric(horizontal=6, vertical=3),
         border_radius=6,
-        bgcolor="rgba(124,58,237,0.18)",
+        bgcolor=ft.Colors.with_opacity(0.18, Color.ACCENT),
         ink=on_details is not None,
         on_click=(lambda _event: on_details()) if on_details is not None else None,
         content=ft.Text(
@@ -300,6 +390,10 @@ def build_download_lesson_row(
             weight=ft.FontWeight.W_600,
         ),
     )
+    details_motion = _row_motion(details_button, width=76, scale=0.96)
+    details_motion.opacity = 0
+    details_motion.ignore_interactions = True
+    details_motion.animate_opacity = ft.Animation(200, ft.AnimationCurve.EASE_OUT_CUBIC)
     progress = ft.ProgressBar(
         value=0,
         bar_height=5,
@@ -319,16 +413,20 @@ def build_download_lesson_row(
     )
     control = ft.Container(
         key=ft.ScrollKey(item.lesson.url),  # type: ignore[call-arg]
+        height=66,
         padding=ft.Padding.symmetric(horizontal=10, vertical=8),
         border_radius=9,
-        bgcolor="rgba(255,255,255,0.03)",
+        bgcolor=ft.Colors.with_opacity(0.03, ft.Colors.WHITE),
+        border=ft.Border.all(1, ft.Colors.TRANSPARENT),
+        animate=ft.Animation(220, ft.AnimationCurve.EASE_OUT_CUBIC),
         content=ft.Column(
-            spacing=5,
+            spacing=4,
             controls=[
                 ft.Row(
+                    height=30,
                     spacing=8,
                     controls=[
-                        status_holder,
+                        icon_switcher,
                         ft.Column(
                             spacing=1,
                             expand=True,
@@ -349,11 +447,16 @@ def build_download_lesson_row(
                                 ),
                             ],
                         ),
-                        status_text,
-                        details_button,
+                        status_switcher,
+                        details_motion,
                     ],
                 ),
-                ft.Row(spacing=8, controls=[ft.Container(width=24), progress, progress_text]),
+                ft.Container(
+                    height=14,
+                    content=ft.Row(
+                        spacing=8, controls=[ft.Container(width=24), progress, progress_text]
+                    ),
+                ),
             ],
         ),
     )
@@ -364,4 +467,7 @@ def build_download_lesson_row(
         details_button,
         progress,
         progress_text,
+        icon_switcher,
+        status_switcher,
+        details_motion,
     )

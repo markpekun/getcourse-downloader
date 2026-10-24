@@ -24,12 +24,17 @@ from getcourse_downloader.domain.models import (
     VideoQuality,
 )
 from getcourse_downloader.infrastructure.diagnostics.reports import DownloadDiagnostics
+from getcourse_downloader.infrastructure.diagnostics.ui_lifecycle import trace_operation
 
 DownloadFinished = Callable[[DownloadSummary], None]
 DownloadFailed = Callable[[Exception], None]
 
 
 class CoursesController:
+    @staticmethod
+    async def load_diagnostic(path: Path) -> str:
+        return await asyncio.to_thread(DownloadDiagnostics.read, path)
+
     @staticmethod
     def describe_diagnostic(event: DownloadEvent) -> str:
         payload = DownloadDiagnostics.describe(event, app_version=__version__)
@@ -91,7 +96,8 @@ class CoursesController:
     ) -> None:
         def run() -> None:
             try:
-                summary = self._download_lessons.execute(request, on_event)
+                with trace_operation("download_execute", lessons=len(request.lessons)):
+                    summary = self._download_lessons.execute(request, on_event)
             except Exception as error:
                 on_failed(error)
             else:
@@ -99,11 +105,14 @@ class CoursesController:
 
         threading.Thread(target=run, name="download-worker-client", daemon=True).start()
 
+    @trace_operation("authentication_continue")
     def continue_authentication(self) -> None:
         self._download_lessons.continue_authentication()
 
+    @trace_operation("download_cancel_command")
     def cancel(self) -> None:
         self._download_lessons.cancel()
 
+    @trace_operation("download_controller_shutdown")
     def shutdown(self, timeout: float = 6.0) -> None:
         self._download_lessons.shutdown(timeout)

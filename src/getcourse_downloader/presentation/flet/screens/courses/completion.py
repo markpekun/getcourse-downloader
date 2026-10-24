@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Awaitable, Callable
 
 import flet as ft
@@ -8,6 +9,8 @@ from getcourse_downloader.presentation.flet.screens.courses.state import (
     CompletionViewState,
 )
 from getcourse_downloader.presentation.flet.theme import Color
+
+_LOGGER = logging.getLogger("getcourse_downloader.ui")
 
 
 class CompletionFlow:
@@ -442,6 +445,7 @@ class CompletionFlow:
         )
 
     def _show(self, content: ft.Control, step: CompletionStep) -> None:
+        _LOGGER.info("completion_step previous=%s target=%s", self.state.step.value, step.value)
         self.state.step = step
         content.key = f"completion-{step.value}"
         # An intrinsic starting height has no finite size to interpolate from.

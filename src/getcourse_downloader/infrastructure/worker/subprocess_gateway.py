@@ -3,7 +3,9 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import json
+import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -20,6 +22,77 @@ from getcourse_downloader.domain.events import DownloadEvent, DownloadEventType
 from getcourse_downloader.domain.models import DownloadRequest, DownloadSummary
 from getcourse_downloader.infrastructure.diagnostics.reports import DownloadDiagnostics
 from getcourse_downloader.infrastructure.platform.paths import AppPaths
+
+_LOGGER = logging.getLogger("getcourse_downloader.ui.worker")
+_SAFE_STAGES = frozenset(
+    {
+        "access",
+        "authentication",
+        "ffmpeg",
+        "lesson",
+        "network",
+        "player",
+        "playlist",
+        "quality",
+        "segments",
+        "summary",
+        "worker",
+    }
+)
+_SAFE_ERROR_CODES = frozenset(
+    [
+        "BROWSER_PROFILE_BUSY",
+        "BROWSER_PROFILE_RESET_FAILED",
+        "BROWSER_PROFILE_UNAVAILABLE",
+        "BROWSER_RESOURCES_MISSING",
+        "BROWSER_START_FAILED",
+        "CONNECTION_FAILED",
+        "DASH_STREAM_UNSUPPORTED",
+        "DNS_FAILED",
+        "DOWNLOAD_FAILED",
+        "DOWNLOAD_STALLED",
+        "DOWNLOADER_ERROR",
+        "EMPTY_PLAYLIST",
+        "EMPTY_SEGMENT",
+        "ENCRYPTED_PLAYLIST_UNSUPPORTED",
+        "EXTERNAL_SERVICE_ERROR",
+        "FFMPEG_FAILED",
+        "FFMPEG_VERSION_UNSUPPORTED",
+        "HLS_KEY_INVALID",
+        "HLS_STRUCTURE_INVALID",
+        "INVALID_CONFIGURATION",
+        "LESSON_ACCESS_DENIED",
+        "LESSON_PROCESSING_FAILED",
+        "NETWORK_TIMEOUT",
+        "PLAYER_ACCESS_DENIED",
+        "PLAYER_CONFIG_UNSUPPORTED",
+        "PLAYER_HTTP_ERROR",
+        "PLAYER_INVALID_RESPONSE",
+        "PLAYER_MASTER_INVALID",
+        "PLAYER_PREPARATION_TIMEOUT",
+        "PLAYER_REQUEST_FAILED",
+        "PLAYER_STREAMS_INCOMPLETE",
+        "PLAYER_VIDEO_NOT_READY",
+        "PLAYLIST_NOT_OBSERVED",
+        "PLAYLIST_REQUEST_FAILED",
+        "SEGMENT_REQUEST_FAILED",
+        "TLS_FAILED",
+        "UNKNOWN",
+        "VIDEO_CHECK_TIMEOUT",
+        "VIDEO_NOT_FOUND",
+    ]
+)
+_SAFE_HTTP_ERROR_CODE = re.compile(r"(?:HLS_KEY_)?HTTP_[1-5][0-9]{2}\Z")
+
+
+def _safe_error_code(code: str) -> str:
+    if not code:
+        return "none"
+    if code in _SAFE_ERROR_CODES or _SAFE_HTTP_ERROR_CODE.fullmatch(code):
+        return code
+    if code.startswith("HLS_KEY_") and code.removeprefix("HLS_KEY_") in _SAFE_ERROR_CODES:
+        return code
+    return "unknown"
 
 
 class _WindowsJobBasicLimitInformation(ctypes.Structure):
@@ -149,6 +222,14 @@ class SubprocessDownloadGateway:
         ]
 
     def run(self, request: DownloadRequest, on_event: EventHandler) -> DownloadSummary:
+        started_at = time.monotonic()
+        run_id = time.monotonic_ns()
+        _LOGGER.info(
+            "worker_run_started gateway=%x run=%x lesson_total=%s",
+            id(self),
+            run_id,
+            len(request.lessons),
+        )
         self._done.clear()
         request_file: Path | None = None
         event_file: Path | None = None
@@ -162,6 +243,9 @@ class SubprocessDownloadGateway:
         last_activity_at = time.monotonic()
         waiting_for_authentication = False
         active_lesson_url = ""
+        lesson_ordinals = {item.lesson.url: index for index, item in enumerate(request.lessons, 1)}
+        event_count, invalid_count, progress_sample_count = 0, 0, 0
+        last_progress_at = float("-inf")
         request_descriptor, request_name = tempfile.mkstemp(prefix="gcd-request-", suffix=".json")
         event_descriptor, event_name = tempfile.mkstemp(prefix="gcd-events-", suffix=".jsonl")
         command_descriptor, command_name = tempfile.mkstemp(prefix="gcd-commands-", suffix=".jsonl")
@@ -199,6 +283,13 @@ class SubprocessDownloadGateway:
                 creationflags=flags,
                 env=environment,
             )
+            _LOGGER.info(
+                "worker_process_started gateway=%x run=%x pid=%s startup_ms=%s",
+                id(self),
+                run_id,
+                process.pid,
+                round((time.monotonic() - started_at) * 1000),
+            )
             job = _WindowsProcessJob.create_for(process)
             with self._lock:
                 self._process = process
@@ -210,11 +301,54 @@ class SubprocessDownloadGateway:
             def consume(line: bytes) -> None:
                 nonlocal active_lesson_url, last_activity_at, summary
                 nonlocal waiting_for_authentication
+                nonlocal event_count, invalid_count, last_progress_at, progress_sample_count
                 try:
                     event = DownloadEvent.from_json(line.decode("utf-8"))
-                except (InvalidDataError, UnicodeDecodeError):
+                except (InvalidDataError, UnicodeDecodeError) as error:
+                    invalid_count += 1
+                    _LOGGER.warning(
+                        "worker_record_invalid gateway=%x run=%x error_type=%s count=%s",
+                        id(self),
+                        run_id,
+                        type(error).__name__,
+                        invalid_count,
+                    )
                     return
                 last_activity_at = time.monotonic()
+                event_count += 1
+                log_event = True
+                if event.type is DownloadEventType.PROGRESS:
+                    progress_sample_count += 1
+                    log_event = last_activity_at - last_progress_at >= 1.0
+                    if log_event:
+                        last_progress_at = last_activity_at
+                if log_event:
+                    level = (
+                        logging.DEBUG
+                        if event.type in {DownloadEventType.LOG, DownloadEventType.PROGRESS}
+                        else logging.INFO
+                    )
+                    _LOGGER.log(
+                        level,
+                        "worker_event gateway=%x run=%x type=%s stage=%s error_code=%s "
+                        "lesson_ordinal=%s event_count=%s progress_count=%s current=%s total=%s "
+                        "downloaded=%s already_present=%s no_video=%s failed=%s cancelled=%s",
+                        id(self),
+                        run_id,
+                        event.type.value,
+                        event.stage if event.stage in _SAFE_STAGES else "unknown",
+                        _safe_error_code(event.error_code),
+                        lesson_ordinals.get(event.lesson_url, 0),
+                        event_count,
+                        progress_sample_count,
+                        event.current,
+                        event.total,
+                        event.downloaded,
+                        event.already_present,
+                        event.no_video,
+                        event.failed_count,
+                        event.cancelled,
+                    )
                 if event.type is DownloadEventType.AUTH_REQUIRED:
                     waiting_for_authentication = True
                 elif event.type is DownloadEventType.AUTHENTICATED:
@@ -268,6 +402,13 @@ class SubprocessDownloadGateway:
                         and self._inactivity_timeout_seconds > 0
                         and time.monotonic() - last_activity_at >= self._inactivity_timeout_seconds
                     ):
+                        _LOGGER.warning(
+                            "worker_inactivity_timeout gateway=%x run=%x pid=%s idle_ms=%s",
+                            id(self),
+                            run_id,
+                            process.pid,
+                            round((time.monotonic() - last_activity_at) * 1000),
+                        )
                         self._terminate_process(process, job)
                         summary = self._stalled_summary(
                             request,
@@ -286,6 +427,14 @@ class SubprocessDownloadGateway:
                     f"Worker завершился без итогового события (код {return_code})"
                 )
             return summary
+        except BaseException as error:
+            _LOGGER.warning(
+                "worker_run_failed gateway=%x run=%x error_type=%s",
+                id(self),
+                run_id,
+                type(error).__name__,
+            )
+            raise
         finally:
             if process is not None and process.poll() is None:
                 self._terminate_process(process, job)
@@ -301,6 +450,19 @@ class SubprocessDownloadGateway:
                 self._command_file = None
                 self._cancel_requested = False
                 self._done.set()
+            _LOGGER.info(
+                "worker_run_finished gateway=%x run=%x pid=%s exit_code=%s duration_ms=%s "
+                "summary_received=%s event_count=%s invalid_count=%s progress_count=%s",
+                id(self),
+                run_id,
+                process.pid if process is not None else 0,
+                process.returncode if process is not None else None,
+                round((time.monotonic() - started_at) * 1000),
+                summary is not None,
+                event_count,
+                invalid_count,
+                progress_sample_count,
+            )
 
     def _stalled_summary(
         self,
@@ -391,6 +553,7 @@ class SubprocessDownloadGateway:
         )
 
     def _send_command(self, command: str) -> None:
+        _LOGGER.info("worker_command_queued gateway=%x command=%s", id(self), command)
         with self._lock:
             if command == "cancel":
                 self._cancel_requested = True
@@ -401,12 +564,31 @@ class SubprocessDownloadGateway:
         path = self._command_file
         process = self._process
         if path is None or process is None or process.poll() is not None:
+            _LOGGER.debug(
+                "worker_command_deferred gateway=%x command=%s process_available=%s",
+                id(self),
+                command,
+                process is not None,
+            )
             return
         try:
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"command": command}) + "\n")
                 stream.flush()
-        except OSError:
+            _LOGGER.info(
+                "worker_command_written gateway=%x pid=%s command=%s",
+                id(self),
+                process.pid,
+                command,
+            )
+        except OSError as error:
+            _LOGGER.warning(
+                "worker_command_write_failed gateway=%x pid=%s command=%s error_type=%s",
+                id(self),
+                process.pid,
+                command,
+                type(error).__name__,
+            )
             return
 
     def continue_authentication(self) -> None:
@@ -416,10 +598,23 @@ class SubprocessDownloadGateway:
         self._send_command("cancel")
 
     def shutdown(self, timeout: float = 6.0) -> None:
+        started_at = time.monotonic()
+        _LOGGER.info(
+            "worker_shutdown_requested gateway=%x active=%s timeout_ms=%s",
+            id(self),
+            not self._done.is_set(),
+            round(timeout * 1000),
+        )
         if self._done.is_set():
             return
         self.cancel()
         if self._done.wait(timeout):
+            _LOGGER.info(
+                "worker_shutdown_finished gateway=%x forced=%s duration_ms=%s",
+                id(self),
+                False,
+                round((time.monotonic() - started_at) * 1000),
+            )
             return
         with self._lock:
             process = self._process
@@ -427,12 +622,23 @@ class SubprocessDownloadGateway:
         if process is None or process.poll() is not None:
             return
         self._terminate_process(process, job)
-        self._done.wait(2)
+        completed = self._done.wait(2)
+        _LOGGER.info(
+            "worker_shutdown_finished gateway=%x forced=%s completed=%s duration_ms=%s",
+            id(self),
+            True,
+            completed,
+            round((time.monotonic() - started_at) * 1000),
+        )
 
     @staticmethod
     def _terminate_process(
         process: subprocess.Popen[str], job: _WindowsProcessJob | None = None
     ) -> None:
+        started_at = time.monotonic()
+        _LOGGER.warning(
+            "worker_force_termination pid=%s job_owned=%s", process.pid, job is not None
+        )
         if job is not None:
             job.close()
         if os.name == "nt":
@@ -448,5 +654,12 @@ class SubprocessDownloadGateway:
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
+            _LOGGER.warning("worker_force_termination_retry pid=%s", process.pid)
             process.kill()
             process.wait(timeout=2)
+        _LOGGER.info(
+            "worker_process_terminated pid=%s exit_code=%s duration_ms=%s",
+            process.pid,
+            process.returncode,
+            round((time.monotonic() - started_at) * 1000),
+        )
