@@ -161,22 +161,7 @@ class CoursesScreen:
             content=self._log_column,
         )
         self._download_rows: dict[str, DownloadLessonRow] = {}
-        self._download_rows_column = ft.Column(
-            spacing=5,
-            scroll=ft.ScrollMode.AUTO,
-            scroll_interval=100,
-            on_scroll=self._on_download_rows_scroll,
-        )
-        self._download_follow = DownloadListFollow(
-            page,
-            self._download_rows_column,
-            can_follow=self._can_follow_download_rows,
-            target_for=self._download_scroll_target,
-            target_index=self._download_target_index,
-            screen_id=id(self),
-            logger=_LOGGER,
-            pause_seconds=_DOWNLOAD_FOLLOW_PAUSE_SECONDS,
-        )
+        self._create_download_list()
         self._preparation_status = ft.Text(size=13, color=Color.TEXT_SECONDARY)
         self._preparation_cover = ft.Container(
             left=0,
@@ -196,6 +181,10 @@ class CoursesScreen:
             ),
         )
         self._preparation_reveal = PreparationReveal(page, self._preparation_cover)
+        self._download_rows_stack = ft.Stack(
+            fit=ft.StackFit.EXPAND,
+            controls=[self._download_rows_column, self._preparation_cover],
+        )
         self._download_rows_container = ft.Container(
             width=540,
             height=290,
@@ -204,10 +193,7 @@ class CoursesScreen:
             border=ft.Border.all(1, "rgba(255,255,255,0.06)"),
             padding=ft.Padding.all(10),
             on_tap_down=self._on_download_rows_interaction,
-            content=ft.Stack(
-                fit=ft.StackFit.EXPAND,
-                controls=[self._download_rows_column, self._preparation_cover],
-            ),
+            content=self._download_rows_stack,
         )
         self._continue_btn = ft.Container(
             visible=False,
@@ -1059,6 +1045,28 @@ class CoursesScreen:
             follow.reset()
         self._active_lesson_url = None
 
+    def _create_download_list(self) -> None:
+        follow = getattr(self, "_download_follow", None)
+        if follow is not None:
+            follow.dispose()
+        self._active_lesson_url = None
+        self._download_rows_column = ft.Column(
+            spacing=5,
+            scroll=ft.ScrollMode.AUTO,
+            scroll_interval=100,
+            on_scroll=self._on_download_rows_scroll,
+        )
+        self._download_follow = DownloadListFollow(
+            self.page,
+            self._download_rows_column,
+            can_follow=self._can_follow_download_rows,
+            target_for=self._download_scroll_target,
+            target_index=self._download_target_index,
+            screen_id=id(self),
+            logger=_LOGGER,
+            pause_seconds=_DOWNLOAD_FOLLOW_PAUSE_SECONDS,
+        )
+
     @staticmethod
     def _is_progress_line(text: str) -> bool:
         return "Сегменты:" in text or "Сегментов:" in text
@@ -1260,7 +1268,6 @@ class CoursesScreen:
             run_id,
             len(lessons_to_download),
         )
-        self._reset_download_follow()
         self._row_transitions.reset()
         self._cancel_btn.disabled = False
         self._cancel_btn.content = "Отмена"
@@ -1273,7 +1280,9 @@ class CoursesScreen:
         self._diagnostics.close(update=False)
         self._diagnostic_open = False
         self._download_rows.clear()
-        self._download_rows_column.controls.clear()
+        # A remounted list must not reuse Flet's snapshots from the previous queue.
+        self._create_download_list()
+        self._download_rows_stack.controls[0] = self._download_rows_column
         groups = [ft.Column(spacing=5) for _ in range(0, len(lessons_to_download), 24)]
         self._download_rows_column.controls.extend(groups)
         self._preparation_status.value = f"Подготовлено: 0 из {len(lessons_to_download)}"
