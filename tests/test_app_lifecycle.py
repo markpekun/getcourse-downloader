@@ -25,7 +25,7 @@ class _Window:
         self.prevent_close = False
         self.closed = False
 
-    async def close(self) -> None:
+    async def destroy(self) -> None:
         self.closed = True
 
 
@@ -321,7 +321,9 @@ def test_flet_scroll_and_repeated_report_back_do_not_refresh_the_whole_page(tmp_
         patched.clear()
         ft.context.enable_auto_update()
         await session.dispatch_event(back._i, "click", None)
-        await asyncio.sleep(0.16)
+        closing = screen._diagnostics._transition._task
+        assert closing is not None
+        await asyncio.wait_for(asyncio.wrap_future(closing), timeout=2.0)
         assert not screen._diagnostics.control.visible
         assert patched and all(control is screen._diagnostics.control for control in patched)
         patched.clear()

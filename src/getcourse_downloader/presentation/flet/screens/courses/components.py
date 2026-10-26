@@ -2,11 +2,57 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from math import pi
 
 import flet as ft
 
 from getcourse_downloader.domain.models import Course, Lesson, SelectedLesson
-from getcourse_downloader.presentation.flet.theme import Color, Gradient, Shadow
+from getcourse_downloader.presentation.flet.theme import Color, Glass
+
+
+def _clickable_row(
+    control: ft.Container,
+    tint: str,
+    callback: Callable[..., None],
+    *,
+    hover_surface: str | None = None,
+) -> ft.Container:
+    if control.padding is not None:
+        control.content = ft.Container(padding=control.padding, content=control.content)
+        control.padding = None
+    control.ink = True
+    control.ink_color = ft.Colors.with_opacity(0.1, tint)
+    control.on_click = callback
+    control.clip_behavior = ft.ClipBehavior.ANTI_ALIAS
+    if hover_surface is not None:
+        surface = control.bgcolor
+
+        def on_hover(event) -> None:
+            ft.context.disable_auto_update()
+            event.control.bgcolor = (
+                hover_surface if event.data is True or event.data == "true" else surface
+            )
+            event.control.update()
+
+        control.on_hover = on_hover
+        control.animate = ft.Animation(180, ft.AnimationCurve.EASE_OUT_CUBIC)
+    return control
+
+
+@dataclass(frozen=True, slots=True)
+class CourseFolderRow:
+    tile: ft.ExpansionTile
+    icon: ft.Icon
+    chevron: ft.Icon
+    checkbox: ft.Checkbox
+    badge: ft.Text
+    lesson_urls: frozenset[str]
+    lesson_checkboxes: tuple[ft.Checkbox, ...]
+    lesson_badges: tuple[ft.Text, ...]
+
+    def set_expanded(self, expanded: bool) -> None:
+        self.tile.expanded = expanded
+        self.chevron.rotate = pi / 2 if expanded else 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +61,7 @@ class CourseTreeView:
     lesson_checkboxes: dict[str, ft.Checkbox]
     folder_checkboxes: dict[str, ft.Checkbox]
     folder_badges: dict[str, ft.Text]
+    folder_rows: dict[str, CourseFolderRow]
 
 
 @dataclass(slots=True)
@@ -64,7 +111,7 @@ class DownloadLessonRow:
             ft.Icon(icon, size=18, color=color),
             key=f"icon-{self._revision}",
             width=24,
-            scale=0.9,
+            scale=0.97,
         )
         self.status_text = _download_status_text(text, color)
         status_motion = _row_motion(
@@ -104,9 +151,9 @@ def _row_motion(
         height=24,
         alignment=ft.Alignment.CENTER,
         scale=scale,
-        offset=ft.Offset(0, 0.1),
-        animate_scale=ft.Animation(220, ft.AnimationCurve.EASE_OUT_BACK),
-        animate_offset=ft.Animation(220, ft.AnimationCurve.EASE_OUT_BACK),
+        offset=ft.Offset(0, 0.06),
+        animate_scale=ft.Animation(260, ft.AnimationCurve.EASE_OUT_CUBIC),
+        animate_offset=ft.Animation(260, ft.AnimationCurve.EASE_OUT_CUBIC),
     )
 
 
@@ -115,7 +162,7 @@ def _status_switcher(content: ft.Control, width: int) -> ft.AnimatedSwitcher:
         content=content,
         width=width,
         height=24,
-        duration=200,
+        duration=240,
         reverse_duration=180,
         switch_in_curve=ft.AnimationCurve.EASE_OUT_CUBIC,
         switch_out_curve=ft.AnimationCurve.EASE_IN_CUBIC,
@@ -186,13 +233,14 @@ def build_course_tree(
     selected_urls: set[str],
     expanded_urls: set[str],
     query: str,
-    on_folder_toggle: Callable[[str], None],
+    on_folder_toggle: Callable[[str, bool], None],
     on_folder_selection: Callable[[Course, bool], None],
     on_lesson_selection: Callable[[Lesson, bool], None],
 ) -> CourseTreeView:
     lesson_checkboxes: dict[str, ft.Checkbox] = {}
     folder_checkboxes: dict[str, ft.Checkbox] = {}
     folder_badges: dict[str, ft.Text] = {}
+    folder_rows: dict[str, CourseFolderRow] = {}
     normalized_query = query.strip().casefold()
 
     def build_node(node: Course, depth: int, ancestor_match: bool = False) -> ft.Control | None:
@@ -210,15 +258,33 @@ def build_course_tree(
         selected_count = len(lesson_urls & selected_urls)
         total = len(lesson_urls)
         folder_value = bool(total and selected_count == total)
+        if depth == 0:
+            kind, kind_icon, tint = "Курс", ft.Icons.LIBRARY_BOOKS_ROUNDED, accent
+            surface = Glass.COURSE_SURFACE
+            hover_surface = Glass.COURSE_HOVER
+        elif node.children:
+            kind, kind_icon, tint = "Раздел", ft.Icons.FOLDER_COPY_ROUNDED, Glass.SECTION
+            surface = Glass.SECTION_SURFACE
+            hover_surface = Glass.SECTION_HOVER
+        else:
+            kind, kind_icon, tint = "Модуль", ft.Icons.FOLDER_ROUNDED, Glass.FOLDER
+            surface = Glass.MODULE_SURFACE
+            hover_surface = Glass.MODULE_HOVER
 
         folder_checkbox = ft.Checkbox(
             value=folder_value,
             tristate=False,
             disabled=not total,
-            active_color=accent,
+            active_color=Glass.CHECKED,
             check_color=Color.TEXT,
-            on_change=lambda _event, current=node, choose=selected_count < total: (
-                on_folder_selection(current, choose)
+            width=30,
+            height=30,
+            scale=1.1,
+            visual_density=ft.VisualDensity.COMPACT,
+            shape=ft.RoundedRectangleBorder(radius=3),
+            border_side=ft.BorderSide(1.4, "#98A2C1"),
+            on_change=lambda event, current=node: on_folder_selection(
+                current, event.control.value is True
             ),
             tooltip="Выбрать все уроки в папке",
         )
@@ -227,7 +293,7 @@ def build_course_tree(
             folder_badge_text(selected_count, total),
             size=12,
             weight=ft.FontWeight.W_600,
-            color=accent,
+            color=tint,
         )
         folder_badges[node.url] = badge
 
@@ -235,39 +301,65 @@ def build_course_tree(
         show_children = is_expanded or bool(normalized_query)
         has_content = bool(node.lessons or node.children)
         chevron = ft.Icon(
-            ft.Icons.EXPAND_MORE_ROUNDED if show_children else ft.Icons.CHEVRON_RIGHT_ROUNDED,
+            ft.Icons.CHEVRON_RIGHT_ROUNDED,
             size=21 if depth == 0 else 18,
-            color=Color.TEXT_SECONDARY,
+            color=tint,
+            rotate=pi / 2 if show_children else 0,
+            animate_rotation=ft.Animation(280, ft.AnimationCurve.EASE_IN_OUT_CUBIC),
+        )
+        folder_icon = ft.Icon(
+            kind_icon,
+            size=23 if depth == 0 else 21,
+            color=tint,
+            tooltip=kind,
         )
 
+        def on_header_hover(event) -> None:
+            ft.context.disable_auto_update()
+            event.control.bgcolor = (
+                hover_surface if event.data is True or event.data == "true" else surface
+            )
+            event.control.update()
+
+        def on_header_click(_event) -> None:
+            on_folder_toggle(node.url, not bool(tile.expanded))
+
         header = ft.Container(
+            height=56 if depth == 0 else 48,
             padding=ft.Padding.symmetric(
-                horizontal=18 if depth == 0 else 8,
-                vertical=12 if depth == 0 else 7,
+                horizontal=20 if depth == 0 else 12,
+                vertical=8 if depth == 0 else 0,
             ),
-            border_radius=12 if depth else 0,
-            ink=has_content,
-            on_click=(lambda _, url=node.url: on_folder_toggle(url)) if has_content else None,
+            border_radius=12 if depth == 0 else 8,
+            bgcolor=surface,
+            animate=ft.Animation(180, ft.AnimationCurve.EASE_OUT_CUBIC),
+            on_hover=on_header_hover,
+            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+            shadow=ft.BoxShadow(
+                blur_radius=8,
+                color="#40000000",
+                offset=ft.Offset(0, 2),
+            )
+            if depth == 0
+            else None,
             content=ft.Row(
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 controls=[
                     ft.Row(
-                        spacing=9,
+                        spacing=12,
                         expand=True,
                         controls=[
                             folder_checkbox,
-                            ft.Icon(
-                                ft.Icons.FOLDER_OPEN_ROUNDED
-                                if show_children
-                                else ft.Icons.FOLDER_ROUNDED,
-                                size=21 if depth == 0 else 18,
-                                color=accent if depth == 0 else Color.TEXT_SECONDARY,
-                            ),
+                            folder_icon,
                             ft.Text(
                                 node.title,
-                                size=16 if depth == 0 else 14,
-                                weight=ft.FontWeight.W_600,
+                                size=18 if depth == 0 else 15 if node.children else 14,
+                                weight=ft.FontWeight.W_700
+                                if depth == 0
+                                else ft.FontWeight.W_600
+                                if node.children
+                                else ft.FontWeight.W_500,
                                 color=Color.TEXT,
                                 expand=True,
                                 max_lines=1,
@@ -280,9 +372,9 @@ def build_course_tree(
                         controls=[
                             ft.Container(
                                 content=badge,
-                                padding=ft.Padding.symmetric(horizontal=9, vertical=4),
-                                border_radius=8,
-                                bgcolor=ft.Colors.with_opacity(0.12, accent),
+                                padding=ft.Padding.symmetric(horizontal=11, vertical=5),
+                                border_radius=11,
+                                bgcolor=ft.Colors.with_opacity(0.09, tint),
                             ),
                             chevron,
                         ],
@@ -290,9 +382,13 @@ def build_course_tree(
                 ],
             ),
         )
+        if has_content:
+            _clickable_row(header, tint, on_header_click)
 
         body_controls: list[ft.Control] = []
-        if show_children:
+        node_checkboxes: list[ft.Checkbox] = []
+        node_badges: list[ft.Text] = []
+        if has_content:
             for lesson in node.lessons:
                 if (
                     normalized_query
@@ -301,7 +397,6 @@ def build_course_tree(
                 ):
                     continue
                 checkbox = ft.Checkbox(
-                    label=lesson.title,
                     value=lesson.url in selected_urls,
                     tristate=False,
                     data=lesson.url,
@@ -309,22 +404,70 @@ def build_course_tree(
                         current,
                         event.control.value is True,
                     ),
-                    active_color=accent,
+                    width=30,
+                    height=30,
+                    scale=1.1,
+                    visual_density=ft.VisualDensity.COMPACT,
+                    shape=ft.RoundedRectangleBorder(radius=3),
+                    border_side=ft.BorderSide(1.4, "#98A2C1"),
+                    active_color=Glass.CHECKED,
                     check_color=Color.TEXT,
                     fill_color={
-                        ft.ControlState.DEFAULT: ft.Colors.with_opacity(0.08, accent),
-                        ft.ControlState.SELECTED: accent,
+                        ft.ControlState.DEFAULT: ft.Colors.TRANSPARENT,
+                        ft.ControlState.SELECTED: Glass.CHECKED,
                     },
                     label_style=ft.TextStyle(size=13, color=Color.TEXT),
                     semantics_label=lesson.title,
                 )
                 lesson_checkboxes[lesson.url] = checkbox
-                body_controls.append(
-                    ft.Container(
-                        padding=ft.Padding.only(left=6, right=6),
-                        content=checkbox,
-                    )
+                node_checkboxes.append(checkbox)
+                lesson_badge = ft.Text(
+                    "1 из 1" if lesson.url in selected_urls else "1 урок",
+                    size=11,
+                    color=accent,
+                    weight=ft.FontWeight.W_500,
                 )
+                node_badges.append(lesson_badge)
+                lesson_row = _clickable_row(
+                    ft.Container(
+                        height=48,
+                        padding=ft.Padding.symmetric(horizontal=12, vertical=5),
+                        border_radius=11,
+                        border=ft.Border.all(1, Glass.LESSON_BORDER),
+                        bgcolor=Glass.LESSON_SURFACE,
+                        content=ft.Row(
+                            spacing=12,
+                            controls=[
+                                checkbox,
+                                ft.Icon(
+                                    ft.Icons.SMART_DISPLAY_OUTLINED,
+                                    size=20,
+                                    color=Glass.FOLDER,
+                                ),
+                                ft.Text(
+                                    lesson.title,
+                                    size=14,
+                                    color=Color.TEXT,
+                                    expand=True,
+                                    max_lines=1,
+                                    overflow=ft.TextOverflow.ELLIPSIS,
+                                ),
+                                ft.Container(
+                                    content=lesson_badge,
+                                    padding=ft.Padding.symmetric(horizontal=11, vertical=5),
+                                    border_radius=11,
+                                    bgcolor=ft.Colors.with_opacity(0.08, accent),
+                                ),
+                            ],
+                        ),
+                    ),
+                    Glass.FOLDER,
+                    lambda _event, current=lesson, ref=checkbox: on_lesson_selection(
+                        current, ref.value is not True
+                    ),
+                    hover_surface=Glass.LESSON_HOVER,
+                )
+                body_controls.append(lesson_row)
             for child in node.children:
                 child_control = build_node(child, depth + 1, visible_by_parent)
                 if child_control is not None:
@@ -332,34 +475,122 @@ def build_course_tree(
 
         body: ft.Control = ft.Container(height=0)
         if body_controls:
+            connector_color = ft.Colors.with_opacity(0.32, tint)
             body = ft.Container(
-                margin=ft.Margin.only(left=25 if depth == 0 else 18),
-                padding=ft.Padding.only(left=10, bottom=8),
-                border=ft.Border.only(left=ft.BorderSide(1, ft.Colors.with_opacity(0.3, accent))),
-                content=ft.Column(spacing=1, controls=body_controls),
+                margin=ft.Margin.only(
+                    left=18 if depth == 0 else 24,
+                    right=12,
+                    top=8,
+                    bottom=8 if depth == 0 or node.children else 0,
+                ),
+                content=ft.Column(
+                    spacing=8,
+                    controls=[
+                        ft.Stack(
+                            clip_behavior=ft.ClipBehavior.NONE,
+                            controls=[
+                                ft.Container(
+                                    margin=ft.Margin.only(left=12),
+                                    content=child,
+                                ),
+                                ft.Container(
+                                    left=0,
+                                    top=0,
+                                    bottom=-8 if index < len(body_controls) - 1 else None,
+                                    width=1,
+                                    height=25 if index == len(body_controls) - 1 else None,
+                                    bgcolor=connector_color,
+                                ),
+                                ft.Container(
+                                    left=0,
+                                    top=24,
+                                    width=12,
+                                    height=1,
+                                    bgcolor=connector_color,
+                                ),
+                            ],
+                        )
+                        for index, child in enumerate(body_controls)
+                    ],
+                ),
             )
+
+        def on_expansion_changed(event) -> None:
+            ft.context.disable_auto_update()
+            expanded = event.data is True or event.data == "true"
+            if expanded != bool(tile.expanded):
+                on_folder_toggle(node.url, expanded)
+
+        tile = ft.ExpansionTile(
+            key=f"course-folder:{node.url}",
+            title=header,
+            controls=[body] if body_controls else [],
+            expanded=show_children,
+            maintain_state=True,
+            show_trailing_icon=False,
+            tile_padding=0,
+            min_tile_height=0,
+            visual_density=ft.VisualDensity.COMPACT,
+            controls_padding=0,
+            expanded_alignment=ft.Alignment.TOP_LEFT,
+            expanded_cross_axis_alignment=ft.CrossAxisAlignment.STRETCH,
+            bgcolor=ft.Colors.TRANSPARENT,
+            collapsed_bgcolor=ft.Colors.TRANSPARENT,
+            shape=ft.RoundedRectangleBorder(radius=0, side=ft.BorderSide(0, ft.Colors.TRANSPARENT)),
+            collapsed_shape=ft.RoundedRectangleBorder(
+                radius=0, side=ft.BorderSide(0, ft.Colors.TRANSPARENT)
+            ),
+            animation_style=ft.AnimationStyle(
+                duration=280,
+                reverse_duration=240,
+                curve=ft.AnimationCurve.EASE_IN_OUT_CUBIC,
+                reverse_curve=ft.AnimationCurve.EASE_IN_OUT_CUBIC,
+            ),
+            on_change=on_expansion_changed if has_content else None,
+        )
+        folder_rows[node.url] = CourseFolderRow(
+            tile,
+            folder_icon,
+            chevron,
+            folder_checkbox,
+            badge,
+            frozenset(lesson_urls),
+            tuple(node_checkboxes),
+            tuple(node_badges),
+        )
 
         if depth == 0:
             return ft.Container(
-                border_radius=16,
-                bgcolor=Color.BG_CARD,
-                border=ft.Border.all(1, Color.BORDER),
-                shadow=Shadow.CARD,
-                gradient=Gradient.CARD,
+                border_radius=14,
+                border=ft.Border.all(1, ft.Colors.with_opacity(0.3, accent)),
+                bgcolor=Glass.COURSE_BODY,
+                theme=ft.Theme(
+                    hover_color=ft.Colors.TRANSPARENT,
+                    highlight_color=ft.Colors.TRANSPARENT,
+                    splash_color=ft.Colors.TRANSPARENT,
+                    list_tile_theme=ft.ListTileTheme(min_vertical_padding=0),
+                ),
+                dark_theme=ft.Theme(
+                    hover_color=ft.Colors.TRANSPARENT,
+                    highlight_color=ft.Colors.TRANSPARENT,
+                    splash_color=ft.Colors.TRANSPARENT,
+                    list_tile_theme=ft.ListTileTheme(min_vertical_padding=0),
+                ),
                 clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                content=ft.Column(spacing=0, controls=[header, body]),
+                content=tile,
             )
         return ft.Container(
-            border_radius=10,
-            bgcolor="rgba(255,255,255,0.02)",
-            content=ft.Column(spacing=0, controls=[header, body]),
+            border_radius=8,
+            bgcolor=Glass.SECTION_BODY if node.children else ft.Colors.TRANSPARENT,
+            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+            content=tile,
         )
 
     root = build_node(course, 0)
     if root is None:
         root = ft.Container(visible=False)
     assert isinstance(root, ft.Container)
-    return CourseTreeView(root, lesson_checkboxes, folder_checkboxes, folder_badges)
+    return CourseTreeView(root, lesson_checkboxes, folder_checkboxes, folder_badges, folder_rows)
 
 
 def build_download_lesson_row(
@@ -418,7 +649,7 @@ def build_download_lesson_row(
         border_radius=9,
         bgcolor=ft.Colors.with_opacity(0.03, ft.Colors.WHITE),
         border=ft.Border.all(1, ft.Colors.TRANSPARENT),
-        animate=ft.Animation(220, ft.AnimationCurve.EASE_OUT_CUBIC),
+        animate=ft.Animation(280, ft.AnimationCurve.EASE_IN_OUT_CUBIC),
         content=ft.Column(
             spacing=4,
             controls=[

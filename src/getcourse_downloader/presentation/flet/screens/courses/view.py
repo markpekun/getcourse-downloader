@@ -15,9 +15,11 @@ from getcourse_downloader.infrastructure.diagnostics.ui_lifecycle import trace_o
 from getcourse_downloader.presentation.flet.lifecycle import UiCallbacks
 from getcourse_downloader.presentation.flet.screens.courses.completion import CompletionFlow
 from getcourse_downloader.presentation.flet.screens.courses.components import (
+    CourseFolderRow,
     DownloadLessonRow,
     build_course_tree,
     build_download_lesson_row,
+    folder_badge_text,
     iter_course_lessons,
     selected_course_lessons,
 )
@@ -37,11 +39,13 @@ from getcourse_downloader.presentation.flet.screens.courses.state import (
 )
 from getcourse_downloader.presentation.flet.theme import (
     Color,
+    Glass,
     Gradient,
     Shadow,
     accent_button,
     body_text,
     divider,
+    glass_container,
 )
 from getcourse_downloader.presentation.flet.transitions import (
     OverlayTransition,
@@ -53,18 +57,6 @@ _GITHUB_URL = "https://github.com/markpekun/getcourse-downloader"
 _CONTACT_URL = "https://t.me/No_Resp_404"
 _DOWNLOAD_FOLLOW_PAUSE_SECONDS = 10.0
 _LOGGER = logging.getLogger("getcourse_downloader.ui")
-
-
-_COURSE_COLORS = [
-    "#7C3AED",
-    "#EC4899",
-    "#10B981",
-    "#F59E0B",
-    "#3B82F6",
-    "#EF4444",
-    "#14B8A6",
-    "#F97316",
-]
 
 
 class CoursesScreen:
@@ -107,24 +99,25 @@ class CoursesScreen:
         self.lesson_refs: dict[str, ft.Checkbox] = {}
         self.folder_refs: dict[str, ft.Checkbox] = {}
         self.folder_badges: dict[str, ft.Text] = {}
+        self._folder_rows: dict[str, CourseFolderRow] = {}
 
         self.file_picker = ft.FilePicker()
 
         self._search_query = ft.TextField(
             hint_text="Поиск уроков...",
-            hint_style=ft.TextStyle(color=Color.TEXT_MUTED, size=14),
+            hint_style=ft.TextStyle(color=Glass.TEXT_MUTED, size=14),
             color=Color.TEXT,
-            bgcolor="rgba(255,255,255,0.04)",
-            border_color=Color.BORDER,
+            bgcolor=Glass.SEARCH,
+            border_color=Glass.BORDER_LIGHT,
             border_width=1,
             border_radius=10,
             focused_border_color=Color.ACCENT,
-            focused_bgcolor="rgba(124,58,237,0.06)",
+            focused_bgcolor="#A11B2135",
             cursor_color=Color.ACCENT,
             text_style=ft.TextStyle(size=14),
             prefix_icon=ft.Icons.SEARCH_ROUNDED,
-            prefix_style=ft.TextStyle(color=Color.TEXT_MUTED),
-            height=44,
+            prefix_style=ft.TextStyle(color=Glass.TEXT_MUTED),
+            height=46,
             expand=True,
             on_change=self._on_search,
         )
@@ -143,7 +136,11 @@ class CoursesScreen:
             color=Color.TEXT_SECONDARY,
             weight=ft.FontWeight.W_500,
         )
-        self.course_list = ft.Column(spacing=12, scroll=ft.ScrollMode.AUTO, expand=True)
+        self.course_list = ft.Column(
+            spacing=14,
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+        )
         self._build_course_list()
 
         self.side_content = ft.Column(spacing=16)
@@ -401,7 +398,7 @@ class CoursesScreen:
 
         self.view = ft.Container(
             expand=True,
-            gradient=Gradient.BG_PRIMARY,
+            gradient=Glass.BACKGROUND,
             content=ft.Stack(
                 expand=True,
                 controls=[
@@ -409,7 +406,7 @@ class CoursesScreen:
                         spacing=0,
                         controls=[
                             self._build_header(),
-                            divider(),
+                            divider(Glass.DIVIDER),
                             ft.Container(
                                 expand=True,
                                 padding=ft.Padding.only(left=32, right=32, top=20, bottom=20),
@@ -449,7 +446,7 @@ class CoursesScreen:
             icon=ft.Icons.PLAYLIST_REMOVE_ROUNDED,
             icon_color=Color.RED,
             icon_size=20,
-            bgcolor="rgba(239,68,68,0.10)",
+            bgcolor=ft.Colors.TRANSPARENT,
             tooltip="Очистить список курсов и уроков",
             on_click=self._delete_courses,
         )
@@ -457,12 +454,13 @@ class CoursesScreen:
             icon=ft.Icons.COOKIE_OUTLINED,
             icon_color=Color.YELLOW,
             icon_size=20,
-            bgcolor="rgba(245,158,11,0.10)",
+            bgcolor=ft.Colors.TRANSPARENT,
             tooltip="Очистить авторизацию (cookies)",
             on_click=self._clear_authorization,
         )
         return ft.Container(
             padding=ft.Padding.symmetric(horizontal=32, vertical=16),
+            bgcolor="#26090D19",
             content=ft.Row(
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -471,30 +469,23 @@ class CoursesScreen:
                         spacing=16,
                         controls=[
                             ft.Container(
-                                width=40,
-                                height=40,
+                                width=42,
+                                height=42,
                                 border_radius=12,
-                                gradient=Gradient.ACCENT,
+                                bgcolor="#46101626",
+                                border=ft.Border.all(1, Glass.BORDER_LIGHT),
                                 content=ft.Icon(
-                                    ft.Icons.DOWNLOAD_ROUNDED,
-                                    size=20,
-                                    color=Color.TEXT,
+                                    ft.Icons.FILE_DOWNLOAD_OUTLINED,
+                                    size=24,
+                                    color=Glass.FOLDER,
                                 ),
                             ),
-                            ft.Column(
-                                spacing=0,
-                                controls=[
-                                    ft.Text(
-                                        "Мои курсы",
-                                        size=22,
-                                        weight=ft.FontWeight.W_700,
-                                        color=Color.TEXT,
-                                    ),
-                                    body_text(
-                                        f"{len(self.data)} курсов · {total_lessons} уроков",
-                                        size=12,
-                                    ),
-                                ],
+                            ft.Text(
+                                "Мои курсы",
+                                size=24,
+                                weight=ft.FontWeight.W_700,
+                                color=Color.TEXT,
+                                tooltip=f"{len(self.data)} курсов · {total_lessons} уроков",
                             ),
                         ],
                     ),
@@ -516,7 +507,7 @@ class CoursesScreen:
                                     ),
                                     padding=ft.Padding.symmetric(horizontal=10, vertical=5),
                                     border_radius=8,
-                                    bgcolor="rgba(16,185,129,0.10)",
+                                    bgcolor=ft.Colors.TRANSPARENT,
                                     tooltip=(
                                         "Средняя скорость загрузки видео "
                                         "(обновляется раз в 3 секунды)"
@@ -546,11 +537,11 @@ class CoursesScreen:
         self.lesson_refs.clear()
         self.folder_refs.clear()
         self.folder_badges.clear()
-        for idx, course in enumerate(self.data):
-            accent = _COURSE_COLORS[idx % len(_COURSE_COLORS)]
+        self._folder_rows.clear()
+        for course in self.data:
             tree = build_course_tree(
                 course,
-                accent=accent,
+                accent=Glass.FOLDER,
                 selected_urls=self.state.selected_lesson_urls,
                 expanded_urls=self.state.expanded_course_urls,
                 query=self.state.search_query,
@@ -561,16 +552,20 @@ class CoursesScreen:
             self.lesson_refs.update(tree.lesson_checkboxes)
             self.folder_refs.update(tree.folder_checkboxes)
             self.folder_badges.update(tree.folder_badges)
+            self._folder_rows.update(tree.folder_rows)
             self.course_list.controls.append(tree.control)
 
     @trace_operation("course_expand_toggle")
-    def _toggle_course(self, course_url: str):
-        if course_url in self.state.expanded_course_urls:
-            self.state.expanded_course_urls.discard(course_url)
-        else:
+    def _toggle_course(self, course_url: str, expanded: bool):
+        ft.context.disable_auto_update()
+        if expanded:
             self.state.expanded_course_urls.add(course_url)
-        self._build_course_list()
-        self.page.update()
+        else:
+            self.state.expanded_course_urls.discard(course_url)
+        row = self._folder_rows.get(course_url)
+        if row is not None:
+            row.set_expanded(expanded)
+            self.page.update(row.tile)
 
     @trace_operation("course_search")
     def _on_search(self, e):
@@ -580,50 +575,44 @@ class CoursesScreen:
 
     @trace_operation("lesson_selection")
     def _set_lesson_selection(self, lesson: Lesson, selected: bool) -> None:
+        ft.context.disable_auto_update()
         if selected:
             self.state.selected_lesson_urls.add(lesson.url)
         else:
             self.state.selected_lesson_urls.discard(lesson.url)
-        self._build_course_list()
         self._update_selected_count()
 
     @trace_operation("course_selection")
     def _set_course_selection(self, course: Course, selected: bool) -> None:
+        ft.context.disable_auto_update()
         urls = {item.lesson.url for item in iter_course_lessons(course)}
         if selected:
             self.state.selected_lesson_urls.update(urls)
         else:
             self.state.selected_lesson_urls.difference_update(urls)
-        self._build_course_list()
         self._update_selected_count()
 
     def _build_side_panel(self):
         total_lessons = sum(course.lesson_count for course in self.data)
 
         def _stat_card() -> ft.Container:
-            return ft.Container(
-                padding=20,
-                border_radius=16,
-                bgcolor=Color.BG_CARD,
-                border=ft.Border.all(1, Color.BORDER),
-                shadow=Shadow.CARD,
-                gradient=Gradient.CARD,
+            return glass_container(
                 content=ft.Column(
                     spacing=16,
                     controls=[
                         ft.Row(
-                            spacing=10,
+                            spacing=14,
                             controls=[
                                 ft.Container(
-                                    width=40,
-                                    height=40,
-                                    border_radius=12,
-                                    gradient=Gradient.ACCENT,
-                                    content=ft.Icon(
-                                        ft.Icons.DOWNLOAD_DONE_ROUNDED,
-                                        size=20,
-                                        color=Color.TEXT,
-                                    ),
+                                    width=4,
+                                    height=28,
+                                    border_radius=2,
+                                    bgcolor=Color.ACCENT_LIGHT,
+                                ),
+                                ft.Icon(
+                                    ft.Icons.FILE_DOWNLOAD_OUTLINED,
+                                    size=25,
+                                    color=Glass.FOLDER,
                                 ),
                                 ft.Text(
                                     "Загрузка",
@@ -633,12 +622,13 @@ class CoursesScreen:
                                 ),
                             ],
                         ),
-                        divider(),
+                        divider(Glass.DIVIDER),
                         ft.Container(
+                            height=70,
                             padding=16,
                             border_radius=12,
-                            bgcolor="rgba(124,58,237,0.06)",
-                            border=ft.Border.all(1, "rgba(124,58,237,0.12)"),
+                            bgcolor=Glass.INSET,
+                            border=ft.Border.all(1, "#BF080B16"),
                             content=ft.Column(
                                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                                 spacing=4,
@@ -656,7 +646,6 @@ class CoursesScreen:
                                             ),
                                         ],
                                     ),
-                                    body_text("уроков выбрано", size=13),
                                 ],
                             ),
                         ),
@@ -665,13 +654,14 @@ class CoursesScreen:
             )
 
         def _quality_card() -> ft.Container:
-            return ft.Container(
-                padding=20,
-                border_radius=16,
-                bgcolor=Color.BG_CARD,
-                border=ft.Border.all(1, Color.BORDER),
-                shadow=Shadow.CARD,
-                gradient=Gradient.CARD,
+            option_style = ft.ButtonStyle(
+                bgcolor={
+                    ft.ControlState.HOVERED: Glass.MENU_HOVER,
+                    ft.ControlState.FOCUSED: Glass.MENU_HOVER,
+                },
+                color=Color.TEXT,
+            )
+            return glass_container(
                 content=ft.Column(
                     spacing=12,
                     controls=[
@@ -681,20 +671,31 @@ class CoursesScreen:
                             weight=ft.FontWeight.W_600,
                             color=Color.TEXT,
                         ),
-                        divider(),
+                        divider(Glass.DIVIDER),
                         ft.Dropdown(
+                            width=280,
                             value=self.state.quality,
                             options=[
-                                ft.DropdownOption(key="auto", text="Авто (максимальное)"),
-                                ft.DropdownOption(key="1080", text="1080p"),
-                                ft.DropdownOption(key="720", text="720p"),
-                                ft.DropdownOption(key="480", text="480p"),
-                                ft.DropdownOption(key="360", text="360p"),
+                                ft.DropdownOption(key=key, text=label, style=option_style)
+                                for key, label in (
+                                    ("auto", "Авто (максимальное)"),
+                                    ("1080", "1080p"),
+                                    ("720", "720p"),
+                                    ("480", "480p"),
+                                    ("360", "360p"),
+                                )
                             ],
                             on_select=self._on_quality_change,
                             text_style=ft.TextStyle(size=14, color=Color.TEXT),
-                            bgcolor="rgba(255,255,255,0.04)",
-                            border_color=Color.BORDER,
+                            bgcolor=Glass.MENU_SURFACE,
+                            menu_style=ft.MenuStyle(
+                                bgcolor=Glass.MENU_SURFACE,
+                                elevation=12,
+                                shadow_color="#B3000000",
+                                side=ft.BorderSide(1, Glass.BORDER_LIGHT),
+                                shape=ft.RoundedRectangleBorder(radius=10),
+                            ),
+                            border_color="#BF080B16",
                             border_width=1,
                             border_radius=10,
                             focused_border_color=Color.ACCENT,
@@ -706,13 +707,7 @@ class CoursesScreen:
             )
 
         def _save_path_card() -> ft.Container:
-            return ft.Container(
-                padding=20,
-                border_radius=16,
-                bgcolor=Color.BG_CARD,
-                border=ft.Border.all(1, Color.BORDER),
-                shadow=Shadow.CARD,
-                gradient=Gradient.CARD,
+            return glass_container(
                 content=ft.Column(
                     spacing=12,
                     controls=[
@@ -722,7 +717,7 @@ class CoursesScreen:
                             weight=ft.FontWeight.W_600,
                             color=Color.TEXT,
                         ),
-                        divider(),
+                        divider(Glass.DIVIDER),
                         ft.Row(
                             spacing=8,
                             controls=[
@@ -733,8 +728,8 @@ class CoursesScreen:
                                     hint_text="Выберите папку...",
                                     hint_style=ft.TextStyle(color=Color.TEXT_MUTED, size=13),
                                     color=Color.TEXT,
-                                    bgcolor="rgba(255,255,255,0.04)",
-                                    border_color=Color.BORDER,
+                                    bgcolor=Glass.FIELD,
+                                    border_color=Glass.BORDER_LIGHT,
                                     border_width=1,
                                     border_radius=10,
                                     text_style=ft.TextStyle(size=13),
@@ -749,7 +744,8 @@ class CoursesScreen:
                                     width=44,
                                     height=44,
                                     border_radius=10,
-                                    gradient=Gradient.ACCENT,
+                                    gradient=Glass.BUTTON,
+                                    border=ft.Border.all(1, "#668D57F2"),
                                     ink=True,
                                     on_click=self._pick_directory,
                                 ),
@@ -761,13 +757,7 @@ class CoursesScreen:
             )
 
         def _actions_card() -> ft.Container:
-            return ft.Container(
-                padding=20,
-                border_radius=16,
-                bgcolor=Color.BG_CARD,
-                border=ft.Border.all(1, Color.BORDER),
-                shadow=Shadow.CARD,
-                gradient=Gradient.CARD,
+            return glass_container(
                 content=ft.Column(
                     spacing=10,
                     controls=[
@@ -777,7 +767,7 @@ class CoursesScreen:
                             weight=ft.FontWeight.W_600,
                             color=Color.TEXT,
                         ),
-                        divider(),
+                        divider(Glass.DIVIDER),
                         ft.Container(
                             content=ft.Row(
                                 spacing=10,
@@ -802,8 +792,8 @@ class CoursesScreen:
                                         ),
                                         padding=ft.Padding.symmetric(horizontal=16, vertical=10),
                                         border_radius=10,
-                                        border=ft.Border.all(1, Color.BORDER_STRONG),
-                                        bgcolor="rgba(255,255,255,0.03)",
+                                        border=ft.Border.all(1, "#BF080B16"),
+                                        bgcolor=Glass.INSET,
                                         ink=True,
                                         on_click=self._select_all,
                                         expand=True,
@@ -828,8 +818,8 @@ class CoursesScreen:
                                         ),
                                         padding=ft.Padding.symmetric(horizontal=16, vertical=10),
                                         border_radius=10,
-                                        border=ft.Border.all(1, Color.BORDER_STRONG),
-                                        bgcolor="rgba(255,255,255,0.03)",
+                                        border=ft.Border.all(1, "#BF080B16"),
+                                        bgcolor=Glass.INSET,
                                         ink=True,
                                         on_click=self._unselect_all,
                                         expand=True,
@@ -842,6 +832,7 @@ class CoursesScreen:
                             on_click=self._start_download,
                             icon=ft.Icons.DOWNLOAD_ROUNDED,
                             height=48,
+                            glass=True,
                         ),
                     ],
                 ),
@@ -953,20 +944,40 @@ class CoursesScreen:
 
     def _update_selected_count(self, e=None):
         self.selected_label.value = str(len(self.state.selected_lesson_urls))
-        self.page.update()
+        changed: list[ft.Control] = [self.selected_label]
+        for row in self._folder_rows.values():
+            for checkbox, badge in zip(row.lesson_checkboxes, row.lesson_badges, strict=True):
+                selected = checkbox.data in self.state.selected_lesson_urls
+                if checkbox.value != selected:
+                    checkbox.value = selected
+                    changed.append(checkbox)
+                text = "1 из 1" if selected else "1 урок"
+                if badge.value != text:
+                    badge.value = text
+                    changed.append(badge)
+            selected_count = len(row.lesson_urls & self.state.selected_lesson_urls)
+            selected = bool(row.lesson_urls and selected_count == len(row.lesson_urls))
+            if row.checkbox.value != selected:
+                row.checkbox.value = selected
+                changed.append(row.checkbox)
+            text = folder_badge_text(selected_count, len(row.lesson_urls))
+            if row.badge.value != text:
+                row.badge.value = text
+                changed.append(row.badge)
+        self.page.update(*changed)
 
     @trace_operation("lessons_select_all")
     def _select_all(self, e):
+        ft.context.disable_auto_update()
         self.state.selected_lesson_urls = {
             item.lesson.url for course in self.data for item in iter_course_lessons(course)
         }
-        self._build_course_list()
         self._update_selected_count()
 
     @trace_operation("lessons_unselect_all")
     def _unselect_all(self, e):
+        ft.context.disable_auto_update()
         self.state.selected_lesson_urls.clear()
-        self._build_course_list()
         self._update_selected_count()
 
     def _dismiss_error(self, e):

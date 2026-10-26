@@ -337,7 +337,10 @@ def test_selection_survives_collapse_and_expand():
     child_url = "https://school.example/course/child"
 
     collapsed = _build_tree(course, selected, set())
-    assert collapsed.lesson_checkboxes == {}
+    assert collapsed.folder_rows[root_url].tile.expanded is False
+    assert collapsed.folder_rows[child_url].tile.expanded is False
+    assert collapsed.lesson_checkboxes["https://school.example/lesson/2"].value is True
+    assert collapsed.lesson_checkboxes["https://school.example/lesson/1"].value is False
     assert selected == {"https://school.example/lesson/2"}
 
     expanded = _build_tree(course, selected, {root_url, child_url})
@@ -660,8 +663,8 @@ def test_download_follow_scrolls_to_latest_previous_lesson_and_ignores_detached_
     calls = asyncio.run(scenario())
 
     assert calls[0]["scroll_key"] == "https://school.example/lesson/7"
-    assert calls[0]["duration"] == 350
-    assert calls[0]["curve"] is ft.AnimationCurve.EASE_OUT_CUBIC
+    assert calls[0]["duration"] == 520
+    assert calls[0]["curve"] is ft.AnimationCurve.EASE_IN_OUT_CUBIC
 
 
 def test_download_scroll_keeps_previous_lesson_at_top():

@@ -7,7 +7,7 @@ import flet as ft
 
 
 class RowTransitions:
-    """Publish spring targets once per batch; the client renders every animation frame."""
+    """Publish motion targets once per batch; the client renders every animation frame."""
 
     def __init__(self, page: ft.Page) -> None:
         self._page = page
@@ -63,8 +63,8 @@ class OverlayTransition:
         self._closing = False
         self._disposed = False
         overlay.opacity = 0
-        card.scale = 0.97
-        card.offset = ft.Offset(0, 0.02)
+        card.scale = 0.985
+        card.offset = ft.Offset(0, 0.008)
         card.animate_opacity = None
 
     def _cancel(self) -> int:
@@ -89,12 +89,12 @@ class OverlayTransition:
         generation = self._cancel()
         self._open = True
         self._closing = False
-        self._duration(190)
+        self._duration(240)
         self._overlay.visible = True
         self._overlay.opacity = 0
         self._card.opacity = 1
-        self._card.scale = 0.97
-        self._card.offset = ft.Offset(0, 0.02)
+        self._card.scale = 0.985
+        self._card.offset = ft.Offset(0, 0.008)
         self._page.update(self._overlay)
         self._task = self._page.run_task(self._reveal, generation)
 
@@ -114,21 +114,21 @@ class OverlayTransition:
         generation = self._cancel()
         self._open = False
         self._overlay.opacity = 0
-        self._card.scale = 0.98
-        self._card.offset = ft.Offset(0, 0.015)
+        self._card.scale = 0.99
+        self._card.offset = ft.Offset(0, 0.005)
         if not update:
             self._overlay.visible = False
             self._closing = False
             return
         if not self._overlay.visible or self._disposed:
             return
-        self._duration(140)
+        self._duration(180)
         self._closing = True
         self._page.update(self._overlay)
         self._task = self._page.run_task(self._hide, generation)
 
     async def _hide(self, generation: int) -> None:
-        await asyncio.sleep(0.14)
+        await asyncio.sleep(0.18)
         if self._disposed or generation != self._generation:
             return
         self._overlay.visible = False

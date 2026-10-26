@@ -104,7 +104,8 @@ class App:
         await self._dispose_screen(wait=True)
         await asyncio.to_thread(flush_ui_lifecycle_logging)
         self.page.window.prevent_close = False
-        await self.page.window.close()
+        # The close signal has already been handled; do not send it through interception again.
+        await self.page.window.destroy()
 
     async def _on_page_closed(self, _event) -> None:
         reason = "disconnect" if getattr(_event, "name", None) == "disconnect" else "close"

@@ -8,7 +8,7 @@ from collections.abc import Callable
 
 import flet as ft
 
-_FOLLOW_DURATION_SECONDS = 0.35
+_FOLLOW_DURATION_SECONDS = 0.52
 
 
 class DownloadListFollow:
@@ -162,8 +162,8 @@ class DownloadListFollow:
                 try:
                     await self._scrollable.scroll_to(
                         scroll_key=target,
-                        duration=350,
-                        curve=ft.AnimationCurve.EASE_OUT_CUBIC,
+                        duration=round(_FOLLOW_DURATION_SECONDS * 1000),
+                        curve=ft.AnimationCurve.EASE_IN_OUT_CUBIC,
                     )
                 except (asyncio.CancelledError, IndexError, RuntimeError):
                     return

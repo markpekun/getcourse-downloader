@@ -86,6 +86,53 @@ class Shadow:
     )
 
 
+class Glass:
+    BORDER = "#4D61698A"
+    BORDER_LIGHT = "#608587B4"
+    FIELD = "#7A262C40"
+    SEARCH = "#9B30364A"
+    INSET = "#59101524"
+    TEXT_MUTED = "#8792B2"
+    FOLDER = "#B9B9F4"
+    SECTION = "#A6ACE2"
+    CHECKED = "#913FF6"
+    DIVIDER = "#30ABB6D5"
+    COURSE_SURFACE = "#F02A3550"
+    COURSE_BODY = "#ED0E1524"
+    SECTION_SURFACE = "#F01F2A40"
+    SECTION_BODY = "#70141D30"
+    MODULE_SURFACE = "#E5151F31"
+    LESSON_SURFACE = "#F0111A2A"
+    LESSON_BORDER = "#394D5B7B"
+    MENU_SURFACE = "#151B2B"
+    MENU_HOVER = "#303A53"
+    COURSE_HOVER = "#34415C"
+    SECTION_HOVER = "#2B3750"
+    MODULE_HOVER = "#23304A"
+    LESSON_HOVER = "#23304A"
+    BACKGROUND = ft.RadialGradient(
+        center=ft.Alignment(0.12, -0.75),
+        radius=1.5,
+        colors=["#17203A", "#101625", "#080B14"],
+        stops=[0, 0.48, 1],
+    )
+    PANEL = ft.LinearGradient(
+        begin=ft.Alignment.TOP_LEFT,
+        end=ft.Alignment.BOTTOM_RIGHT,
+        colors=["#C92B314B", "#BF1D233A"],
+    )
+    ROW = ft.LinearGradient(
+        begin=ft.Alignment.TOP_LEFT,
+        end=ft.Alignment.BOTTOM_RIGHT,
+        colors=["#6E353B55", "#4D20263C"],
+    )
+    BUTTON = ft.LinearGradient(
+        begin=ft.Alignment.TOP_LEFT,
+        end=ft.Alignment.BOTTOM_RIGHT,
+        colors=["#8138E8", "#6020BD"],
+    )
+
+
 def glass_container(
     content: ft.Control,
     width: int | None = None,
@@ -101,10 +148,11 @@ def glass_container(
         expand=expand,
         padding=padding,
         border_radius=border_radius,
-        bgcolor=Color.BG_CARD,
-        border=ft.Border.all(1, Color.BORDER),
+        border=ft.Border.all(1, Glass.BORDER),
         shadow=Shadow.CARD,
-        gradient=Gradient.CARD,
+        gradient=Glass.PANEL,
+        blur=ft.Blur(12, 12),
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
     )
 
 
@@ -134,6 +182,7 @@ def accent_button(
     expand: bool = False,
     height: int = 48,
     disabled: bool = False,
+    glass: bool = False,
 ) -> ft.Container:
     content = ft.Row(
         [
@@ -148,7 +197,8 @@ def accent_button(
         height=height,
         expand=expand,
         border_radius=10,
-        gradient=Gradient.ACCENT,
+        gradient=Glass.BUTTON if glass else Gradient.ACCENT,
+        border=ft.Border.all(1, "#9B9B62F5") if glass else None,
         shadow=Shadow.GLOW_PRIMARY if not disabled else None,
         ink=True,
         on_click=on_click,
@@ -210,8 +260,8 @@ def status_badge(text: str, color: str = Color.GREEN) -> ft.Container:
     )
 
 
-def divider() -> ft.Divider:
-    return ft.Divider(height=1, color=Color.BORDER)
+def divider(color: str = Color.BORDER) -> ft.Divider:
+    return ft.Divider(height=1, color=color)
 
 
 def page_header(title: str, subtitle: str = "") -> ft.Column:

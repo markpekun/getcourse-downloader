@@ -2,7 +2,7 @@ name: Build Windows release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "[0-9]*.[0-9]*.[0-9]*"]
   workflow_dispatch:
 
 permissions:
@@ -148,6 +148,7 @@ jobs:
         with:
           generate_release_notes: false
           prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
+          make_latest: ${{ !contains(github.ref_name, '-beta') && !contains(github.ref_name, '-rc') }}
           body_path: docs/RELEASE_NOTES_${{ github.ref_name }}.md
           files: |
             dist/GetCourseVideoDownloader-win-x64.zip
