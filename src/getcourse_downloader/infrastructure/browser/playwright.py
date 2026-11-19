@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from pathlib import Path
 
 from playwright.async_api import BrowserContext, Playwright
 from playwright.async_api import Error as PlaywrightError
@@ -20,11 +21,7 @@ class PlaywrightBrowserFactory:
         self._paths = paths
         self._paths.ensure_runtime_directories()
         self._bundled_browsers = (paths.resources / "ms-playwright").resolve()
-        self._bundled_firefox = next(
-            self._bundled_browsers.glob("firefox-*/firefox/firefox.exe"),
-            None,
-        )
-        if self._bundled_browsers.is_dir():
+        if is_frozen():
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(self._bundled_browsers)
 
     @property
@@ -32,7 +29,7 @@ class PlaywrightBrowserFactory:
         return str(self._paths.session)
 
     async def launch(self, playwright: Playwright, *, headless: bool) -> BrowserContext:
-        if is_frozen() and (self._bundled_firefox is None or not self._bundled_firefox.is_file()):
+        if is_frozen() and not Path(playwright.firefox.executable_path).is_file():
             raise ExternalServiceError(
                 "Встроенный Firefox отсутствует или повреждён. "
                 "Полностью распакуйте архив приложения и повторите загрузку.",
@@ -83,15 +80,6 @@ class PlaywrightBrowserFactory:
             return context
         except PlaywrightError as error:
             lease.release()
-            message = str(error).casefold()
-            if "already running" in message or "failed to launch" in message:
-                raise ExternalServiceError(
-                    "Встроенный Firefox не запустился. Возможно, предыдущая загрузка "
-                    "завершилась некорректно и браузер ещё закрывается. "
-                    "Подождите несколько секунд и повторите.",
-                    code="BROWSER_START_FAILED",
-                    technical_details=str(error),
-                ) from error
             raise ExternalServiceError(
                 "Не удалось запустить встроенный Firefox.",
                 code="BROWSER_START_FAILED",

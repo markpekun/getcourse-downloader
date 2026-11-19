@@ -12,6 +12,9 @@ from getcourse_downloader.infrastructure.browser.playwright import (
 )
 from getcourse_downloader.infrastructure.platform.paths import AppPaths
 
+_TEST_FIREFOX_REVISION = "firefox-9001"
+_OTHER_TEST_FIREFOX_REVISION = "firefox-9002"
+
 
 @pytest.fixture(autouse=True)
 def _restore_browser_path() -> Iterator[None]:
@@ -33,24 +36,40 @@ def _paths(tmp_path) -> AppPaths:
     )
 
 
-def test_bundled_firefox_overrides_an_existing_playwright_browser_path(monkeypatch, tmp_path):
+@pytest.mark.parametrize("frozen", [False, True])
+def test_browser_path_uses_bundle_only_in_frozen_app(monkeypatch, tmp_path, frozen):
+    monkeypatch.setattr(sys, "frozen", frozen, raising=False)
     paths = _paths(tmp_path)
     bundled = paths.resources / "ms-playwright"
-    (bundled / "firefox-1538" / "firefox").mkdir(parents=True)
-    (bundled / "firefox-1538" / "firefox" / "firefox.exe").write_bytes(b"firefox")
-    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "C:/stale-playwright-cache")
+    executable = bundled / _TEST_FIREFOX_REVISION / "firefox" / "firefox.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fake executable")
+    test_cache = str(tmp_path / "test-browser-cache")
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", test_cache)
 
     PlaywrightBrowserFactory(paths)
 
-    assert os.environ["PLAYWRIGHT_BROWSERS_PATH"] == str(bundled.resolve())
+    expected = str(bundled.resolve()) if frozen else test_cache
+    assert os.environ["PLAYWRIGHT_BROWSERS_PATH"] == expected
 
 
-def test_launch_fails_clearly_when_bundled_firefox_is_missing(monkeypatch, tmp_path):
+@pytest.mark.parametrize("other_revision", [False, True])
+def test_launch_fails_clearly_when_bundled_firefox_is_missing(
+    monkeypatch, tmp_path, other_revision
+):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     paths = _paths(tmp_path)
+    if other_revision:
+        stale = paths.resources / "ms-playwright" / _OTHER_TEST_FIREFOX_REVISION / "firefox"
+        stale.mkdir(parents=True)
+        (stale / "firefox.exe").write_bytes(b"unrelated revision")
     factory = PlaywrightBrowserFactory(paths)
 
     class Firefox:
+        executable_path = str(
+            paths.resources / "ms-playwright" / _TEST_FIREFOX_REVISION / "firefox" / "firefox.exe"
+        )
+
         async def launch_persistent_context(self, *_args, **_kwargs):
             raise AssertionError("An installed browser must not be used as a fallback")
 
@@ -65,9 +84,9 @@ def test_launch_fails_clearly_when_bundled_firefox_is_missing(monkeypatch, tmp_p
 
 def test_browser_launch_error_has_stable_diagnostic_code(tmp_path):
     paths = _paths(tmp_path)
-    bundled = paths.resources / "ms-playwright" / "firefox-1538" / "firefox"
+    bundled = paths.resources / "ms-playwright" / _TEST_FIREFOX_REVISION / "firefox"
     bundled.mkdir(parents=True)
-    (bundled / "firefox.exe").write_bytes(b"firefox")
+    (bundled / "firefox.exe").write_bytes(b"fake executable")
     factory = PlaywrightBrowserFactory(paths)
 
     from playwright.async_api import Error as PlaywrightError

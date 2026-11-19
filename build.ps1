@@ -69,26 +69,20 @@ if (-not (Test-Path -LiteralPath $FfmpegExe) -or -not (Test-Path -LiteralPath $F
 }
 
 Write-Host "[3/7] Проверяю Firefox для Playwright..."
-$PlaywrightSource = Join-Path $env:LOCALAPPDATA "ms-playwright"
-$FirefoxDirectories = @(
-    Get-ChildItem -LiteralPath $PlaywrightSource -Directory -Filter "firefox-*" -ErrorAction SilentlyContinue |
-        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "firefox\firefox.exe") }
-)
-if ($FirefoxDirectories.Count -eq 0) {
+$PlaywrightDestination = Join-Path $Resources "ms-playwright"
+$PreviousBrowserPath = $env:PLAYWRIGHT_BROWSERS_PATH
+try {
+    $env:PLAYWRIGHT_BROWSERS_PATH = $PlaywrightDestination
     uv run --no-sync playwright install firefox
     if ($LASTEXITCODE -ne 0) { throw "Playwright не смог установить Firefox" }
-    $FirefoxDirectories = @(
-        Get-ChildItem -LiteralPath $PlaywrightSource -Directory -Filter "firefox-*" -ErrorAction SilentlyContinue |
-            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "firefox\firefox.exe") }
-    )
-}
-if ($FirefoxDirectories.Count -eq 0) { throw "Firefox Playwright не найден после установки" }
 
-Write-Host "[4/7] Копирую браузер в resources..."
-$PlaywrightDestination = Join-Path $Resources "ms-playwright"
-New-Item -ItemType Directory -Force -Path $PlaywrightDestination | Out-Null
-foreach ($FirefoxDirectory in $FirefoxDirectories) {
-    Copy-Item -LiteralPath $FirefoxDirectory.FullName -Destination $PlaywrightDestination -Recurse -Force
+    Write-Host "[4/7] Проверяю совместимую версию браузера в resources..."
+    $FirefoxExecutable = uv run --no-sync python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); print(p.firefox.executable_path); p.stop()"
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $FirefoxExecutable -PathType Leaf)) {
+        throw "Совместимый Firefox Playwright отсутствует в resources после установки"
+    }
+} finally {
+    $env:PLAYWRIGHT_BROWSERS_PATH = $PreviousBrowserPath
 }
 
 Write-Host "[5/7] Собираю Windows-приложение..."

@@ -226,6 +226,109 @@ def test_lesson_cards_filter_invalid_links_and_deduplicate_with_legacy_lessons()
     _run_in_firefox(check)
 
 
+def test_custom_image_widgets_supply_lesson_links_without_anchors(monkeypatch):
+    async def check(context: BrowserContext) -> None:
+        # Fictional course, lesson names and identifiers. Only the widget format is real.
+        pages = {
+            f"{ORIGIN}/teach/control/lesson/view/id/4101": (
+                "<h1>Академия картонных комет</h1>"
+                '<div class="lesson-header-block">'
+                '<h2 class="lesson-title-value">Орбита бумажного чайника</h2></div>'
+            ),
+            f"{ORIGIN}/teach/control/lesson/view/id/4102": (
+                "<h1>Академия картонных комет</h1>"
+                '<h2 class="lesson-title-value">Карта созвездия Пуговицы</h2>'
+            ),
+        }
+        visited = await _serve_pages(context, pages)
+        title_requests = []
+        disposed = []
+
+        class TitleResponse:
+            status = 200
+
+            def __init__(self, url):
+                self.url = url
+
+            async def text(self):
+                return pages[self.url]
+
+            async def dispose(self):
+                disposed.append(self.url)
+
+        async def request_title(url, **_kwargs):
+            title_requests.append(url)
+            await asyncio.sleep(0)
+            return TitleResponse(url)
+
+        monkeypatch.setattr(context.request, "get", request_title)
+        page = await context.new_page()
+        await page.set_content(
+            '<ul class="lesson-list"><li><a href="/teach/control/lesson/view/id/4100">'
+            '<div class="link title">Разметка картонной ракеты</div></a></li></ul>'
+            '<div class="xdget-training">'
+            '<div class="xdget-image with-link" data-xdget-id="teapot"><img></div>'
+            '<div class="xdget-image with-link" data-xdget-id="buttons"><img></div>'
+            '<div class="xdget-image with-link" data-xdget-id="duplicate"><img></div>'
+            '<div class="xdget-image with-link" data-xdget-id="foreign"><img></div>'
+            '<div class="xdget-image with-link" data-xdget-id="module"><img></div>'
+            "</div>"
+            '<nav><a href="/teach/control/lesson/view/id/99">Космический указатель</a></nav>'
+            '<script type="text/plain">'
+            + "\n".join(
+                f"$('[data-xdget-id=\"{identifier}\"]').xdget_image({{"
+                f"xdgetId: '{identifier}', type: 'image', params: {json.dumps(params)}"
+                "});"
+                for identifier, params in [
+                    (
+                        "teapot",
+                        {"link": "/pl/teach/control/lesson/view?id=4101", "alt": "Рисунок чайника"},
+                    ),
+                    (
+                        "buttons",
+                        {
+                            "link": (
+                                r"https:\/\/school.example\/"
+                                r"teach\/control\/lesson\/view\/id\/4102"
+                            ),
+                            "alt": "",
+                        },
+                    ),
+                    ("duplicate", {"link": "/teach/control/lesson/view/id/4101", "alt": "Повтор"}),
+                    (
+                        "foreign",
+                        {"link": "https://another.example/teach/control/lesson/view/id/4103"},
+                    ),
+                    ("module", {"link": "/teach/control/stream/view/id/4104"}),
+                    ("absent", {"link": "/teach/control/lesson/view/id/4105"}),
+                ]
+            )
+            + "</script>"
+        )
+
+        lessons = await GetCourseDiscoverer._read_lessons(page, MODULE_URL)
+
+        assert [lesson.title for lesson in lessons] == [
+            "Разметка картонной ракеты",
+            "Орбита бумажного чайника",
+            "Карта созвездия Пуговицы",
+        ]
+        assert [lesson.url for lesson in lessons] == [
+            f"{ORIGIN}/teach/control/lesson/view/id/4100",
+            f"{ORIGIN}/teach/control/lesson/view/id/4101",
+            f"{ORIGIN}/teach/control/lesson/view/id/4102",
+        ]
+        assert title_requests == [
+            f"{ORIGIN}/teach/control/lesson/view/id/4101",
+            f"{ORIGIN}/teach/control/lesson/view/id/4102",
+        ]
+        assert sorted(disposed) == title_requests
+        assert visited == []
+        assert len(context.pages) == 1
+
+    _run_in_firefox(check)
+
+
 def test_lesson_page_navigation_is_not_a_lesson_list_and_player_is_recognized():
     async def check(context: BrowserContext) -> None:
         page = await context.new_page()

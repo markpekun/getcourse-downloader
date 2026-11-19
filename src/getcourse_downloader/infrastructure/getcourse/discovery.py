@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -44,6 +45,12 @@ _BREADCRUMB_BLOCK_RE = re.compile(
     r"<(?:div|nav|ol)[^>]*class=[\"'][^\"']*breadcrumb[^\"']*[\"'][^>]*>"
     r".*?</(?:div|nav|ol)>",
     flags=re.IGNORECASE | re.DOTALL,
+)
+
+_IMAGE_WIDGET_PARAMS_RE = re.compile(
+    r"[\"']\[data-xdget-id=[\"'](?P<identifier>[\w-]+)[\"']\][\"']\s*\)"
+    r"\.xdget_image\(\s*\{[^{}]*?\bparams\s*:\s*",
+    flags=re.DOTALL,
 )
 
 
@@ -282,10 +289,11 @@ class GetCourseDiscoverer:
         current_url = page.url or playlist_url
         direct_stream = normalize_stream_url(current_url, current_url)
         initial_graph: dict[str, _StreamSnapshot] = {}
+        title_semaphore = asyncio.Semaphore(self._concurrency)
         try:
             if direct_stream:
                 seeds = [_StreamLink(direct_stream)]
-                snapshot = await self._read_loaded_stream(page, seeds[0])
+                snapshot = await self._read_loaded_stream(page, seeds[0], title_semaphore)
                 initial_graph[direct_stream] = snapshot
                 if on_course_discovered:
                     await on_course_discovered(
@@ -314,6 +322,7 @@ class GetCourseDiscoverer:
                 browser,
                 seeds,
                 semaphore=semaphore,
+                title_semaphore=title_semaphore,
                 callback_lock=callback_lock,
                 on_course_discovered=on_course_discovered,
                 initial_graph=initial_graph,
@@ -331,6 +340,7 @@ class GetCourseDiscoverer:
         seeds: list[_StreamLink],
         *,
         semaphore: asyncio.Semaphore,
+        title_semaphore: asyncio.Semaphore,
         callback_lock: asyncio.Lock,
         on_course_discovered: CourseDiscoveredCallback | None,
         initial_graph: dict[str, _StreamSnapshot],
@@ -356,6 +366,7 @@ class GetCourseDiscoverer:
                         browser,
                         stream,
                         semaphore=semaphore,
+                        title_semaphore=title_semaphore,
                         callback_lock=callback_lock,
                         on_course_discovered=on_course_discovered,
                     )
@@ -444,6 +455,7 @@ class GetCourseDiscoverer:
         stream: _StreamLink,
         *,
         semaphore: asyncio.Semaphore,
+        title_semaphore: asyncio.Semaphore,
         callback_lock: asyncio.Lock,
         on_course_discovered: CourseDiscoveredCallback | None,
     ) -> _StreamSnapshot:
@@ -460,7 +472,7 @@ class GetCourseDiscoverer:
                     )
                 else:
                     self._raise_for_http_error(response)
-                    snapshot = await self._read_loaded_stream(page, stream)
+                    snapshot = await self._read_loaded_stream(page, stream, title_semaphore)
             finally:
                 with contextlib.suppress(Exception):
                     await page.close()
@@ -533,12 +545,14 @@ class GetCourseDiscoverer:
         fallback = stream.url.rstrip("/").rsplit("/", maxsplit=1)[-1]
         return CourseDiscoveryUpdate(stream.url, stream.title or f"Курс {fallback}")
 
-    async def _read_loaded_stream(self, page: Page, stream: _StreamLink) -> _StreamSnapshot:
+    async def _read_loaded_stream(
+        self, page: Page, stream: _StreamLink, title_semaphore: asyncio.Semaphore
+    ) -> _StreamSnapshot:
         if await _is_authentication_required(page):
             raise ExternalServiceError("Сессия GetCourse завершилась во время обхода курсов")
         await self._wait_for_redesigned_content(page)
         title = await self._read_stream_title(page, stream)
-        lessons = tuple(await self._read_lessons(page, page.url))
+        lessons = tuple(await self._read_lessons(page, page.url, title_semaphore=title_semaphore))
         children = tuple(
             await self._extract_stream_links(
                 page,
@@ -677,7 +691,13 @@ class GetCourseDiscoverer:
         return f"Курс {identifier}"
 
     @classmethod
-    async def _read_lessons(cls, page: Page, base_url: str) -> list[Lesson]:
+    async def _read_lessons(
+        cls,
+        page: Page,
+        base_url: str,
+        *,
+        title_semaphore: asyncio.Semaphore | None = None,
+    ) -> list[Lesson]:
         elements = await page.query_selector_all("ul.lesson-list li")
         lessons: list[Lesson] = []
         seen: set[str] = set()
@@ -698,4 +718,105 @@ class GetCourseDiscoverer:
                 continue
             seen.add(url)
             lessons.append(Lesson(title=title, url=url))
+        image_lessons: list[Lesson] = []
+        for title, href in await cls._read_image_widget_links(page):
+            url = normalize_lesson_url(base_url, href)
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            identifier = url.rsplit("/", maxsplit=1)[-1]
+            image_lessons.append(Lesson(title=title or f"Урок {identifier}", url=url))
+
+        if not image_lessons:
+            return lessons
+        semaphore = title_semaphore or asyncio.Semaphore(DISCOVERY_CONCURRENCY)
+
+        async def resolve_title(lesson: Lesson) -> Lesson:
+            async with semaphore:
+                title = await cls._read_image_lesson_title(page, lesson.url, lesson.title)
+                return Lesson(title=title, url=lesson.url)
+
+        tasks = [asyncio.create_task(resolve_title(lesson)) for lesson in image_lessons]
+        try:
+            lessons.extend(await asyncio.gather(*tasks))
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         return lessons
+
+    @classmethod
+    async def _read_image_lesson_title(cls, page: Page, url: str, fallback: str) -> str:
+        """Image captions need not contain the lesson's actual title."""
+        response = None
+        try:
+            # Shares the browser session without loading scripts, images or players.
+            response = await page.context.request.get(url, timeout=15_000)
+            if is_authentication_url(response.url):
+                raise ExternalServiceError("Сессия GetCourse завершилась во время обхода уроков")
+            if response.status in (403, 404):
+                return fallback
+            cls._raise_for_http_error(response)
+            title = await page.evaluate(
+                """html => {
+                    const template = document.createElement('template');
+                    template.innerHTML = html;
+                    for (const selector of [
+                        '.lesson-title-value',
+                        '.lesson-header-block h1',
+                        '.lesson-header-block h2'
+                    ]) {
+                        const text = template.content.querySelector(selector)?.textContent;
+                        if (text?.trim()) return text;
+                    }
+                    return '';
+                }""",
+                await response.text(),
+            )
+            return clean_title(title) or fallback
+        except PlaywrightTimeoutError as error:
+            raise ExternalServiceError(
+                "Сайт не ответил при получении названия урока.",
+                code="SITE_TIMEOUT",
+                technical_details="Lesson title HTML request timed out",
+            ) from error
+        except PlaywrightError as error:
+            raise ExternalServiceError(
+                "Не удалось получить название урока с сайта.",
+                code="SITE_CONNECTION_FAILED",
+                technical_details="Lesson title HTML request failed",
+            ) from error
+        finally:
+            if response is not None:
+                await response.dispose()
+
+    @staticmethod
+    async def _read_image_widget_links(page: Page) -> list[tuple[str, str]]:
+        """Read image navigation configured by GetCourse without executing its scripts."""
+        links: list[tuple[str, str]] = []
+        decoder = json.JSONDecoder()
+        for script in await page.query_selector_all("script:not([src])"):
+            content = await script.text_content() or ""
+            for match in _IMAGE_WIDGET_PARAMS_RE.finditer(content):
+                try:
+                    params, _ = decoder.raw_decode(content, match.end())
+                except ValueError:
+                    continue
+                if not isinstance(params, dict):
+                    continue
+                href = params.get("link")
+                if not isinstance(href, str) or not href:
+                    continue
+                widget_selector = f'.xdget-image[data-xdget-id="{match.group("identifier")}"]'
+                widget = await page.query_selector(
+                    f".xdget-training {widget_selector}, "
+                    f".xdget-trainingsSystemPage {widget_selector}"
+                )
+                if widget is None:
+                    continue
+                title = clean_title(await widget.inner_text())
+                if not title and isinstance(params.get("alt"), str):
+                    title = clean_title(params["alt"])
+                links.append((title, href))
+        return links
