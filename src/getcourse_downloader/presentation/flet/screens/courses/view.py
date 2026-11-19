@@ -26,12 +26,14 @@ from getcourse_downloader.presentation.flet.screens.courses.components import (
 from getcourse_downloader.presentation.flet.screens.courses.confirmations import (
     ClearTarget,
     build_clear_confirmation,
+    build_removal_confirmation,
 )
 from getcourse_downloader.presentation.flet.screens.courses.controller import CoursesController
 from getcourse_downloader.presentation.flet.screens.courses.diagnostics import DiagnosticOverlay
 from getcourse_downloader.presentation.flet.screens.courses.download_follow import (
     DownloadListFollow,
 )
+from getcourse_downloader.presentation.flet.screens.courses.remove_menu import RemoveMenu
 from getcourse_downloader.presentation.flet.screens.courses.state import (
     CompletionResult,
     CompletionStep,
@@ -75,6 +77,7 @@ class CoursesScreen:
         _LOGGER.info("courses_screen_created screen=%x", id(self))
         self.state = CoursesViewState(save_path=controller.load_save_path())
         self._confirmation_dialog: ft.AlertDialog | None = None
+        self._remove_menu = RemoveMenu(page, self._request_remove_item)
         self._active_lesson_url: str | None = None
         self._completion_flow: CompletionFlow | None = None
         self._diagnostic_reports: dict[str, Path] = {}
@@ -432,6 +435,7 @@ class CoursesScreen:
                             ),
                         ],
                     ),
+                    self._remove_menu.control,
                     self.overlay,
                     self._diagnostics.control,
                     self.error_overlay,
@@ -442,6 +446,13 @@ class CoursesScreen:
 
     def _build_header(self) -> ft.Container:
         total_lessons = sum(course.lesson_count for course in self.data)
+        self._course_title = ft.Text(
+            "Мои курсы",
+            size=24,
+            weight=ft.FontWeight.W_700,
+            color=Color.TEXT,
+            tooltip=f"{len(self.data)} курсов · {total_lessons} уроков",
+        )
         self._clear_courses_button = ft.IconButton(
             icon=ft.Icons.PLAYLIST_REMOVE_ROUNDED,
             icon_color=Color.RED,
@@ -480,13 +491,7 @@ class CoursesScreen:
                                     color=Glass.FOLDER,
                                 ),
                             ),
-                            ft.Text(
-                                "Мои курсы",
-                                size=24,
-                                weight=ft.FontWeight.W_700,
-                                color=Color.TEXT,
-                                tooltip=f"{len(self.data)} курсов · {total_lessons} уроков",
-                            ),
+                            self._course_title,
                         ],
                     ),
                     ft.Container(
@@ -548,6 +553,7 @@ class CoursesScreen:
                 on_folder_toggle=self._toggle_course,
                 on_folder_selection=self._set_course_selection,
                 on_lesson_selection=self._set_lesson_selection,
+                on_context_menu=self._open_course_menu,
             )
             self.lesson_refs.update(tree.lesson_checkboxes)
             self.folder_refs.update(tree.folder_checkboxes)
@@ -595,6 +601,13 @@ class CoursesScreen:
     def _build_side_panel(self):
         total_lessons = sum(course.lesson_count for course in self.data)
 
+        self._total_label = ft.Text(
+            f"/ {total_lessons}",
+            size=18,
+            color=Color.TEXT_MUTED,
+            weight=ft.FontWeight.W_500,
+        )
+
         def _stat_card() -> ft.Container:
             return glass_container(
                 content=ft.Column(
@@ -638,12 +651,7 @@ class CoursesScreen:
                                         spacing=6,
                                         controls=[
                                             self.selected_label,
-                                            ft.Text(
-                                                f"/ {total_lessons}",
-                                                size=18,
-                                                color=Color.TEXT_MUTED,
-                                                weight=ft.FontWeight.W_500,
-                                            ),
+                                            self._total_label,
                                         ],
                                     ),
                                 ],
@@ -877,6 +885,77 @@ class CoursesScreen:
             button = getattr(self, name, None)
             if button is not None:
                 button.disabled = self._clear_is_blocked()
+
+    async def _open_course_menu(
+        self, course: Course, lesson: Lesson | None, position: ft.Offset
+    ) -> None:
+        if (
+            not self._disposed
+            and self._confirmation_dialog is None
+            and not self._clear_is_blocked()
+        ):
+            await self._remove_menu.show(course, lesson, position)
+
+    def _request_remove_item(self, course: Course, lesson: Lesson | None) -> None:
+        if self._disposed or self._confirmation_dialog is not None:
+            return
+        if self._clear_is_blocked():
+            self._show_snack("Дождитесь завершения текущей операции", is_error=True)
+            return
+
+        async def confirm(_event) -> None:
+            if self._confirmation_dialog is dialog:
+                await self._confirm_remove_item(course, lesson)
+
+        dialog = build_removal_confirmation(
+            course.title if lesson is None else lesson.title,
+            is_folder=lesson is None,
+            on_confirm=confirm,
+            on_cancel=self._close_clear_confirmation,
+            on_dismiss=self._on_clear_confirmation_dismissed,
+        )
+        self._confirmation_dialog = dialog
+        self.page.show_dialog(dialog)
+
+    async def _confirm_remove_item(self, course: Course, lesson: Lesson | None) -> None:
+        self._close_clear_confirmation()
+        if self._disposed:
+            return
+        if self._clear_is_blocked():
+            self._show_snack("Дождитесь завершения текущей операции", is_error=True)
+            return
+
+        self.state.clearing = True
+        self._refresh_clear_actions()
+        self.page.update()
+        try:
+            remaining = await asyncio.to_thread(
+                self._controller.remove_course_item, self.data, course, lesson
+            )
+        except (DownloaderError, OSError):
+            if not self._disposed:
+                self._show_snack("Не удалось сохранить список курсов", is_error=True)
+            return
+        else:
+            if self._disposed:
+                return
+            self.data = remaining
+            remaining_urls = {
+                item.lesson.url for root in remaining for item in iter_course_lessons(root)
+            }
+            self.state.selected_lesson_urls.intersection_update(remaining_urls)
+            self._build_course_list()
+            total = sum(root.lesson_count for root in remaining)
+            self.selected_label.value = str(len(self.state.selected_lesson_urls))
+            self._total_label.value = f"/ {total}"
+            self._course_title.tooltip = f"{len(remaining)} курсов · {total} уроков"
+        finally:
+            self.state.clearing = False
+            if not self._disposed:
+                self._refresh_clear_actions()
+                self.page.update()
+        if not remaining:
+            await self._on_navigate_start()
 
     @trace_operation("clear_confirmation_open")
     def _request_clear(self, target: ClearTarget) -> None:
@@ -1682,6 +1761,9 @@ class CoursesScreen:
         if getattr(self, "_disposed", False):
             return
         self._disposed = True
+        remove_menu = getattr(self, "_remove_menu", None)
+        if remove_menu is not None:
+            remove_menu.dispose()
         preparation = getattr(self, "_preparation_task", None)
         if preparation is not None:
             preparation.cancel()

@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from getcourse_downloader import __version__
@@ -19,6 +20,7 @@ from getcourse_downloader.domain.models import (
     Course,
     DownloadRequest,
     DownloadSummary,
+    Lesson,
     SelectedLesson,
     Settings,
     VideoQuality,
@@ -60,6 +62,30 @@ class CoursesController:
 
     def delete_courses(self) -> None:
         self._courses.delete()
+
+    def remove_course_item(
+        self, courses: list[Course], target: Course, lesson: Lesson | None
+    ) -> list[Course]:
+        def without_item(nodes: Sequence[Course]) -> tuple[Course, ...]:
+            remaining: list[Course] = []
+            for node in nodes:
+                if node is target:
+                    if lesson is None:
+                        continue
+                    lessons = tuple(item for item in node.lessons if item is not lesson)
+                    if len(lessons) != len(node.lessons):
+                        node = replace(node, lessons=lessons)
+                else:
+                    children = without_item(node.children)
+                    if children != node.children:
+                        node = replace(node, children=children)
+                remaining.append(node)
+            return tuple(remaining)
+
+        remaining = list(without_item(courses))
+        if remaining != courses:
+            self._courses.save(remaining)
+        return remaining
 
     async def clear_authorization(self) -> None:
         if self._authorization is None:

@@ -33,8 +33,55 @@ def build_clear_confirmation(
         )
         label = "Очистить авторизацию"
         icon = ft.Icons.COOKIE_OUTLINED
+    return _build_confirmation(
+        f"confirm-clear-{target}",
+        title,
+        description,
+        label,
+        icon,
+        on_confirm=on_confirm,
+        on_cancel=on_cancel,
+        on_dismiss=on_dismiss,
+    )
+
+
+def build_removal_confirmation(
+    item_title: str,
+    *,
+    is_folder: bool,
+    on_confirm: Callable,
+    on_cancel: Callable,
+    on_dismiss: Callable,
+) -> ft.AlertDialog:
+    description = f"«{item_title}» будет удалён из списка приложения."
+    if is_folder:
+        description += " Вложенные разделы и уроки тоже будут удалены из списка."
+    description += "\n\nСкачанные видео останутся на диске."
+    return _build_confirmation(
+        "confirm-remove-course-item",
+        "Удалить из списка?",
+        description,
+        "Удалить",
+        ft.Icons.DELETE_OUTLINE_ROUNDED,
+        on_confirm=on_confirm,
+        on_cancel=on_cancel,
+        on_dismiss=on_dismiss,
+    )
+
+
+def _build_confirmation(
+    key: str,
+    title: str,
+    description: str,
+    label: str,
+    icon: ft.IconData,
+    *,
+    on_confirm: Callable,
+    on_cancel: Callable,
+    on_dismiss: Callable,
+) -> ft.AlertDialog:
     return ft.AlertDialog(
-        key=f"confirm-clear-{target}",
+        key=key,
         modal=True,
         scrollable=True,
         bgcolor=Color.BG_CARD,

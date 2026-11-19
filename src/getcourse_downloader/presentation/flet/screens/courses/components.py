@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from math import pi
 
@@ -226,6 +226,22 @@ def _course_matches(course: Course, query: str) -> bool:
     return any(_course_matches(child, query) for child in course.children)
 
 
+def _with_context_click(
+    row: ft.Container,
+    course: Course,
+    lesson: Lesson | None,
+    on_context_menu: Callable[[Course, Lesson | None, ft.Offset], Awaitable[None]] | None,
+) -> ft.Control:
+    if on_context_menu is None:
+        return row
+
+    async def open_menu(event: ft.TapEvent) -> None:
+        if event.global_position is not None:
+            await on_context_menu(course, lesson, event.global_position)
+
+    return ft.GestureDetector(content=row, on_secondary_tap_up=open_menu)
+
+
 def build_course_tree(
     course: Course,
     *,
@@ -236,6 +252,7 @@ def build_course_tree(
     on_folder_toggle: Callable[[str, bool], None],
     on_folder_selection: Callable[[Course, bool], None],
     on_lesson_selection: Callable[[Lesson, bool], None],
+    on_context_menu: Callable[[Course, Lesson | None, ft.Offset], Awaitable[None]] | None = None,
 ) -> CourseTreeView:
     lesson_checkboxes: dict[str, ft.Checkbox] = {}
     folder_checkboxes: dict[str, ft.Checkbox] = {}
@@ -467,7 +484,7 @@ def build_course_tree(
                     ),
                     hover_surface=Glass.LESSON_HOVER,
                 )
-                body_controls.append(lesson_row)
+                body_controls.append(_with_context_click(lesson_row, node, lesson, on_context_menu))
             for child in node.children:
                 child_control = build_node(child, depth + 1, visible_by_parent)
                 if child_control is not None:
@@ -523,7 +540,7 @@ def build_course_tree(
 
         tile = ft.ExpansionTile(
             key=f"course-folder:{node.url}",
-            title=header,
+            title=_with_context_click(header, node, None, on_context_menu),
             controls=[body] if body_controls else [],
             expanded=show_children,
             maintain_state=True,
