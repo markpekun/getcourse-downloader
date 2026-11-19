@@ -686,6 +686,16 @@ class StartScreen:
 
     @staticmethod
     def _error_guidance(code: str) -> _ErrorGuidance:
+        if code == "BROWSER_INSTALL_FAILED":
+            return _ErrorGuidance(
+                "Не удалось установить Firefox",
+                "Для текущего Playwright требуется загрузить подходящий Firefox.",
+                (
+                    "Проверьте интернет и нажмите «Повторить».",
+                    "Можно установить Firefox из терминала проекта: "
+                    "uv run --no-sync playwright install firefox",
+                ),
+            )
         if code in {"BROWSER_RESOURCES_MISSING", "BROWSER_START_FAILED"}:
             return _ErrorGuidance(
                 "Встроенный Firefox не запустился",

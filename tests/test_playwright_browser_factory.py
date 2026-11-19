@@ -36,6 +36,14 @@ def _paths(tmp_path) -> AppPaths:
     )
 
 
+@pytest.fixture
+def installed_firefox(tmp_path):
+    executable = tmp_path / "test-browser-cache" / _TEST_FIREFOX_REVISION / "firefox.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fake executable")
+    return str(executable)
+
+
 @pytest.mark.parametrize("frozen", [False, True])
 def test_browser_path_uses_bundle_only_in_frozen_app(monkeypatch, tmp_path, frozen):
     monkeypatch.setattr(sys, "frozen", frozen, raising=False)
@@ -82,16 +90,15 @@ def test_launch_fails_clearly_when_bundled_firefox_is_missing(
     assert getattr(captured.value, "code", "") == "BROWSER_RESOURCES_MISSING"
 
 
-def test_browser_launch_error_has_stable_diagnostic_code(tmp_path):
+def test_browser_launch_error_has_stable_diagnostic_code(tmp_path, installed_firefox):
     paths = _paths(tmp_path)
-    bundled = paths.resources / "ms-playwright" / _TEST_FIREFOX_REVISION / "firefox"
-    bundled.mkdir(parents=True)
-    (bundled / "firefox.exe").write_bytes(b"fake executable")
     factory = PlaywrightBrowserFactory(paths)
 
     from playwright.async_api import Error as PlaywrightError
 
     class Firefox:
+        executable_path = installed_firefox
+
         async def launch_persistent_context(self, *_args, **_kwargs):
             raise PlaywrightError("Failed to launch browser process")
 
@@ -104,9 +111,29 @@ def test_browser_launch_error_has_stable_diagnostic_code(tmp_path):
     assert getattr(captured.value, "code", "") == "BROWSER_START_FAILED"
 
 
-def test_source_launch_uses_installed_playwright_firefox(tmp_path):
+@pytest.mark.parametrize("state", ["cached", "missing", "install-failed"])
+def test_source_launch_prepares_the_required_playwright_firefox(tmp_path, monkeypatch, state):
     paths = _paths(tmp_path)
     factory = PlaywrightBrowserFactory(paths)
+    executable = tmp_path / "test-browser-cache" / _TEST_FIREFOX_REVISION / "firefox.exe"
+    if state == "cached":
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"fake executable")
+    install_calls = []
+
+    class Installer:
+        async def wait(self):
+            if state == "install-failed":
+                return 1
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"fake executable")
+            return 0
+
+    async def start_installer(*args, **_kwargs):
+        install_calls.append(args)
+        return Installer()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start_installer)
 
     class Context:
         def on(self, event, callback):
@@ -116,7 +143,10 @@ def test_source_launch_uses_installed_playwright_firefox(tmp_path):
     context = Context()
 
     class Firefox:
+        executable_path = str(executable)
+
         async def launch_persistent_context(self, profile, *, headless):
+            assert executable.is_file()
             assert profile == str(paths.session)
             assert headless is True
             return context
@@ -124,18 +154,26 @@ def test_source_launch_uses_installed_playwright_firefox(tmp_path):
     class Playwright:
         firefox = Firefox()
 
-    assert asyncio.run(factory.launch(Playwright(), headless=True)) is context
-    context.close_callback()
+    if state == "install-failed":
+        with pytest.raises(ExternalServiceError) as captured:
+            asyncio.run(factory.launch(Playwright(), headless=True))
+        assert captured.value.code == "BROWSER_INSTALL_FAILED"
+    else:
+        # The second launch has a cached Firefox even after the first installs it.
+        for _ in range(2):
+            assert asyncio.run(factory.launch(Playwright(), headless=True)) is context
+            context.close_callback()
+    expected_command = (sys.executable, "-m", "playwright", "install", "firefox")
+    assert install_calls == ([] if state == "cached" else [expected_command])
     assert not (paths.session / ".gcd-profile-owner").exists()
 
 
-def test_cancelled_browser_launch_releases_profile(tmp_path):
+def test_cancelled_browser_launch_releases_profile(tmp_path, installed_firefox):
     paths = _paths(tmp_path)
-    bundled = paths.resources / "ms-playwright" / "firefox-1538" / "firefox"
-    bundled.mkdir(parents=True)
-    (bundled / "firefox.exe").write_bytes(b"firefox")
 
     class Firefox:
+        executable_path = installed_firefox
+
         async def launch_persistent_context(self, *_args, **_kwargs):
             raise asyncio.CancelledError
 
@@ -147,7 +185,7 @@ def test_cancelled_browser_launch_releases_profile(tmp_path):
     assert not (paths.session / ".gcd-profile-owner").exists()
 
 
-def test_launch_waits_for_previous_profile_owner_to_close(tmp_path):
+def test_launch_waits_for_previous_profile_owner_to_close(tmp_path, installed_firefox):
     paths = _paths(tmp_path)
     factory = PlaywrightBrowserFactory(paths)
     previous = _ProfileLease(paths.session)
@@ -160,6 +198,8 @@ def test_launch_waits_for_previous_profile_owner_to_close(tmp_path):
     context = Context()
 
     class Firefox:
+        executable_path = installed_firefox
+
         async def launch_persistent_context(self, *_args, **_kwargs):
             return context
 
@@ -182,7 +222,7 @@ def test_launch_waits_for_previous_profile_owner_to_close(tmp_path):
     asyncio.run(run())
 
 
-def test_launch_retries_a_profile_that_firefox_is_still_closing(tmp_path):
+def test_launch_retries_a_profile_that_firefox_is_still_closing(tmp_path, installed_firefox):
     paths = _paths(tmp_path)
     factory = PlaywrightBrowserFactory(paths)
 
@@ -195,6 +235,7 @@ def test_launch_retries_a_profile_that_firefox_is_still_closing(tmp_path):
     context = Context()
 
     class Firefox:
+        executable_path = installed_firefox
         attempts = 0
 
         async def launch_persistent_context(self, *_args, **_kwargs):

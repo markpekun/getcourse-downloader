@@ -195,11 +195,13 @@ MP4-файл.
 git clone https://github.com/markpekun/getcourse-downloader.git
 cd getcourse-downloader
 uv sync --locked --group dev
-uv run playwright install firefox
 uv run getcourse-downloader
 ```
 
-В исходном коде Firefox устанавливается в обычный кэш Playwright командой выше.
+При первом обращении к браузеру из исходников приложение скачает Firefox,
+если нужной текущему Playwright ревизии ещё нет в кэше. Первый запуск поиска после
+установки или обновления Playwright может занять больше времени. Подготовить браузер
+вручную заранее можно командой `uv run --no-sync playwright install firefox`.
 Для проверки зависимостей без курса и без входа можно выполнить:
 
 ```powershell

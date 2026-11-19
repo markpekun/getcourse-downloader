@@ -14,9 +14,11 @@ flowchart LR
 
 `domain/` содержит модели, события и ошибки; `application/` — сценарии и порты. `infrastructure/` реализует браузер, обнаружение страниц, загрузку, хранение, worker и диагностику. `presentation/` содержит Flet и CLI. GUI соединяется в `bootstrap.py`; у CLI worker собственная сборка адаптеров в `presentation/cli/worker.py`. Направление импортов domain/application проверяет `tests/test_architecture.py`.
 
-При запуске из исходников Firefox выбирает установленный Playwright из своего кэша
-(`uv run --no-sync playwright install firefox`); старые браузеры в `resources/` на этот
-запуск не влияют. В EXE фабрика использует `resources/ms-playwright` и проверяет наличие
+При запуске из исходников фабрика проверяет путь к Firefox, который возвращает
+текущий Playwright. Если файла нет, фабрика запускает `python -m playwright install firefox`
+тем же интерпретатором и проверяет результат до открытия профиля. При ошибке скачивания
+приложение показывает `BROWSER_INSTALL_FAILED`. В EXE фабрика использует
+`resources/ms-playwright` и проверяет наличие
 именно исполняемого файла, ожидаемого Playwright. `build.ps1` устанавливает браузер
 текущей версии Playwright непосредственно в этот каталог и проверяет его путь:
 наличие произвольного `firefox-*` не подтверждает совместимость после обновления зависимостей.
@@ -54,4 +56,14 @@ flowchart LR
 | Worker, события и управление процессом | `src/getcourse_downloader/infrastructure/worker/subprocess_gateway.py`, `presentation/cli/worker.py`, `domain/events.py` |
 | Настройки, каталог готовых файлов, пути, диагностика | `src/getcourse_downloader/infrastructure/storage/`, `infrastructure/platform/paths.py`, `infrastructure/diagnostics/reports.py` |
 | Зависимости, проверки и Windows ZIP | `pyproject.toml`, `uv.lock`, `tests/`, `README.md`, `build.ps1` |
+
+## Расширение Chrome
+
+В [chrome-extension/](chrome-extension/README.md) находится отдельная точка входа для открытого урока.
+`background.js` обнаруживает HLS в выбранной вкладке через `webRequest`.
+`download.mjs` показывает варианты, а `hls.mjs` загружает плейлисты, ключи HLS
+и сегменты. Выбранные дорожки временно записываются в OPFS. `mux-worker.mjs`
+собирает MP4 локальными mux.js и libav.js/WebAssembly. Страница расширения
+передаёт готовый файл в `chrome.downloads` и удаляет промежуточные данные
+после завершения или отмены. Поддерживаемые форматы и установка описаны в README расширения.
 
