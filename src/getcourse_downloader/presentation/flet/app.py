@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import sys
 from typing import Any
 
 import flet as ft
@@ -155,11 +156,31 @@ class App:
 
 
 async def main(page: ft.Page) -> None:
-    await App(page).show_initial_screen()
+    page.window.visible = False
+    try:
+        await App(page).show_initial_screen()
+        await page.window.wait_until_ready_to_show()
+    finally:
+        # Show the window even if Flet needs to display a startup error.
+        page.window.visible = True
+        page.window.update()
 
 
 def run() -> None:
-    ft.run(main)
+    if (
+        sys.platform == "win32"
+        and sys.implementation.name == "cpython"
+        and sys.version_info[:2] == (3, 13)
+    ):
+        from getcourse_downloader.presentation.flet.windows_asyncio import FletProactorEventLoop
+
+        asyncio.run(
+            ft.run_async(main, view=ft.AppView.FLET_APP_HIDDEN),
+            loop_factory=FletProactorEventLoop,
+        )
+        return
+
+    ft.run(main, view=ft.AppView.FLET_APP_HIDDEN)
 
 
 if __name__ == "__main__":
