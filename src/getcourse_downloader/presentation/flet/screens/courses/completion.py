@@ -8,7 +8,7 @@ from getcourse_downloader.presentation.flet.screens.courses.state import (
     CompletionStep,
     CompletionViewState,
 )
-from getcourse_downloader.presentation.flet.theme import Color
+from getcourse_downloader.presentation.flet.theme import Color, result_emblem
 
 _LOGGER = logging.getLogger("getcourse_downloader.ui")
 
@@ -25,6 +25,7 @@ class CompletionFlow:
         on_close: Callable,
         on_github: Callable[..., Awaitable[None]],
         on_contact: Callable[..., Awaitable[None]],
+        on_find_duplicates: Callable[..., Awaitable[None]] | None = None,
         failed_details: ft.Control | None = None,
     ) -> None:
         self.state = CompletionViewState(result)
@@ -34,6 +35,7 @@ class CompletionFlow:
         self._on_close = on_close
         self._on_github = on_github
         self._on_contact = on_contact
+        self._on_find_duplicates = on_find_duplicates
         self._failed_details = failed_details
         self._details_content: ft.Column | None = None
         self._result_height = 460 if failed_details is not None else 360
@@ -122,14 +124,7 @@ class CompletionFlow:
                 Color.GREEN,
             )
         body: list[ft.Control] = [
-            ft.Container(
-                width=64,
-                height=64,
-                border_radius=32,
-                alignment=ft.Alignment.CENTER,
-                bgcolor=ft.Colors.with_opacity(0.15, color),
-                content=ft.Icon(icon, size=36, color=color),
-            ),
+            result_emblem(icon, color),
             self._text(title, heading=True, centered=True),
         ]
         if not (self.result.is_error or self.result.is_warning or self.result.cancelled):
@@ -145,6 +140,30 @@ class CompletionFlow:
                     on_click=self.show_details,
                 )
             )
+        actions: list[ft.Control] = []
+        if self._on_find_duplicates is not None:
+            actions.append(
+                ft.Container(
+                    expand=True,
+                    alignment=ft.Alignment.CENTER_LEFT,
+                    content=self._find_duplicates_button(self._on_find_duplicates),
+                )
+            )
+        actions.append(
+            ft.TextButton(
+                key="completion-next",
+                content=ft.Row(
+                    tight=True,
+                    spacing=8,
+                    controls=[
+                        ft.Text("Далее"),
+                        ft.Icon(ft.Icons.ARROW_FORWARD, size=18),
+                    ],
+                ),
+                style=ft.ButtonStyle(color=Color.ACCENT_LIGHT),
+                on_click=self.show_support,
+            )
+        )
         return ft.Column(
             expand=True,
             spacing=12,
@@ -163,23 +182,45 @@ class CompletionFlow:
                 ),
                 ft.Row(
                     alignment=ft.MainAxisAlignment.END,
-                    controls=[
-                        ft.TextButton(
-                            key="completion-next",
-                            content=ft.Row(
-                                tight=True,
-                                spacing=8,
-                                controls=[
-                                    ft.Text("Далее"),
-                                    ft.Icon(ft.Icons.ARROW_FORWARD, size=18),
-                                ],
-                            ),
-                            style=ft.ButtonStyle(color=Color.ACCENT_LIGHT),
-                            on_click=self.show_support,
-                        )
-                    ],
+                    controls=actions,
                 ),
             ],
+        )
+
+    @staticmethod
+    def _find_duplicates_button(on_find: Callable[..., Awaitable[None]]) -> ft.IconButton:
+        return ft.IconButton(
+            key="completion-find-duplicates",
+            tooltip=ft.Tooltip("Найти дубликаты видео", prefer_below=False),
+            width=40,
+            height=40,
+            padding=8,
+            style=ft.ButtonStyle(
+                overlay_color={
+                    ft.ControlState.HOVERED: ft.Colors.with_opacity(0.18, Color.ACCENT_LIGHT),
+                    ft.ControlState.FOCUSED: ft.Colors.with_opacity(0.22, Color.ACCENT_LIGHT),
+                    ft.ControlState.PRESSED: ft.Colors.with_opacity(0.28, Color.ACCENT_LIGHT),
+                },
+                shape=ft.CircleBorder(),
+            ),
+            icon=ft.Stack(
+                width=24,
+                height=24,
+                controls=[
+                    ft.Icon(ft.Icons.CONTENT_COPY_ROUNDED, size=19, color=Color.TEXT_SECONDARY),
+                    ft.Container(
+                        right=0,
+                        bottom=0,
+                        width=13,
+                        height=13,
+                        border_radius=7,
+                        bgcolor=Color.BG_CARD,
+                        alignment=ft.Alignment.CENTER,
+                        content=ft.Icon(ft.Icons.CLOSE, size=12, color=Color.RED),
+                    ),
+                ],
+            ),
+            on_click=on_find,
         )
 
     def _build_details(self) -> ft.Column:

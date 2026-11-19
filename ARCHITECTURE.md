@@ -55,15 +55,6 @@ flowchart LR
 | HLS, идентичность плейлистов, checkpoint и FFmpeg | `src/getcourse_downloader/infrastructure/media/hls.py`, `playlist_identity.py`, `ffmpeg.py` |
 | Worker, события и управление процессом | `src/getcourse_downloader/infrastructure/worker/subprocess_gateway.py`, `presentation/cli/worker.py`, `domain/events.py` |
 | Настройки, каталог готовых файлов, пути, диагностика | `src/getcourse_downloader/infrastructure/storage/`, `infrastructure/platform/paths.py`, `infrastructure/diagnostics/reports.py` |
+| Поиск и удаление точных копий видео | `presentation/flet/screens/courses/duplicates.py` → контроллер → `infrastructure/storage/video_duplicates.py` |
 | Зависимости, проверки и Windows ZIP | `pyproject.toml`, `uv.lock`, `tests/`, `README.md`, `build.ps1` |
-
-## Расширение Chrome
-
-В [chrome-extension/](chrome-extension/README.md) находится отдельная точка входа для открытого урока.
-`background.js` обнаруживает HLS в выбранной вкладке через `webRequest`.
-`download.mjs` показывает варианты, а `hls.mjs` загружает плейлисты, ключи HLS
-и сегменты. Выбранные дорожки временно записываются в OPFS. `mux-worker.mjs`
-собирает MP4 локальными mux.js и libav.js/WebAssembly. Страница расширения
-передаёт готовый файл в `chrome.downloads` и удаляет промежуточные данные
-после завершения или отмены. Поддерживаемые форматы и установка описаны в README расширения.
 

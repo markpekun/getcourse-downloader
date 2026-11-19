@@ -27,6 +27,13 @@ from getcourse_downloader.domain.models import (
 )
 from getcourse_downloader.infrastructure.diagnostics.reports import DownloadDiagnostics
 from getcourse_downloader.infrastructure.diagnostics.ui_lifecycle import trace_operation
+from getcourse_downloader.infrastructure.storage.video_duplicates import (
+    DuplicateProgress,
+    DuplicateRemoval,
+    DuplicateScan,
+    delete_duplicate_videos,
+    scan_duplicate_videos,
+)
 
 DownloadFinished = Callable[[DownloadSummary], None]
 DownloadFailed = Callable[[Exception], None]
@@ -101,6 +108,18 @@ class CoursesController:
 
     def save_save_path(self, path: str) -> None:
         self._settings.save(Settings(save_path=path))
+
+    @staticmethod
+    async def scan_duplicates(
+        folder: Path, cancel: threading.Event, on_progress: Callable[[DuplicateProgress], None]
+    ) -> DuplicateScan:
+        return await asyncio.to_thread(scan_duplicate_videos, folder, cancel, on_progress)
+
+    @staticmethod
+    async def delete_duplicates(
+        scan: DuplicateScan, selected: frozenset[Path], cancel: threading.Event
+    ) -> DuplicateRemoval:
+        return await asyncio.to_thread(delete_duplicate_videos, scan, selected, cancel)
 
     @staticmethod
     def make_request(

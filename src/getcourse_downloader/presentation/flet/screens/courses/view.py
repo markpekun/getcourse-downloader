@@ -16,6 +16,7 @@ from getcourse_downloader.presentation.flet.lifecycle import UiCallbacks
 from getcourse_downloader.presentation.flet.screens.courses.completion import CompletionFlow
 from getcourse_downloader.presentation.flet.screens.courses.components import (
     CourseFolderRow,
+    CourseTreeView,
     DownloadLessonRow,
     build_course_tree,
     build_download_lesson_row,
@@ -33,6 +34,7 @@ from getcourse_downloader.presentation.flet.screens.courses.diagnostics import D
 from getcourse_downloader.presentation.flet.screens.courses.download_follow import (
     DownloadListFollow,
 )
+from getcourse_downloader.presentation.flet.screens.courses.duplicates import DuplicateDialog
 from getcourse_downloader.presentation.flet.screens.courses.remove_menu import RemoveMenu
 from getcourse_downloader.presentation.flet.screens.courses.state import (
     CompletionResult,
@@ -78,6 +80,7 @@ class CoursesScreen:
         self.state = CoursesViewState(save_path=controller.load_save_path())
         self._confirmation_dialog: ft.AlertDialog | None = None
         self._remove_menu = RemoveMenu(page, self._request_remove_item)
+        self._duplicates = DuplicateDialog(page, controller)
         self._active_lesson_url: str | None = None
         self._completion_flow: CompletionFlow | None = None
         self._diagnostic_reports: dict[str, Path] = {}
@@ -87,6 +90,7 @@ class CoursesScreen:
         self._download_view_active = True
         self._diagnostics = DiagnosticOverlay(page, self._close_diagnostic_report)
         self._active_download_id = 0
+        self._download_folder: Path | None = None
         self._preparation_task: concurrent.futures.Future[None] | None = None
         self._preparing_download = False
         self._preparation_total = 0
@@ -103,6 +107,7 @@ class CoursesScreen:
         self.folder_refs: dict[str, ft.Checkbox] = {}
         self.folder_badges: dict[str, ft.Text] = {}
         self._folder_rows: dict[str, CourseFolderRow] = {}
+        self._course_trees: dict[int, CourseTreeView] = {}
 
         self.file_picker = ft.FilePicker()
 
@@ -537,29 +542,44 @@ class CoursesScreen:
             ),
         )
 
-    def _build_course_list(self):
-        self.course_list.controls.clear()
+    def _build_course_list(self, *, reuse_existing: bool = False) -> None:
+        previous = self._course_trees
+        trees: dict[int, CourseTreeView] = {}
         self.lesson_refs.clear()
         self.folder_refs.clear()
         self.folder_badges.clear()
         self._folder_rows.clear()
         for course in self.data:
-            tree = build_course_tree(
-                course,
-                accent=Glass.FOLDER,
-                selected_urls=self.state.selected_lesson_urls,
-                expanded_urls=self.state.expanded_course_urls,
-                query=self.state.search_query,
-                on_folder_toggle=self._toggle_course,
-                on_folder_selection=self._set_course_selection,
-                on_lesson_selection=self._set_lesson_selection,
-                on_context_menu=self._open_course_menu,
-            )
+            key = id(course)
+            tree = previous.get(key) if reuse_existing else None
+            if tree is None:
+                tree = build_course_tree(
+                    course,
+                    accent=Glass.FOLDER,
+                    selected_urls=self.state.selected_lesson_urls,
+                    expanded_urls=self.state.expanded_course_urls,
+                    query=self.state.search_query,
+                    on_folder_toggle=self._toggle_course,
+                    on_folder_selection=self._set_course_selection,
+                    on_lesson_selection=self._set_lesson_selection,
+                    on_context_menu=self._open_course_menu,
+                )
+            trees[key] = tree
             self.lesson_refs.update(tree.lesson_checkboxes)
             self.folder_refs.update(tree.folder_checkboxes)
             self.folder_badges.update(tree.folder_badges)
             self._folder_rows.update(tree.folder_rows)
-            self.course_list.controls.append(tree.control)
+
+        if reuse_existing:
+            retained: list[ft.Control] = [
+                tree.control for key, tree in previous.items() if key in trees
+            ]
+            if len(retained) < min(len(previous), len(trees)):
+                # Flet otherwise compares every unmounted control with every replacement.
+                self.course_list.controls = retained
+                self.page.update(self.course_list)
+        self._course_trees = trees
+        self.course_list.controls = [tree.control for tree in trees.values()]
 
     @trace_operation("course_expand_toggle")
     def _toggle_course(self, course_url: str, expanded: bool):
@@ -871,6 +891,19 @@ class CoursesScreen:
             self._build_side_panel()
             self.page.update()
 
+    async def _find_duplicates(self, folder: Path, run_id: int, _event) -> None:
+        ft.context.disable_auto_update()
+        if (
+            self._disposed
+            or run_id != self._active_download_id
+            or self._completion_flow is None
+            or self._completion_flow.state.step is not CompletionStep.RESULT
+            or self._confirmation_dialog is not None
+            or self._clear_is_blocked()
+        ):
+            return
+        await self._duplicates.open(folder)
+
     def _delete_courses(self, e=None) -> None:
         self._request_clear("courses")
 
@@ -878,7 +911,13 @@ class CoursesScreen:
         self._request_clear("authorization")
 
     def _clear_is_blocked(self) -> bool:
-        return self.state.downloading or self.state.cancelling or self.state.clearing
+        duplicates = getattr(self, "_duplicates", None)
+        return (
+            self.state.downloading
+            or self.state.cancelling
+            or self.state.clearing
+            or (duplicates is not None and duplicates.active)
+        )
 
     def _refresh_clear_actions(self) -> None:
         for name in ("_clear_courses_button", "_clear_authorization_button"):
@@ -918,6 +957,7 @@ class CoursesScreen:
         self.page.show_dialog(dialog)
 
     async def _confirm_remove_item(self, course: Course, lesson: Lesson | None) -> None:
+        ft.context.disable_auto_update()
         self._close_clear_confirmation()
         if self._disposed:
             return
@@ -926,8 +966,9 @@ class CoursesScreen:
             return
 
         self.state.clearing = True
+        changed: list[ft.Control] = [self._clear_courses_button, self._clear_authorization_button]
         self._refresh_clear_actions()
-        self.page.update()
+        self.page.update(*changed)
         try:
             remaining = await asyncio.to_thread(
                 self._controller.remove_course_item, self.data, course, lesson
@@ -944,16 +985,19 @@ class CoursesScreen:
                 item.lesson.url for root in remaining for item in iter_course_lessons(root)
             }
             self.state.selected_lesson_urls.intersection_update(remaining_urls)
-            self._build_course_list()
+            self._build_course_list(reuse_existing=True)
             total = sum(root.lesson_count for root in remaining)
             self.selected_label.value = str(len(self.state.selected_lesson_urls))
             self._total_label.value = f"/ {total}"
             self._course_title.tooltip = f"{len(remaining)} курсов · {total} уроков"
+            changed.extend(
+                (self.course_list, self.selected_label, self._total_label, self._course_title)
+            )
         finally:
             self.state.clearing = False
             if not self._disposed:
                 self._refresh_clear_actions()
-                self.page.update()
+                self.page.update(*changed)
         if not remaining:
             await self._on_navigate_start()
 
@@ -1352,6 +1396,8 @@ class CoursesScreen:
         self._refresh_clear_actions()
         self._active_download_id += 1
         run_id = self._active_download_id
+        save_path = self.state.save_path
+        self._download_folder = Path(save_path).absolute()
         _LOGGER.info(
             "download_started screen=%x run=%s lessons=%s",
             id(self),
@@ -1390,7 +1436,7 @@ class CoursesScreen:
             lessons_to_download,
             groups,
             self.state.quality,
-            self.state.save_path,
+            save_path,
             run_id,
         )
 
@@ -1764,6 +1810,9 @@ class CoursesScreen:
         remove_menu = getattr(self, "_remove_menu", None)
         if remove_menu is not None:
             remove_menu.dispose()
+        duplicates = getattr(self, "_duplicates", None)
+        if duplicates is not None:
+            duplicates.dispose()
         preparation = getattr(self, "_preparation_task", None)
         if preparation is not None:
             preparation.cancel()
@@ -1818,6 +1867,7 @@ class CoursesScreen:
                 ]
             )
         )
+        folder = getattr(self, "_download_folder", None)
         self._completion_flow = CompletionFlow(
             CompletionResult(message, is_error, is_warning, cancelled),
             self._overlay_card,
@@ -1825,6 +1875,11 @@ class CoursesScreen:
             on_close=self._close_completion_overlay,
             on_github=self._open_github,
             on_contact=self._open_contact,
+            on_find_duplicates=(
+                partial(self._find_duplicates, folder, self._active_download_id)
+                if folder is not None
+                else None
+            ),
             failed_details=self._build_failed_lessons(detail_titles) if detail_titles else None,
         )
         self.overlay.visible = True

@@ -251,6 +251,17 @@ def body_text(text: str, size: int = 14, color: str | None = None) -> ft.Text:
     )
 
 
+def result_emblem(icon: ft.IconData, color: str) -> ft.Container:
+    return ft.Container(
+        width=64,
+        height=64,
+        border_radius=32,
+        alignment=ft.Alignment.CENTER,
+        bgcolor=ft.Colors.with_opacity(0.15, color),
+        content=ft.Icon(icon, size=36, color=color),
+    )
+
+
 def status_badge(text: str, color: str = Color.GREEN) -> ft.Container:
     return ft.Container(
         content=ft.Text(text, size=11, weight=ft.FontWeight.W_600, color=color),
